@@ -1,5 +1,12 @@
 # Section Identification
 
+## Installation
+```
+git clone https://github.com/fredericoaraujopt/section_identification.git
+cd section_identification
+pip install -e .
+```
+
 # Basic git tutorial
 ## Contributing new changes
 Make sure your main branch is up to date
