@@ -19,6 +19,10 @@ Checkout new branch
 git checkout -b <name>-<feature>
 ```
 Make changes.
+Make sure tests pass:
+```
+pytest .
+```
 Push changes:
 ```
 git add <files to be pushed>
