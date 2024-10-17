@@ -10,5 +10,6 @@ setup(
     author_email="*********",
     install_requires=[
         "numpy",
+        "matplotlib"
     ]
 )
