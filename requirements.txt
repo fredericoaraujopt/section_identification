@@ -1,0 +1,6 @@
+numpy
+pillow
+matplotlib
+scikit-learn
+segment-anything
+ipywidgets
