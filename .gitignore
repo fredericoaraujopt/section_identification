@@ -5,3 +5,5 @@ examples/manual.ipynb
 .DS_Store
 *.egg-info/
 __pycache__
+# Ignore pickle files
+*.pkl
