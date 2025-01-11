@@ -1,7 +1,7 @@
-.DS_Store
-*.egg-info/
-__pycache__
 models/
 examples/images/jelly_screening copy.png
 examples/colab_automatic.ipynb
 examples/manual.ipynb
+.DS_Store
+*.egg-info/
+__pycache__
