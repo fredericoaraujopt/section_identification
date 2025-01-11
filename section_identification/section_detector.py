@@ -68,8 +68,8 @@ def automatic_identification(image_path, compress=False, apply_filtering=False, 
         # Initialize the SAM model
         print("Initializing SAM model...")
         model_type = "vit_h"
-        checkpoint = "../models/sam_vit_h_4b8939.pth"  # Update with your checkpoint path
-        sam = sam_model_registry[model_type](checkpoint)
+        checkpoint = "/Users/fredericoaraujo/Documents/ES 100/section_identification/models/sam_vit_h_4b8939.pth"  # Update with your checkpoint path
+        sfam = sam_model_registry[model_type](checkpoint)
         sam.to(device=params['device'])
         print("SAM model was initialized successfully.")
 
