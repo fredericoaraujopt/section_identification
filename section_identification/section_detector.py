@@ -5,10 +5,10 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from ipywidgets import interact, IntSlider
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
-from .preprocess import preprocess_image
-from .filtering import filtering
+from section_identification.preprocess import preprocess_image
+from section_identification.filtering import filtering
 
-def automatic_identification(image_path, compress=False, apply_filtering=False, eps_values=None, min_samples_values=None, **kwargs):
+def automatic_identification(image_path, checkpoint, compress=False, apply_filtering=False, eps_values=None, min_samples_values=None, **kwargs):
     """
     Perform automatic mask identification on an input image using the SAM model.
 
@@ -68,8 +68,7 @@ def automatic_identification(image_path, compress=False, apply_filtering=False, 
         # Initialize the SAM model
         print("Initializing SAM model...")
         model_type = "vit_h"
-        checkpoint = "/Users/fredericoaraujo/Documents/ES 100/section_identification/models/sam_vit_h_4b8939.pth"  # Update with your checkpoint path
-        sfam = sam_model_registry[model_type](checkpoint)
+        sam = sam_model_registry[model_type](checkpoint)
         sam.to(device=params['device'])
         print("SAM model was initialized successfully.")
 
