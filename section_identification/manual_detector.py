@@ -60,7 +60,7 @@ def create_embedding_if_needed(image_path, checkpoint, model_type="vit_h", devic
 
     return embedding_file
 
-# NEW
+# NEW VERSION
 
 import os
 import cv2

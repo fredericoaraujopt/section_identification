@@ -29,6 +29,7 @@ def preprocess_image(file_path, max_file_size_kb=100, step=10, initial_quality=8
         if size_kb <= max_file_size_kb:
             img_byte_arr.seek(0)
             img_final = Image.open(img_byte_arr)
+            print("Image shape:", img_final.size)
             return np.array(img_final)
 
         if quality <= 10 or img.width < 50 or img.height < 50:

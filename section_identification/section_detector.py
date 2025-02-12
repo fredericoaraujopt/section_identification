@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from ipywidgets import interact, IntSlider
+from PIL import Image
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from .preprocess import preprocess_image
 from .filtering import filtering
@@ -14,7 +15,7 @@ def automatic_identification(image_path, compress=False, apply_filtering=False, 
 
     Args:
         image_path (str): Path to the input image file.
-        compress (bool): Whether to compress the image before processing.
+        compress (bool): Whether to compress the image before processing. This decreases running time.
         filtering (bool): Whether to filter masks using the filtering function.
         eps_values (list or array-like): Values of eps to try in DBSCAN for filtering.
         min_samples_values (list or array-like): Values of min_samples to try in DBSCAN for filtering.
@@ -54,10 +55,15 @@ def automatic_identification(image_path, compress=False, apply_filtering=False, 
         image = preprocess_image(image_path)
         print("Image is compressed.")
     else:
-        image = np.array(Image.open(image_path))
+        image = Image.open(image_path).convert('RGB')
+        image = np.array(image)
+        print("Image shape:", image.shape)
+
 
     # Cache file for storing generated masks
-    cache_file = f"{os.path.splitext(image_path)[0]}_masks.pkl"
+    cache_tag = "compressed" if compress else "full"
+    cache_file = f"{os.path.splitext(image_path)[0]}_{cache_tag}_masks.pkl"
+
 
     # Check if masks have already been generated for this image
     if os.path.exists(cache_file):
