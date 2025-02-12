@@ -12,7 +12,10 @@ setup(
         'matplotlib',
         'scikit-learn',
         'segment-anything',
-        'ipywidgets'
+        'ipywidgets',
+        'torch',
+        'torchvision',
+        'opencv-python'
     ],
     description='section identification',
     author='Frederico Araujo',
