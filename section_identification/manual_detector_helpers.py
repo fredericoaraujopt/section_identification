@@ -1,0 +1,287 @@
+import numpy as np
+import cv2
+
+def overlay_stored_masks(image, masks, alpha=1, random_color=False):
+    """
+    Overlay stored masks on the original image using detailed mask information.
+    - image: Original image on which to overlay masks.
+    - masks: List of dictionaries, each containing mask data including a segmentation numpy array.
+    - alpha: Transparency factor for the masks, increased to make them more opaque.
+    - random_color: Whether to apply random colors to each mask.
+    Returns an image with the masks overlaid, each mask having a thick contour.
+    """
+    overlay = image.copy()
+    for mask_details in masks:
+        segmentation = mask_details['segmentation']
+        if random_color:
+            # Generate random primary or secondary colors
+            color_choices = [
+                (0.8, 0, 0),  # Darker Red
+                (0, 0.8, 0),  # Darker Green
+                (0, 0, 0.8),  # Darker Blue
+                (0.8, 0.8, 0),  # Darker Yellow
+                (0.8, 0, 0.8),  # Darker Magenta
+                (0, 0.8, 0.8)   # Darker Cyan
+            ]
+            color = np.array(color_choices[np.random.randint(len(color_choices))])  # Choose a random color
+        else:
+            #color = np.array([0, 0.5, 0.8])  # Deep Ocean Blue, approx. HEX #004080
+            color = np.array([30/255, 144/255, 255/255, 0.6])
+        # Convert segmentation to binary mask
+        binary_mask = (segmentation > 0).astype(np.uint8)  # Ensure mask is binary
+        # Find contours of the masks
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Create a color mask
+        mask_color_overlay = np.zeros_like(image, dtype=np.float32)
+        for c in range(3):  # Assuming image has three channels (BGR)
+            mask_color_overlay[:, :, c] = segmentation * color[c]
+        # Convert the float image to uint8
+        mask_color_overlay = (mask_color_overlay * 255).astype(np.uint8)
+        # Draw contours with thick borders
+        cv2.drawContours(mask_color_overlay, contours, -1, (255, 0, 0), 20)  # Drawing with a green color
+        # Apply the color mask to the overlay image
+        overlay = cv2.addWeighted(overlay, 1, mask_color_overlay, alpha, 0)
+
+    return overlay
+
+def process_new_mask(base_image, embedding, click, samScale, orig_size, session, new_masks, alpha=1):
+    """
+    Process a user click to generate and permanently overlay a new mask on the image.
+      - base_image: The current image with all permanent overlays.
+      - embedding: The pre-computed image embedding.
+      - click: Tuple (x, y, clickType) for the user click.
+      - samScale: Scale factor for the SAM model.
+      - orig_size: Original dimensions of the image.
+      - session: ONNX session to run the model.
+      - new_masks: List to store details of new masks.
+      - alpha: Transparency factor for the masks.
+    Returns the updated image with the new mask overlayed and the updated new_masks list.
+    """
+    import cv2
+    import numpy as np
+    import interactive
+
+    # Prepare inputs and run the model to obtain the raw mask prediction.
+    inputs = interactive.prepare_inputs(embedding, click, samScale, orig_size)
+    mask_pred = interactive.run_model(session, inputs)
+
+    # Use the same color and contour style as overlay_stored_masks.
+    # overlay_stored_masks uses a deep ocean blue with an alpha of 0.6.
+    color = np.array([30/255, 144/255, 255/255, 0.6])  # RGBA
+    # Threshold the model output to obtain a binary mask.
+    binary_mask = (mask_pred > 0).astype(np.uint8)
+    # Squeeze the extra dimensions so that binary_mask has shape (H, W)
+    binary_mask = np.squeeze(binary_mask)
+    # Find external contours.
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Create an overlay image for the new mask.
+    mask_color_overlay = np.zeros_like(base_image, dtype=np.float32)
+    for c in range(3):  # Only use RGB channels for the overlay.
+        mask_color_overlay[:, :, c] = binary_mask * color[c]
+    mask_color_overlay = (mask_color_overlay * 255).astype(np.uint8)
+    
+    # Draw contours with thick borders.
+    cv2.drawContours(mask_color_overlay, contours, -1, (255, 0, 0), 20)
+
+    # Blend the new mask overlay onto the base image.
+    updated_overlay = cv2.addWeighted(base_image, 1, mask_color_overlay, alpha, 0)
+
+    # Store the new mask details for later reference.
+    new_mask_details = {"segmentation": mask_pred, "color": color[:3].tolist()}
+    new_masks.append(new_mask_details)
+    print(f"New mask added at position {click}")
+
+    return updated_overlay, new_masks
+
+import time
+def fiducials(image):
+    """
+    Launch fiducials mode: displays an overlay of a zoomed live view (100x100 pixels, zoom factor 4)
+    based on the current mouse position. A dynamic green cross follows the hover on the zoomed view.
+    On mouse click, the marker (displayed with a temporary blue indicator) is saved (with coordinates 
+    relative to the original image) and printed. Press 'm' to exit fiducials mode.
+    
+    Parameters:
+        image (np.ndarray): The original image (BGR) on which to operate.
+    
+    Returns:
+        markers (list): List of saved marker coordinates [(x1, y1), (x2, y2), ...]
+    """
+    zoom_factor = 4
+    zoom_window_size = 1500      # size (in pixels) for the zoomed view window
+    patch_size = zoom_window_size // zoom_factor  # region size in original image (e.g. 25x25)
+
+    markers = []                # List to hold saved marker coordinates
+    current_mouse_pos = (0, 0)  # Latest mouse position (in original image coordinates)
+    temp_marker = None          # Temporary marker info: (x, y, timestamp)
+
+    # Create a dedicated window for fiducials mode.
+    fiducials_window = "Fiducials Mode (Press 'm' to exit)"
+    cv2.namedWindow(fiducials_window, cv2.WINDOW_NORMAL)
+
+    def fiducials_mouse_callback(event, x, y, flags, param):
+        nonlocal current_mouse_pos, markers, temp_marker
+        current_mouse_pos = (x, y)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Save marker (coordinates are relative to the original image)
+            markers.append((x, y))
+            print(f"Fiducial saved at coordinates {(x, y)}")
+            temp_marker = (x, y, time.time())
+
+    cv2.setMouseCallback(fiducials_window, fiducials_mouse_callback)
+
+    def get_zoom_view():
+        """
+        Extract a patch centered on the current mouse position from the original image,
+        resize it (zoom factor 4) to create a zoomed view, and draw the dynamic marker and any
+        saved markers.
+        """
+        x, y = current_mouse_pos
+        h_img, w_img = image.shape[:2]
+        half_patch = patch_size // 2
+
+        # Determine patch boundaries (handling borders)
+        x1 = max(x - half_patch, 0)
+        y1 = max(y - half_patch, 0)
+        x2 = min(x1 + patch_size, w_img)
+        y2 = min(y1 + patch_size, h_img)
+        if (x2 - x1) < patch_size:
+            x1 = max(x2 - patch_size, 0)
+        if (y2 - y1) < patch_size:
+            y1 = max(y2 - patch_size, 0)
+        
+        patch = image[y1:y2, x1:x2].copy()
+        zoom_view = cv2.resize(patch, (zoom_window_size, zoom_window_size), interpolation=cv2.INTER_NEAREST)
+
+        # Draw a dynamic green cross at the relative mouse position.
+        rel_x = int((x - x1) * zoom_factor)
+        rel_y = int((y - y1) * zoom_factor)
+        cv2.drawMarker(zoom_view, (rel_x, rel_y), (0, 255, 0),
+                       markerType=cv2.MARKER_CROSS, markerSize=50, thickness=5)
+
+        # Draw any saved markers (as red circles) that fall within the patch.
+        for mx, my in markers:
+            if x1 <= mx < x2 and y1 <= my < y2:
+                marker_rel_x = int((mx - x1) * zoom_factor)
+                marker_rel_y = int((my - y1) * zoom_factor)
+                cv2.circle(zoom_view, (marker_rel_x, marker_rel_y), 5, (0, 0, 255), thickness=5)
+
+        # Draw temporary marker (blue circle) if recently clicked.
+        if temp_marker is not None:
+            tx, ty, t_stamp = temp_marker
+            if time.time() - t_stamp < 0.5:
+                rel_tx = int((tx - x1) * zoom_factor)
+                rel_ty = int((ty - y1) * zoom_factor)
+                cv2.circle(zoom_view, (rel_tx, rel_ty), 10, (255, 0, 0), thickness=5)
+        return zoom_view
+
+    # Fiducials mode event loop.
+    while True:
+        key = cv2.waitKey(20) & 0xFF
+        if key == ord('m'):
+            # Exit fiducials mode when 'm' is pressed again.
+            break
+
+        display_img = image.copy()
+
+        # Draw persistent markers (red circles) on the display image.
+        for mx, my in markers:
+            cv2.circle(display_img, (mx, my), 10, (0, 0, 255), thickness=5)
+
+        # Draw a temporary marker (blue circle) if applicable.
+        if temp_marker is not None:
+            tx, ty, t_stamp = temp_marker
+            if time.time() - t_stamp < 0.5:
+                cv2.circle(display_img, (tx, ty), 10, (255, 0, 0), thickness=5)
+            else:
+                temp_marker = None
+
+        # Get the zoom view based on the current mouse position.
+        zoom_view = get_zoom_view()
+
+        # Overlay the zoom view on the top-right corner.
+        h_img, w_img = display_img.shape[:2]
+        h_zoom, w_zoom = zoom_view.shape[:2]
+        x_offset = max(w_img - w_zoom - 10, 0)
+        y_offset = 10
+        display_img[y_offset:y_offset+h_zoom, x_offset:x_offset+w_zoom] = zoom_view
+        cv2.rectangle(display_img, (x_offset, y_offset), (x_offset+w_zoom, y_offset+h_zoom), (0, 255, 255), thickness=2)
+
+        cv2.imshow(fiducials_window, display_img)
+
+    cv2.destroyWindow(fiducials_window)
+    return markers
+
+# -----------------------------------------------
+# HELPER that uses SamPredictor instead of ONNX
+# -----------------------------------------------
+
+def process_new_mask_SamPredictor(base_image, click, predictor, new_masks):
+    """
+    Process a user click to generate and permanently overlay a new mask on the image using SamPredictor.
+      - base_image: The current image with permanent overlays.
+      - click: Tuple (x, y) representing the user click coordinates.
+      - predictor: A SamPredictor instance that has already been set with the current image.
+      - new_masks: List to store details of new masks.
+    Returns:
+      - updated_overlay: The image with the new mask overlaid.
+      - new_masks: The updated list of mask details.
+    """
+    import numpy as np
+    import cv2
+    import interactive  # Assuming interactive provides overlay_stored_masks
+
+    # Unpack the click coordinates.
+    x, y = click[:2]
+    
+    # Prepare the point prompt: one positive point.
+    input_point = np.array([[x, y]], dtype=np.float32)
+    input_label = np.array([1], dtype=np.float32)  # 1 indicates a positive prompt
+
+    # Predict masks using SamPredictor.
+    # Here we use multimask_output=True to obtain several candidate masks.
+    masks, scores, logits = predictor.predict(
+        point_coords=input_point,
+        point_labels=input_label,
+        multimask_output=True
+    )
+    
+    # Select the best mask (with the highest score).
+    best_index = int(np.argmax(scores))
+    best_mask = masks[best_index]  # Shape: (H, W), binary mask
+
+    # Compute additional mask details to match standard SAM output structure.
+    # Calculate the area (number of mask pixels).
+    area = int(np.sum(best_mask))
+    
+    # Compute bounding box from the largest contour.
+    binary_mask = best_mask.astype(np.uint8)
+    contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        x_box, y_box, w_box, h_box = cv2.boundingRect(largest_contour)
+        bbox = [x_box, y_box, w_box, h_box]
+    else:
+        bbox = [0, 0, 0, 0]
+    
+    # Build the new mask details dictionary.
+    new_mask_details = {
+        "segmentation": best_mask,
+        "area": area,
+        "bbox": bbox,
+        "predicted_iou": float(scores[best_index]),  # Use the predictor's score as a proxy
+        "point_coords": [[x, y]],
+        "stability_score": 0.0,  # Placeholder (can be updated if more info is available)
+        "crop_box": [0, 0, base_image.shape[1], base_image.shape[0]],
+        "color": (0, 114, 189)  # Standard blue color for consistency
+    }
+    
+    # Append the new mask details to the list.
+    new_masks.append(new_mask_details)
+    print(f"New mask added: {new_mask_details} at position {(x, y)}")
+    
+    # Update the overlay using overlay_stored_masks for consistent appearance.
+    updated_overlay = interactive.overlay_stored_masks(base_image, new_masks)
+    
+    return updated_overlay, new_masks

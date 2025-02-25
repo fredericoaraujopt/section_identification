@@ -40,6 +40,12 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
         'device': 'cpu'
     }
 
+    # Ensure the directory for image files exists
+    file_directory = f"{os.path.splitext(image_path)[0]}_files"
+    if not os.path.exists(file_directory):
+        os.makedirs(file_directory)
+        print(f"Created directory: {file_directory}")
+
     # Default filtering parameters
     if eps_values is None:
         eps_values = np.linspace(100, 1200, 11)
@@ -62,7 +68,7 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
 
     # Cache file for storing generated masks
     cache_tag = "compressed" if compress else "full"
-    cache_file = f"{os.path.splitext(image_path)[0]}_{cache_tag}_masks.pkl"
+    cache_file = f"{file_directory}/{os.path.basename(os.path.splitext(image_path)[0])}_{cache_tag}_masks.pkl"
 
 
     # Check if masks have already been generated for this image
@@ -148,7 +154,8 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
     plot_masks(ax, sorted_masks, 'blue')
     plt.show()
 
+
     # Interactive slider for browsing masks
-    interact(display_mask, index=IntSlider(min=0, max=len(sorted_masks) - 1, step=1, value=0))
+    #interact(display_mask, index=IntSlider(min=0, max=len(sorted_masks) - 1, step=1, value=0))
 
     return sorted_masks

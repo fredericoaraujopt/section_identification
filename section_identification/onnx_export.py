@@ -3,18 +3,19 @@ import sys
 import subprocess
 import warnings
 from pathlib import Path
+from PIL import Image
 
 import torch
 from segment_anything import sam_model_registry
 from segment_anything.utils.onnx import SamOnnxModel
 
 def install_and_export_sam_onnx(
+    image_path: str,
     checkpoint: str,
-    output_onnx: str,
     model_type: str = "vit_h",
     return_single_mask: bool = True,
     opset: int = 17,
-    quantize_out: str = None,
+    quantize_out: bool = True,
     gelu_approximate: bool = False,
     use_stability_score: bool = False,
     return_extra_metrics: bool = False,
@@ -30,7 +31,7 @@ def install_and_export_sam_onnx(
         return_single_mask (bool): If True, the model only returns the best mask
                                    (speeds up the pipeline for large images).
         opset (int): ONNX opset version to use in export. Must be >= 11. (Default=17)
-        quantize_out (str): If not None, will quantize the exported ONNX model
+        quantize_out (str): If True, will quantize the exported ONNX model
                             and write it to this path.
         gelu_approximate (bool): Replace GELU ops with tanh approximations (for
                                  runtimes that have slow/unimplemented erf).
@@ -41,6 +42,22 @@ def install_and_export_sam_onnx(
     Returns:
         str: The path to the final ONNX model file (quantized if requested).
     """
+
+    # ---------------------------
+    # 1) Check if files already exist
+    # ---------------------------
+    # Define paths for the ONNX and quantized model within the directory
+    file_directory = f"{os.path.splitext(image_path)[0]}_files"
+    onnx_path = f"{file_directory}/{os.path.basename(os.path.splitext(image_path)[0])}_onnx.onnx"
+    onnx_quantized_path = f"{file_directory}/{os.path.basename(os.path.splitext(image_path)[0])}_onnx_quantized.onnx"
+
+    # Check if the ONNX or quantized model already exists
+    if os.path.exists(onnx_quantized_path):
+        print(f"Quantized ONNX model already exists: {onnx_quantized_path}")
+        return onnx_quantized_path
+    if os.path.exists(onnx_path):
+        print(f"ONNX model already exists: {onnx_path}")
+        return onnx_path
 
     # ---------------------------
     # 1) Install missing packages
@@ -88,6 +105,7 @@ def install_and_export_sam_onnx(
     embed_dim = sam.prompt_encoder.embed_dim
     embed_size = sam.prompt_encoder.image_embedding_size  # e.g. (64, 64) for ViT-H
     mask_input_size = [4 * x for x in embed_size]          # e.g. (256, 256)
+    image = Image.open(image_path) # image dimensions
 
     dummy_inputs = {
         "image_embeddings": torch.randn(1, embed_dim, *embed_size, dtype=torch.float),
@@ -95,7 +113,7 @@ def install_and_export_sam_onnx(
         "point_labels":     torch.randint(low=0, high=4,   size=(1, 5),     dtype=torch.float),
         "mask_input":       torch.randn(1, 1, *mask_input_size, dtype=torch.float),
         "has_mask_input":   torch.tensor([1], dtype=torch.float),
-        "orig_im_size":     torch.tensor([1500, 2250], dtype=torch.float),
+        "orig_im_size":     torch.tensor([image.height, image.width], dtype=torch.float), 
     }
 
     _ = onnx_model(**dummy_inputs)  # initial dry run
@@ -103,13 +121,14 @@ def install_and_export_sam_onnx(
     dynamic_axes = {
         "point_coords": {1: "num_points"},
         "point_labels": {1: "num_points"},
+        "orig_im_size": {0: "im_size"},
     }
     output_names = ["masks", "iou_predictions", "low_res_masks"]
 
     # ---------------------------
     # 4) Export to ONNX
     # ---------------------------
-    output_onnx = Path(output_onnx)
+    output_onnx = Path(onnx_path)
     output_onnx.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"[Info] Exporting ONNX model to '{output_onnx}'...")
@@ -138,7 +157,8 @@ def install_and_export_sam_onnx(
     # ---------------------------
     # 5) (Optional) Quantize
     # ---------------------------
-    if quantize_out is not None:
+    if quantize_out:
+        quantize_out = onnx_quantized_path
         print(f"[Info] Quantizing model => '{quantize_out}'...")
         quantize_dynamic(
             model_input=str(output_onnx),
