@@ -1,43 +1,67 @@
 import numpy as np
 import cv2
 
+import numpy as np
+import cv2
+
+import numpy as np
+import cv2
+from pycocotools import mask as mask_utils
+
 def overlay_stored_masks(image, masks, alpha=0.5, random_color=True):
     """
     Overlay stored masks on the original image using detailed mask information.
     - image: Original image on which to overlay masks.
-    - masks: List of dictionaries, each containing mask data including a segmentation numpy array.
-    - alpha: Transparency factor for the masks, increased to make them more opaque.
+    - masks: List of dictionaries, each containing mask data including a segmentation mask 
+             (either as a binary array or in COCO RLE format).
+    - alpha: Transparency factor for the masks.
     - random_color: Whether to apply random colors to each mask.
-    Returns an image with the masks overlaid, each mask having a thick contour.
+    
+    Returns:
+        An image with the masks overlaid, each mask having a thick contour.
     """
     overlay = image.copy()
-    for mask_details in masks:
+
+    # Pre-compute random colors if necessary.
+    if random_color:
+        color_choices = np.array([
+            [1, 0.8, 0.8],  # Pastel Red
+            [0.8, 1, 0.8],  # Pastel Green
+            [0.8, 0.8, 1],  # Pastel Blue
+            [1, 1, 0.8],    # Pastel Yellow
+            [1, 0.8, 1],    # Pastel Magenta
+            [0.8, 1, 1]     # Pastel Cyan
+        ])
+        colors = color_choices[np.random.choice(len(color_choices), size=len(masks))]
+    else:
+        colors = [np.array([0.8, 0.9, 1]) for _ in range(len(masks))]
+
+    # Process each mask individually.
+    for i, mask_details in enumerate(masks):
+        print(f"Processing mask {i+1}/{len(masks)}")
         segmentation = mask_details['segmentation']
-        if random_color:
-            # Generate random primary or secondary colors
-            color_choices = [
-                (1, 0.8, 0.8),  # Pastel Red
-                (0.8, 1, 0.8),  # Pastel Green
-                (0.8, 0.8, 1),  # Pastel Blue
-                (1, 1, 0.8),    # Pastel Yellow
-                (1, 0.8, 1),    # Pastel Magenta
-                (0.8, 1, 1)     # Pastel Cyan
-            ]
-            color = np.array(color_choices[np.random.randint(len(color_choices))])  # Choose a random color
-        else:
-            color = np.array([0.8, 0.9, 1])  # Default to a soft blue
 
-        binary_mask = (segmentation > 0).astype(np.uint8)  # Convert segmentation to binary mask
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE) # Find contours of the masks
-        mask_color_overlay = np.zeros_like(image, dtype=np.float32) # Create a color mask
-        for c in range(3):  # Assuming image has three channels (BGR)
-            mask_color_overlay[:, :, c] = segmentation * color[c]
-
-        mask_color_overlay = (mask_color_overlay * 255).astype(np.uint8) # Convert the float image to uint8
-        cv2.drawContours(mask_color_overlay, contours, -1, (255, 0, 0), 20)  # Draw contours with thick borders
-        # Apply the color mask to the overlay image
-        overlay = cv2.addWeighted(overlay, 1, mask_color_overlay, alpha, 0) #change to 1-alpha
-
+        # Convert segmentation to binary mask
+        binary_mask = (segmentation > 0).astype(np.uint8) 
+        
+        # Find contours in the binary mask.
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Create a color mask overlay for this mask.
+        mask_color_overlay = np.zeros_like(image, dtype=np.float32)
+        color = colors[i]
+        for c in range(3):  # For each channel (assumes image is in BGR)
+            mask_color_overlay[:, :, c] = binary_mask * color[c]
+        
+        # Convert the float overlay to uint8.
+        mask_color_overlay = (mask_color_overlay * 255).astype(np.uint8)
+        
+        # Draw contours with a specified thickness (e.g., 2 pixels) and color (blue in BGR).
+        cv2.drawContours(mask_color_overlay, contours, -1, (255, 0, 0), 15)
+        
+        # Blend the current mask overlay with the overall overlay image.
+        overlay = cv2.addWeighted(overlay, 1, mask_color_overlay, alpha, 0)
+    
     return overlay
 
 def process_overlay(base_overlay, embedding, hover, samScale, orig_size, session):

@@ -6,6 +6,7 @@ from matplotlib.patches import Rectangle
 from ipywidgets import interact, IntSlider
 from PIL import Image
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+from pycocotools import mask as mask_utils
 from section_identification.preprocess import preprocess_image
 from section_identification.filtering import filtering
 
