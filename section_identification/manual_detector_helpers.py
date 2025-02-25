@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 
-def overlay_stored_masks(image, masks, alpha=1, random_color=False):
+def overlay_stored_masks(image, masks, alpha=0.5, random_color=True):
     """
     Overlay stored masks on the original image using detailed mask information.
     - image: Original image on which to overlay masks.
@@ -16,33 +16,50 @@ def overlay_stored_masks(image, masks, alpha=1, random_color=False):
         if random_color:
             # Generate random primary or secondary colors
             color_choices = [
-                (0.8, 0, 0),  # Darker Red
-                (0, 0.8, 0),  # Darker Green
-                (0, 0, 0.8),  # Darker Blue
-                (0.8, 0.8, 0),  # Darker Yellow
-                (0.8, 0, 0.8),  # Darker Magenta
-                (0, 0.8, 0.8)   # Darker Cyan
+                (1, 0.8, 0.8),  # Pastel Red
+                (0.8, 1, 0.8),  # Pastel Green
+                (0.8, 0.8, 1),  # Pastel Blue
+                (1, 1, 0.8),    # Pastel Yellow
+                (1, 0.8, 1),    # Pastel Magenta
+                (0.8, 1, 1)     # Pastel Cyan
             ]
             color = np.array(color_choices[np.random.randint(len(color_choices))])  # Choose a random color
         else:
-            #color = np.array([0, 0.5, 0.8])  # Deep Ocean Blue, approx. HEX #004080
-            color = np.array([30/255, 144/255, 255/255, 0.6])
-        # Convert segmentation to binary mask
-        binary_mask = (segmentation > 0).astype(np.uint8)  # Ensure mask is binary
-        # Find contours of the masks
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        # Create a color mask
-        mask_color_overlay = np.zeros_like(image, dtype=np.float32)
+            color = np.array([0.8, 0.9, 1])  # Default to a soft blue
+
+        binary_mask = (segmentation > 0).astype(np.uint8)  # Convert segmentation to binary mask
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE) # Find contours of the masks
+        mask_color_overlay = np.zeros_like(image, dtype=np.float32) # Create a color mask
         for c in range(3):  # Assuming image has three channels (BGR)
             mask_color_overlay[:, :, c] = segmentation * color[c]
-        # Convert the float image to uint8
-        mask_color_overlay = (mask_color_overlay * 255).astype(np.uint8)
-        # Draw contours with thick borders
-        cv2.drawContours(mask_color_overlay, contours, -1, (255, 0, 0), 20)  # Drawing with a green color
+
+        mask_color_overlay = (mask_color_overlay * 255).astype(np.uint8) # Convert the float image to uint8
+        cv2.drawContours(mask_color_overlay, contours, -1, (255, 0, 0), 20)  # Draw contours with thick borders
         # Apply the color mask to the overlay image
-        overlay = cv2.addWeighted(overlay, 1, mask_color_overlay, alpha, 0)
+        overlay = cv2.addWeighted(overlay, 1, mask_color_overlay, alpha, 0) #change to 1-alpha
 
     return overlay
+
+def process_overlay(base_overlay, embedding, hover, samScale, orig_size, session):
+    """
+    Process hover input to create an ephemeral mask and overlay it on the given image.
+    
+    Parameters:
+    - base_overlay: The current display overlay.
+    - embedding: The pre-computed image embedding.
+    - hover: Coordinates and type of hover event.
+    - samScale: Scale factor for the SAM model.
+    - orig_size: Original dimensions of the image.
+    - session: ONNX session to run the model.
+
+    Returns:
+    - Updated overlay with the ephemeral mask applied.
+    """
+    import interactive
+    inputs_hover = interactive.prepare_inputs(embedding, hover, samScale, orig_size)
+    mask_hover = interactive.run_model(session, inputs_hover)
+    updated_overlay = interactive.overlay_mask(base_overlay, mask_hover)
+    return updated_overlay
 
 def process_new_mask(base_image, embedding, click, samScale, orig_size, session, new_masks, alpha=1):
     """
@@ -67,7 +84,7 @@ def process_new_mask(base_image, embedding, click, samScale, orig_size, session,
 
     # Use the same color and contour style as overlay_stored_masks.
     # overlay_stored_masks uses a deep ocean blue with an alpha of 0.6.
-    color = np.array([30/255, 144/255, 255/255, 0.6])  # RGBA
+    color = np.array([0.8, 0.9, 1])  # Default to a soft blue
     # Threshold the model output to obtain a binary mask.
     binary_mask = (mask_pred > 0).astype(np.uint8)
     # Squeeze the extra dimensions so that binary_mask has shape (H, W)
@@ -88,7 +105,7 @@ def process_new_mask(base_image, embedding, click, samScale, orig_size, session,
     updated_overlay = cv2.addWeighted(base_image, 1, mask_color_overlay, alpha, 0)
 
     # Store the new mask details for later reference.
-    new_mask_details = {"segmentation": mask_pred, "color": color[:3].tolist()}
+    new_mask_details = {"segmentation": binary_mask, "color": color[:3].tolist()}
     new_masks.append(new_mask_details)
     print(f"New mask added at position {click}")
 
@@ -212,6 +229,102 @@ def fiducials(image):
 
     cv2.destroyWindow(fiducials_window)
     return markers
+
+def exclude_mask(image, stored_masks, new_masks, current_mouse, base_overlay):
+    """
+    Exclude a mask from stored_masks or new_masks based on the current mouse coordinates.
+    
+    Parameters:
+      image         : Original BGR image (numpy array).
+      stored_masks  : List of initially stored masks (each with a 'segmentation' field).
+      new_masks     : List of masks added during the session (each with a 'segmentation' field).
+      current_mouse : Tuple (x, y, clickType) or (x, y) representing the current mouse coordinates.
+      base_overlay  : The current permanent overlay image.
+      
+    Returns:
+      updated_base_overlay, new_masks, stored_masks.
+    
+    Workflow:
+      1. Check at the given coordinates whether any mask (from new_masks or stored_masks) exists.
+      2. If found, create a temporary overlay that highlights that mask’s contour (in red) and display it.
+      3. Wait for the user to press “r” again to confirm deletion.
+      4. If confirmed, remove that mask from its list and update base_overlay accordingly.
+      5. If not confirmed, leave the masks unchanged.
+    """
+    import cv2
+    import numpy as np
+    import interactive  # for overlay_stored_masks
+    
+    # Unpack mouse coordinates (assume first two elements are x, y)
+    x, y = current_mouse[:2]
+    mask_found = None
+    mask_list = None  # either 'new' or 'stored'
+    mask_index = None
+
+    # Helper: Given a segmentation field, return a binary mask (2D).
+    def get_binary(segmentation):
+        bin_mask = np.squeeze(segmentation)
+        if bin_mask.dtype != np.uint8:
+            bin_mask = (bin_mask > 0).astype(np.uint8)
+        return bin_mask
+
+    # Search new_masks first.
+    for i, mask in enumerate(new_masks):
+        bin_mask = get_binary(mask["segmentation"])
+        # Ensure the coordinate is within the mask shape.
+        if y < bin_mask.shape[0] and x < bin_mask.shape[1]:
+            if bin_mask[y, x] == 1:
+                mask_found = mask
+                mask_list = 'new'
+                mask_index = i
+                break
+
+    # If not found, search stored_masks.
+    if mask_found is None:
+        for i, mask in enumerate(stored_masks):
+            bin_mask = get_binary(mask["segmentation"])
+            if y < bin_mask.shape[0] and x < bin_mask.shape[1]:
+                if bin_mask[y, x] == 1:
+                    mask_found = mask
+                    mask_list = 'stored'
+                    mask_index = i
+                    break
+
+    if mask_found is None:
+        print("No mask found at this location.")
+        return base_overlay, new_masks, stored_masks
+
+    # If a mask is found, extract its contours for highlighting.
+    seg = get_binary(mask_found["segmentation"])
+    contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Create a temporary overlay: copy the current base overlay.
+    temp_overlay = base_overlay.copy()
+    # Highlight the found mask by drawing its contours in red (BGR: (0, 0, 255)) with a thick line.
+    cv2.drawContours(temp_overlay, contours, -1, (0, 0, 255), 4)
+    cv2.imshow("Confirm Exclusion", temp_overlay)
+    print("Mask found at location ({}, {}).".format(x, y))
+    print("Press 'r' again to confirm deletion of the highlighted mask, or any other key to cancel.")
+    
+    # Wait indefinitely for a key press.
+    key = cv2.waitKey(0) & 0xFF
+    cv2.destroyWindow("Confirm Exclusion")
+    
+    if key == ord('r'):
+        # Delete the mask.
+        if mask_list == 'new':
+            del new_masks[mask_index]
+            print("Deleted mask from new_masks.")
+        else:
+            del stored_masks[mask_index]
+            print("Deleted mask from stored_masks.")
+        # Recompute the base overlay by combining the remaining masks.
+        combined_masks = stored_masks + new_masks
+        base_overlay = interactive.overlay_stored_masks(image, combined_masks)
+    else:
+        print("Exclusion cancelled.")
+    
+    return base_overlay, new_masks, stored_masks
 
 # -----------------------------------------------
 # HELPER that uses SamPredictor instead of ONNX

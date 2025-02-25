@@ -1,4 +1,4 @@
-def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials, visualize=False):
+def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials, visualize=False, sample_points=None):
     """
     Export the contour coordinates of new_masks and stored_masks and fiducial information to a CSV file.
     
@@ -18,6 +18,9 @@ def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials, visu
     If visualize=True, the function will display:
       - The image with overlaid contours (drawn with thick borders).
       - Markers at each fiducial location.
+
+    If sample_points is not None, the function will store only the specified number of equally spaced points per contour.
+      - This is useful to reduce the number of points in the CSV even though at the cost of precise shape of the polygon.
     
     Returns the export file path.
     """
@@ -47,7 +50,14 @@ def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials, visu
         contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contour_list = []
         for cnt in contours:
-            points = cnt.reshape(-1, 2).tolist()
+            if sample_points is not None and len(cnt) > sample_points:
+                # Reducing number of points to sample_points equally spaced points.
+                total_points = len(cnt)
+                indices = np.round(np.linspace(0, total_points - 1, sample_points)).astype(int)
+                sampled_cnt = cnt[indices]
+                points = sampled_cnt.reshape(-1, 2).tolist()
+            else:
+                points = cnt.reshape(-1, 2).tolist()
             contour_list.append(points)
         return contour_list
 
@@ -83,8 +93,8 @@ def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials, visu
     for idx, mask in enumerate(stored_masks, start=1):
         contours = get_contours(mask["segmentation"])
         row = {
-            "id": f"stored_{idx}",
-            "type": "stored_mask",
+            "id": f"Polygon {idx}",
+            "type": "mask",
             "contour_coordinates": str(contours),
             "distance": ""
         }

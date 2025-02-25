@@ -6,7 +6,9 @@ import onnxruntime as ort
 from pathlib import Path
 
 from manual_detector_helpers import overlay_stored_masks
+from manual_detector_helpers import process_overlay
 from manual_detector_helpers import fiducials
+from manual_detector_helpers import exclude_mask
 
 # Import your helper functions from your package.
 # (Assumes these are defined in modules onnx_export and embedding_helper.)
@@ -159,25 +161,30 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
     last_processed_click = None
 
     try:
+        markers = []
         while True:
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                 break 
-
+            
             if key == ord('m'):
                 # Suspend segmentation and launch fiducials mode.
                 markers = fiducials(image)
                 print("Fiducial markers collected:", markers)
                 # After fiducials mode, segmentation resumes with its previous state.
+            
+            if key == ord('r'):
+                # Call exclude_mask with the current mouse coordinates.
+                base_overlay, new_masks, stored_masks = exclude_mask(
+                    image, stored_masks, new_masks, latest_hover, base_overlay
+                )
 
             # Start with the permanent overlay.
             overlay_to_display = base_overlay.copy()
 
             # --- Dynamic Hover: Create an ephemeral mask using latest_hover.
             if latest_hover is not None:
-                inputs_hover = prepare_inputs(embedding, latest_hover, samScale, orig_size)
-                mask_hover = run_model(session, inputs_hover)
-                overlay_to_display = overlay_mask(overlay_to_display, mask_hover)
+                overlay_to_display = process_overlay(overlay_to_display, embedding, latest_hover, samScale, orig_size, session)
 
             # --- Permanent Click: Process click events only if new.
             if latest_click is not None and latest_click != last_processed_click:
@@ -185,12 +192,13 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
                 last_processed_click = latest_click
                 # Refresh the display overlay with the new permanent mask.
                 overlay_to_display = base_overlay.copy()
-
+            
             cv2.imshow(window_name, overlay_to_display)
 
     except Exception as e:
         print("An error occurred during the interactive loop:", e)
     finally:
-        cv2.destroyAllWindows()
+        cv2.destroyWindow(window_name)
+        cv2.waitKey(1)
         print("[Info] Exiting interactive segmentation.")
         return new_masks, stored_masks, markers
