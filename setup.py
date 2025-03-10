@@ -15,7 +15,13 @@ setup(
         'ipywidgets',
         'torch',
         'torchvision',
-        'opencv-python'
+        'opencv-python',
+        'ipycanvas',
+        'ipyevents'
+        'ipython'
+        'onnxruntime'
+        'opencv_python'
+        'pycocotools'
     ],
     description='section identification',
     author='Frederico Araujo',
