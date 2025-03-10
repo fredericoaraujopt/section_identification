@@ -22,6 +22,13 @@ setup(
         'onnxruntime'
         'opencv_python'
         'pycocotools'
+        'opencv-python',
+        'ipycanvas',
+        'ipyevents',
+        'ipython',
+        'onnxruntime',
+        'opencv-python',
+        'pycocotools'
     ],
     description='section identification',
     author='Frederico Araujo',
