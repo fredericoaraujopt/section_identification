@@ -9,6 +9,7 @@ from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 from pycocotools import mask as mask_utils
 from section_identification.preprocess import preprocess_image
 from section_identification.filtering import filtering
+import time
 
 def automatic_identification(image_path, checkpoint, compress=False, apply_filtering=False, eps_values=None, min_samples_values=None, **kwargs):
     """
@@ -31,6 +32,7 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
     Returns:
         list: A list of generated masks sorted by area, with each mask containing its properties like bbox and area.
     """
+    start_time = time.time()
     # Default parameters
     default_params = {
         'points_per_side': 32,
@@ -136,8 +138,10 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
 
         # Display the image
         ax.imshow(image, cmap='gray')
-        ax.set_title(f'Mask ID: {sorted_mask_ids[id(mask)]}\nArea: {mask["area"]} pixels')
-
+        image_label = os.path.splitext(os.path.basename(image_path))[0]
+        title_suffix = "Filtered Masks" if apply_filtering else "Identified Masks"
+        ax.set_title(f"{image_label} - {title_suffix}")
+        
         # Draw the bounding box for the mask
         rect = Rectangle((bbox[0], bbox[1]), bbox[2], bbox[3], linewidth=1, edgecolor='red', facecolor='none')
         ax.add_patch(rect)
@@ -151,7 +155,8 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
     # Plot the first figure: image with masks
     fig, ax = plt.subplots(1, 1, figsize=(10, 8))
     ax.imshow(image, cmap='gray')
-    ax.set_title('Image with Identified Masks' if not filtering else 'Image with Filtered Masks')
+    image_label = os.path.splitext(os.path.basename(image_path))[0]
+    ax.set_title(f"{image_label} - {'Filtered Masks' if apply_filtering else 'Identified Masks'}")
     plot_masks(ax, sorted_masks, 'blue')
     plt.show()
 
@@ -159,4 +164,6 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
     # Interactive slider for browsing masks
     #interact(display_mask, index=IntSlider(min=0, max=len(sorted_masks) - 1, step=1, value=0))
 
+    end_time = time.time()
+    print(f"Time taken to run automatic_identification for {os.path.basename(image_path)}: {end_time - start_time:.2f} seconds")
     return sorted_masks
