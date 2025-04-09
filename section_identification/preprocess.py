@@ -16,7 +16,7 @@ def preprocess_image(file_path, max_file_size_kb=100, step=10, initial_quality=8
         np.ndarray: Processed image as a NumPy array.
     """
     img = Image.open(file_path)
-    if img.mode == 'P':  
+    if img.mode != 'RGB':
         img = img.convert('RGB')
     img_format = 'JPEG'
 

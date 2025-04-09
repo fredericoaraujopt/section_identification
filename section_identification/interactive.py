@@ -5,10 +5,10 @@ import numpy as np
 import onnxruntime as ort
 from pathlib import Path
 
-from manual_detector_helpers import overlay_stored_masks
-from manual_detector_helpers import process_overlay
-from manual_detector_helpers import fiducials
-from manual_detector_helpers import exclude_mask
+from section_identification.interactive_helpers import overlay_stored_masks
+from section_identification.interactive_helpers import process_overlay
+from section_identification.interactive_helpers import fiducials
+from section_identification.interactive_helpers import exclude_mask
 
 # Import your helper functions from your package.
 # (Assumes these are defined in modules onnx_export and embedding_helper.)
@@ -114,7 +114,7 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
     The function exports a quantized ONNX model for this image, creates the image embedding
     (if needed), and launches an interactive OpenCV window. The loop stops when ESC is pressed.
     """
-    from manual_detector_helpers import process_new_mask
+    from section_identification.interactive_helpers import process_new_mask
     global latest_click, latest_hover, last_processed_click, current_overlay
 
     # Step 1: Export and quantize the ONNX model for this image.

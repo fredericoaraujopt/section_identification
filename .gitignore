@@ -7,3 +7,6 @@ examples/manual.ipynb
 __pycache__
 # Ignore pickle files
 *.pkl
+images_local/
+section_identification/TESTING_local.ipynb
+section_identification/test.py
