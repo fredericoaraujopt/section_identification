@@ -4,6 +4,8 @@ This Python package provides an interface for targeting sections on silicon wafe
 
 The interface integrates the Segment Anything Model (SAM) for automated section segmentation and includes a manual correction GUI for refining segmentation results.
 
+Results from section targeting experiments on 25 wafers are found in `experiments/results.ipynb`.
+
 ## Installation
 ```
 git clone https://github.com/fredericoaraujopt/section_identification.git
