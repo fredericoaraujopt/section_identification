@@ -45,39 +45,3 @@ Use the `demo.ipynb` notebook to explore the functionality of the package. The n
    Run the `export_mask_coordinates()` function to save mask countours and fiducial coordinates into a CSV file.
 
 📺 **Video demo** of the manual targeting process: [Manual targeting 🔬](https://www.loom.com/share/d361c44e708e4592a820a8e2ce8e36a0?sid=fd021e3d-a311-46fb-9ea0-ab85b4af4b5d)
-
-
-# Basic git tutorial
-## Contributing new changes
-Make sure your main branch is up to date
-```
-git checkout main
-git pull
-```
-Checkout new branch
-```
-git checkout -b <name>-<feature>
-```
-Make changes.
-Make sure tests pass:
-```
-pytest .
-```
-Push changes:
-```
-git add <files to be pushed>
-git commit -m "<commit message>"
-git push # might need to use git push --set-upstream origin <name>-<feature>
-```
-
-## Pulling changes
-Make sure your main branch is up to date
-```
-git checkout main
-git pull
-```
-Checkout the branch that you want to update
-```
-git checkout <name>-<feature>
-git merge main
-```
