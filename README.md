@@ -4,19 +4,6 @@ This Python package provides an interface for targeting sections on silicon wafe
 
 The interface integrates the Segment Anything Model (SAM) for automated section segmentation and includes a manual correction GUI for refining segmentation results.
 
-### Overview of Modules
-
-The section targeting interface consists of three key modules:
-
-1. **Automatic Identification**  
-   Automates the detection of sections on wafer images using the Segment Anything Model (SAM). The module includes image compression (for testing on lower-spec machines), mask generation with SAM, and clustering-based filtering (DBSCAN) to isolate true sections. Parameters like `min_mask_area` and `points_per_side` are configurable for flexibility across samples.
-
-2. **Manual Detector**  
-   Provides a graphical interface for real-time correction of segmentation outputs. Users can hover and click to add new sections, press keys to remove false positives, and mark fiducial points. It leverages ONNX-quantized models for faster runtime on lower-resource machines and enhances segmentation completeness and precision through manual input.
-
-3. **Export Coordinates**  
-   This module compiles the final set of section masks and fiducials and exports their contours to a CSV file. The exported format is compatible with the electron microscopy imaging system, ensuring accurate targeting of sections.
-
 ## Installation
 ```
 git clone https://github.com/fredericoaraujopt/section_identification.git

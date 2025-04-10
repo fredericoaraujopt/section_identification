@@ -79,7 +79,7 @@ def process_overlay(base_overlay, embedding, hover, samScale, orig_size, session
     Returns:
     - Updated overlay with the ephemeral mask applied.
     """
-    import interactive
+    from section_identification import interactive
     inputs_hover = interactive.prepare_inputs(embedding, hover, samScale, orig_size)
     mask_hover = interactive.run_model(session, inputs_hover)
     updated_overlay = interactive.overlay_mask(base_overlay, mask_hover)
@@ -100,7 +100,7 @@ def process_new_mask(base_image, embedding, click, samScale, orig_size, session,
     """
     import cv2
     import numpy as np
-    import interactive
+    from section_identification import interactive
 
     # Prepare inputs and run the model to obtain the raw mask prediction.
     inputs = interactive.prepare_inputs(embedding, click, samScale, orig_size)
@@ -277,7 +277,7 @@ def exclude_mask(image, stored_masks, new_masks, current_mouse, base_overlay):
     """
     import cv2
     import numpy as np
-    import interactive  # for overlay_stored_masks
+    from section_identification import interactive  # for overlay_stored_masks
     
     # Unpack mouse coordinates (assume first two elements are x, y)
     x, y = current_mouse[:2]
@@ -367,7 +367,7 @@ def process_new_mask_SamPredictor(base_image, click, predictor, new_masks):
     """
     import numpy as np
     import cv2
-    import interactive  # Assuming interactive provides overlay_stored_masks
+    from section_identification import interactive  # Assuming interactive provides overlay_stored_masks
 
     # Unpack the click coordinates.
     x, y = click[:2]

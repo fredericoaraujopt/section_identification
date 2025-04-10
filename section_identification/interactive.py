@@ -5,15 +5,15 @@ import numpy as np
 import onnxruntime as ort
 from pathlib import Path
 
+
+# Import your helper functions from package.
 from section_identification.interactive_helpers import overlay_stored_masks
 from section_identification.interactive_helpers import process_overlay
 from section_identification.interactive_helpers import fiducials
 from section_identification.interactive_helpers import exclude_mask
 
-# Import your helper functions from your package.
-# (Assumes these are defined in modules onnx_export and embedding_helper.)
-from onnx_export import install_and_export_sam_onnx
-from create_embedding import create_embedding_if_needed
+from section_identification.onnx_export import install_and_export_sam_onnx
+from section_identification.create_embedding import create_embedding_if_needed
 
 # Constants
 LONG_SIDE_LENGTH = 1024         # SAM requires the longest side to be 1024
