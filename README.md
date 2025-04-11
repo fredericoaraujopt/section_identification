@@ -15,7 +15,7 @@ pip install -e .
 
 ## Tutorial
 
-Use the `demo.ipynb` notebook to explore the functionality of the package. The notebook follows the operation steps:
+Use the `demo.ipynb` notebook to explore the functionality of the package.
 
 1. **Load your image**  
    Indicate the path to the image of interest.
