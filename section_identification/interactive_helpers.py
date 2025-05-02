@@ -1,8 +1,55 @@
-import numpy as np
-import cv2
+import os
+import pickle
+
+def save_interactive_state(image_path, new_masks, stored_masks, fiducials):
+    folder = f"{os.path.splitext(str(image_path))[0]}_files"
+    os.makedirs(folder, exist_ok=True)
+    basename = os.path.basename(os.path.splitext(str(image_path))[0])
+    state_fn = os.path.join(folder, f"{basename}_interactive_state.pkl")
+    with open(state_fn, "wb") as f:
+        pickle.dump({
+            "stored_masks": stored_masks,
+            "new_masks": new_masks,
+            "fiducials": fiducials
+        }, f)
+
+def load_interactive_state(image_path):
+    folder = f"{os.path.splitext(str(image_path))[0]}_files"
+    basename = os.path.basename(os.path.splitext(str(image_path))[0])
+    state_fn = os.path.join(folder, f"{basename}_interactive_state.pkl")
+    if os.path.exists(state_fn):
+        with open(state_fn, "rb") as f:
+            return pickle.load(f)
+    return None
+def recompose_overlay(image, masks, alpha=0.5):
+    """
+    Recompose the overlay image by blending each mask's cached 'overlay' over the base image.
+    Each mask dict must have an 'overlay' key (precomputed overlay for that mask).
+    The overlays are blended sequentially using cv2.addWeighted with the given alpha.
+    Returns the final overlay image.
+    """
+    overlay = image.copy()
+    for mask in masks:
+        if "overlay" in mask:
+            overlay = cv2.addWeighted(overlay, 1, mask["overlay"], alpha, 0)
+    return overlay
+
+
+# Display masks overlay utility
+def display_masks(image, stored_masks, new_masks, show=True, alpha=0.5):
+    """
+    Return an image with masks overlaid if show=True, otherwise return the original image.
+    Combines stored_masks and new_masks, using their cached 'overlay' layers.
+    """
+    if show:
+        return recompose_overlay(image, stored_masks + new_masks, alpha)
+    else:
+        return image.copy()
 
 import numpy as np
 import cv2
+from qtpy import QtWidgets
+import napari
 
 import numpy as np
 import cv2
@@ -128,8 +175,8 @@ def process_new_mask(base_image, embedding, click, samScale, orig_size, session,
     # Blend the new mask overlay onto the base image.
     updated_overlay = cv2.addWeighted(base_image, 1, mask_color_overlay, alpha, 0)
 
-    # Store the new mask details for later reference.
-    new_mask_details = {"segmentation": binary_mask, "color": color[:3].tolist()}
+    # Store the new mask details for later reference, including the overlay.
+    new_mask_details = {"segmentation": binary_mask, "color": color[:3].tolist(), "overlay": mask_color_overlay}
     new_masks.append(new_mask_details)
     print(f"New mask added at position {click}")
 
@@ -342,13 +389,65 @@ def exclude_mask(image, stored_masks, new_masks, current_mouse, base_overlay):
         else:
             del stored_masks[mask_index]
             print("Deleted mask from stored_masks.")
-        # Recompute the base overlay by combining the remaining masks.
-        combined_masks = stored_masks + new_masks
-        base_overlay = interactive.overlay_stored_masks(image, combined_masks)
+        # Recompute the base overlay by combining the remaining masks using recompose_overlay.
+        from section_identification.interactive_helpers import recompose_overlay
+        combined = stored_masks + new_masks
+        base_overlay = recompose_overlay(image, combined, alpha=0.5)
     else:
         print("Exclusion cancelled.")
     
     return base_overlay, new_masks, stored_masks
+
+def display_help():
+    """
+    Show a help window with usage instructions. Press 'h' to toggle this window.
+    """
+    from qtpy import QtWidgets
+    import napari
+
+    help_html = """
+    <html><body>
+    <p>Video tutorial here: <a href="https://www.loom.com/share/d361c44e708e4592a820a8e2ce8e36a0">https://www.loom.com/share/d361c44e708e4592a820a8e2ce8e36a0</a></p>
+    <p>Hover over sections to preview masks.<br>
+    Click to a dd a new mask.<br>
+    Press 'r' to select a mask. Press 'r' again to remove mask.<br>
+    Press 'd' to display masks. Press 'd' again to hide masks.<br>
+    Press 'm' to mark fiducials (opens zoomed window).<br>
+    Press 'Esc' to exit the interface.</p>
+    <p>Developed by Frederico Araujo.<br>
+    Code: <a href="https://github.com/fredericoaraujopt/section_identification">GitHub Repository</a></p>
+    </body></html>
+    """
+
+    # If dialog exists and is visible, raise it
+    if hasattr(display_help, "_dialog") and display_help._dialog is not None:
+        display_help._dialog.raise_()
+        return
+
+    # Create dialog with Napari main window as parent
+    try:
+        viewer = napari.current_viewer()
+        parent_window = viewer.window._qt_window
+    except Exception:
+        parent_window = None
+
+    dialog = QtWidgets.QDialog(parent_window)
+    dialog.setWindowTitle("Help")
+    dialog.resize(600, 400)
+    layout = QtWidgets.QVBoxLayout(dialog)
+    text_browser = QtWidgets.QTextBrowser()
+    text_browser.setHtml(help_html)
+    text_browser.setOpenExternalLinks(True)
+    layout.addWidget(text_browser)
+
+    # Position next to main Napari window if possible
+    if parent_window:
+        geom = parent_window.frameGeometry()
+        dialog.move(geom.x() + geom.width() + 10, geom.y())
+
+    # Store dialog reference and show
+    display_help._dialog = dialog
+    dialog.show()
 
 # -----------------------------------------------
 # HELPER that uses SamPredictor instead of ONNX
