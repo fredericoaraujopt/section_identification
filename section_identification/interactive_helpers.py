@@ -407,9 +407,9 @@ def display_help():
 
     help_html = """
     <html><body>
-    <p>Video tutorial here: <a href="https://www.loom.com/share/d361c44e708e4592a820a8e2ce8e36a0">https://www.loom.com/share/d361c44e708e4592a820a8e2ce8e36a0</a></p>
+    <p>Video tutorial here: <a href="https://www.loom.com/share/d361c44e708e4592a820a8e2ce8e36a0">Tutorial 🔬</a></p>
     <p>Hover over sections to preview masks.<br>
-    Click to a dd a new mask.<br>
+    Click to add a new mask.<br>
     Press 'r' to select a mask. Press 'r' again to remove mask.<br>
     Press 'd' to display masks. Press 'd' again to hide masks.<br>
     Press 'm' to mark fiducials (opens zoomed window).<br>
