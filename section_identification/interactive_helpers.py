@@ -400,7 +400,7 @@ def exclude_mask(image, stored_masks, new_masks, current_mouse, base_overlay):
 
 def display_help():
     """
-    Show a help window with usage instructions. Press 'h' to toggle this window.
+    Show a help window with usage instructions.
     """
     from qtpy import QtWidgets
     import napari

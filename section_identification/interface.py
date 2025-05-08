@@ -336,8 +336,6 @@ class SectionIdentificationGUI(QWidget):
                 model_type="vit_h",
                 device="cpu"
             )
-            # Ensure the help window is closed if still open
-            cv2.destroyWindow("Help")
 
             self.append_log(f"✔️ Manual session done. {len(new_masks)} new masks, {len(stored_masks)} stored masks, {len(fiducials)} fiducials.")
 
