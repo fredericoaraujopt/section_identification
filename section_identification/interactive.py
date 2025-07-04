@@ -11,6 +11,8 @@ from section_identification.interactive_helpers import overlay_stored_masks
 from section_identification.interactive_helpers import process_overlay
 from section_identification.interactive_helpers import fiducials
 from section_identification.interactive_helpers import exclude_mask
+from section_identification.interactive_helpers import display_masks
+from section_identification.interactive_helpers import load_interactive_state, save_interactive_state, recompose_overlay
 
 from section_identification.onnx_export import install_and_export_sam_onnx
 from section_identification.create_embedding import create_embedding_if_needed
@@ -119,6 +121,19 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
 
     # Step 1: Export and quantize the ONNX model for this image.
     image_path = Path(image_path)
+
+    # Try to load prior interactive state
+    state = load_interactive_state(image_path)
+    if state is not None:
+        stored_masks = state["stored_masks"]
+        new_masks = state["new_masks"]
+        markers = state["fiducials"]
+        # Since overlays were cached, recreate base_overlay from those overlays
+        base_overlay = recompose_overlay(load_image(image_path), stored_masks + new_masks, alpha=0.5)
+        cache_loaded = True
+    else:
+        cache_loaded = False
+
     final_model_path = install_and_export_sam_onnx(
         image_path=image_path,
         checkpoint=checkpoint,
@@ -139,9 +154,24 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
     orig_size = (h, w)
     print(f"Image size: {w}x{h} (width x height), samScale: {samScale:.3f}")
 
-    # Overlay initally stored masks
-    base_overlay = overlay_stored_masks(image, stored_masks)
-    new_masks = [] # Initialize array for new masks
+    if not cache_loaded:
+        # original overlay + cache overlays for first run
+        base_overlay = overlay_stored_masks(image, stored_masks)
+        for mask_details in stored_masks:
+            segmentation = mask_details['segmentation']
+            binary_mask = (segmentation > 0).astype(np.uint8)
+            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            mask_color_overlay = np.zeros_like(image, dtype=np.float32)
+            color = np.array([0.8, 0.9, 1])
+            for c in range(3):
+                mask_color_overlay[:, :, c] = binary_mask * color[c]
+            mask_color_overlay = (mask_color_overlay * 255).astype(np.uint8)
+            cv2.drawContours(mask_color_overlay, contours, -1, (255, 0, 0), 15)
+            mask_details["overlay"] = mask_color_overlay
+        # After caching, recompose overlay from cache
+        base_overlay = recompose_overlay(image, stored_masks, alpha=0.5)
+        new_masks = []
+        markers = []
 
     # Step 4: Create an ONNX runtime session.
     try:
@@ -159,45 +189,56 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
     latest_click = None
     latest_hover = None
     last_processed_click = None
+    display_on = True
 
     try:
-        markers = []
         while True:
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                 break 
-            
+
             if key == ord('m'):
                 # Suspend segmentation and launch fiducials mode.
                 markers = fiducials(image)
                 print("Fiducial markers collected:", markers)
                 # After fiducials mode, segmentation resumes with its previous state.
-            
+
             if key == ord('r'):
                 # Call exclude_mask with the current mouse coordinates.
                 base_overlay, new_masks, stored_masks = exclude_mask(
                     image, stored_masks, new_masks, latest_hover, base_overlay
                 )
 
-            # Start with the permanent overlay.
-            overlay_to_display = base_overlay.copy()
+            if key == ord('d'):
+                display_on = not display_on
+
+            # Set overlay_to_display based on display_on flag
+            if display_on:
+                overlay_to_display = base_overlay.copy()
+            else:
+                overlay_to_display = image.copy()
 
             # --- Dynamic Hover: Create an ephemeral mask using latest_hover.
-            if latest_hover is not None:
+            if display_on and latest_hover is not None:
                 overlay_to_display = process_overlay(overlay_to_display, embedding, latest_hover, samScale, orig_size, session)
 
             # --- Permanent Click: Process click events only if new.
             if latest_click is not None and latest_click != last_processed_click:
-                base_overlay,new_masks = process_new_mask(base_overlay, embedding, latest_click, samScale, orig_size, session, new_masks)
+                base_overlay, new_masks = process_new_mask(base_overlay, embedding, latest_click, samScale, orig_size, session, new_masks)
                 last_processed_click = latest_click
                 # Refresh the display overlay with the new permanent mask.
-                overlay_to_display = base_overlay.copy()
-            
+                if display_on:
+                    overlay_to_display = base_overlay.copy()
+                else:
+                    overlay_to_display = image.copy()
+
             cv2.imshow(window_name, overlay_to_display)
 
     except Exception as e:
         print("An error occurred during the interactive loop:", e)
     finally:
+        # Persist interactive edits
+        save_interactive_state(image_path, new_masks, stored_masks, markers)
         cv2.destroyWindow(window_name)
         cv2.waitKey(1)
         print("[Info] Exiting interactive segmentation.")

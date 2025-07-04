@@ -11,7 +11,7 @@ from section_identification.preprocess import preprocess_image
 from section_identification.filtering import filtering
 import time
 
-def automatic_identification(image_path, checkpoint, compress=False, apply_filtering=False, eps_values=None, min_samples_values=None, **kwargs):
+def automatic_identification(image_path, checkpoint, compress=False, apply_filtering=False, visualize=False, eps_values=None, min_samples_values=None, **kwargs):
     """
     Perform automatic mask identification on an input image using the SAM model.
 
@@ -152,17 +152,17 @@ def automatic_identification(image_path, checkpoint, compress=False, apply_filte
 
         plt.show()
 
-    # Plot the first figure: image with masks
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-    ax.imshow(image, cmap='gray')
-    image_label = os.path.splitext(os.path.basename(image_path))[0]
-    ax.set_title(f"{image_label} - {'Filtered Masks' if apply_filtering else 'Identified Masks'}")
-    plot_masks(ax, sorted_masks, 'blue')
-    plt.show()
+    if visualize:
+        # Plot the first figure: image with masks
+        fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+        ax.imshow(image, cmap='gray')
+        image_label = os.path.splitext(os.path.basename(image_path))[0]
+        ax.set_title(f"{image_label} - {'Filtered Masks' if apply_filtering else 'Identified Masks'}")
+        plot_masks(ax, sorted_masks, 'blue')
+        plt.show()
 
-
-    # Interactive slider for browsing masks
-    #interact(display_mask, index=IntSlider(min=0, max=len(sorted_masks) - 1, step=1, value=0))
+        # Interactive slider for browsing masks
+        #interact(display_mask, index=IntSlider(min=0, max=len(sorted_masks) - 1, step=1, value=0))
 
     end_time = time.time()
     print(f"Time taken to run automatic_identification for {os.path.basename(image_path)}: {end_time - start_time:.2f} seconds")
