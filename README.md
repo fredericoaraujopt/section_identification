@@ -1,4 +1,4 @@
-# Section Targeting
+# STiM: Section Targeting interface for Microscopy
 
 This Python package provides an interface for targeting sections on silicon wafers imaged under a microscope, developed to support large-scale connectomics workflows. The tool enables precise targeting of tissue sections for electron microscopy by retrieving their coordinates.
 
