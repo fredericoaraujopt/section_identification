@@ -16,7 +16,7 @@ pip install -e .
 ## Tutorial
 Once the package is installed, open STiM by running
 ```
-python section_identification/interface.py
+python interface.py
 ```
 📺 **Video demo**: [STiM 🔬](https://www.loom.com/share/48c99d4387db4497963017c24cff7c3b?sid=436aefad-03f1-412b-8d9b-fa19b2b49c7f)
 #
