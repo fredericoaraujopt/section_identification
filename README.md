@@ -4,7 +4,7 @@ STiM is a napari-based interface for targeting sections on silicon wafers imaged
 
 The interface integrates the Segment Anything Model (SAM) for automated section segmentation and includes a manual correction GUI for refining segmentation results.
 
-Results from section targeting experiments on 18 wafers are found in `experiments/results/image_library`.
+Results from section targeting experiments on 18 wafers are found in `experiments/image_library`.
 
 ## Installation
 ```
