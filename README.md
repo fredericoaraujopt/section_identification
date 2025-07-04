@@ -4,7 +4,7 @@ STiM is a napari-based interface for targeting sections on silicon wafers imaged
 
 The interface integrates the Segment Anything Model (SAM) for automated section segmentation and includes a manual correction GUI for refining segmentation results.
 
-Results from section targeting experiments on 25 wafers are found in `experiments/results.ipynb`.
+Results from section targeting experiments on 18 wafers are found in `experiments/results/image_library`.
 
 ## Installation
 ```
@@ -16,7 +16,7 @@ pip install -e .
 ## Tutorial
 Once the package is installed, open STiM by running
 ```
-python interface.py
+python section_identification/interface.py
 ```
 📺 **Video demo**: [STiM 🔬](https://www.loom.com/share/48c99d4387db4497963017c24cff7c3b?sid=436aefad-03f1-412b-8d9b-fa19b2b49c7f)
 #
