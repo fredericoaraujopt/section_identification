@@ -56,7 +56,7 @@ class SectionIdentificationGUI(QWidget):
         # --- Automatic detector ---
         layout.addWidget(QLabel("<b>Automatic Detector</b>"))
         self.chk_compress = QCheckBox("Compress image before detection (currently not working)")
-        self.chk_filter   = QCheckBox("Filter masks after detection")
+        self.chk_filter   = QCheckBox("Filter for sections")
         self.btn_auto     = QPushButton("Launch Automatic Detector")
         layout.addWidget(self.chk_compress)
         layout.addWidget(self.chk_filter)
@@ -80,7 +80,7 @@ class SectionIdentificationGUI(QWidget):
 
         # Authorship statement
         self.lbl_authorship = QLabel(
-            "Developed by Frederico Araujo. Reach out to fredericoaraujo@college.harvard.edu"
+            "Developed by Frederico Araujo (fredrfaa@gmail.com)"
         )
         self.lbl_authorship.setAlignment(Qt.AlignCenter)
         self.lbl_authorship.setStyleSheet("font-size: 12px; color: gray;")
@@ -268,7 +268,7 @@ class SectionIdentificationGUI(QWidget):
             edge_width=6,
             name='Mask Boxes'
         )
-        self.box_layer.visible = False
+        self.box_layer.visible = True
 
         # Add ID points layer with small text
         self.id_points_layer = self.viewer.add_points(
@@ -279,7 +279,7 @@ class SectionIdentificationGUI(QWidget):
             size=5
         )
         self.id_points_layer.text_size = 5
-        self.id_points_layer.visible = False
+        self.id_points_layer.visible = True
 
         # Store latest state
         self.latest_mode = 'auto'

@@ -13,7 +13,7 @@ def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials, visu
     The CSV file is saved in a directory:
          file_directory = f"{os.path.splitext(image_path)[0]}_files"
     with a filename such as:
-         {os.path.basename(os.path.splitext(image_path)[0])}_mask_coordinates.csv
+         {os.path.basename(os.path.splitext(image_path)[0])}.csv
          
     If visualize=True, the function will display:
       - The image with overlaid contours (drawn with thick borders).
@@ -77,28 +77,31 @@ def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials, visu
         return distances
 
     rows = []
+    global_idx = 1
 
-    # Process new masks.
+   # Process new masks.
     for idx, mask in enumerate(new_masks, start=1):
         contours = get_contours(mask["segmentation"])
         row = {
-            "id": f"new_{idx}",
+            "id": f"section_{global_idx}",
             "type": "new_mask",
             "contour_coordinates": str(contours),
             "distance": ""  # Not applicable for masks.
         }
         rows.append(row)
+        global_idx += 1
 
     # Process stored masks.
     for idx, mask in enumerate(stored_masks, start=1):
         contours = get_contours(mask["segmentation"])
         row = {
-            "id": f"Polygon {idx}",
-            "type": "mask",
+            "id": f"section_{global_idx}",
+            "type": "stored_mask",
             "contour_coordinates": str(contours),
             "distance": ""
         }
         rows.append(row)
+        global_idx += 1
 
     # Process fiducials.
     fiducials_row = {
