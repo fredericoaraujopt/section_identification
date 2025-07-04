@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
-__version__ = "0.0.1"
+__version__ = "1.0.0"
 
 setup(
-    name='section_identification',
+    name='Section Targeting interface for Microscopy (STiM)',
     version='0.1.0',
     packages=find_packages(),
     install_requires=[
@@ -30,8 +30,8 @@ setup(
         'opencv-python',
         'pycocotools'
     ],
-    description='section identification',
+    description='STiM is a napari-based interface for targeting sections on silicon wafers imaged under a microscope, developed to support large-scale connectomics workflows.',
     author='Frederico Araujo',
-    author_email='*****',
-    url='*****',
+    author_email='fredrfaa@gmail.com',
+    url='github.com/fredericoaraujopt/section_identification',
 )
