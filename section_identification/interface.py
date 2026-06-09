@@ -92,13 +92,15 @@ class SectionIdentificationGUI(QWidget):
         self.sp_iou = QDoubleSpinBox(); self.sp_iou.setRange(0.0, 1.0)
         self.sp_iou.setSingleStep(0.05); self.sp_iou.setValue(0.80)
         self.sp_minarea = QSpinBox(); self.sp_minarea.setRange(0, 100000)
-        self.sp_minarea.setValue(100)
+        self.sp_minarea.setValue(20)
+        self.sp_crop = QSpinBox(); self.sp_crop.setRange(0, 3); self.sp_crop.setValue(1)
         self.sp_target = QSpinBox(); self.sp_target.setRange(1024, 16384)
-        self.sp_target.setSingleStep(512); self.sp_target.setValue(4096)
+        self.sp_target.setSingleStep(512); self.sp_target.setValue(3072)
         form.addRow("points_per_side", self.sp_pps)
         form.addRow("points_per_batch (mem)", self.sp_ppb)
         form.addRow("pred_iou_thresh", self.sp_iou)
         form.addRow("min_mask_region_area", self.sp_minarea)
+        form.addRow("crop_n_layers (small-section recall)", self.sp_crop)
         form.addRow("overview long side (px)", self.sp_target)
         layout.addLayout(form)
 
@@ -134,7 +136,7 @@ class SectionIdentificationGUI(QWidget):
 
         # --- Checkpoint ---
         pkg = Path(os.path.abspath(__file__))
-        default_ckpt = pkg.parents[2] / "checkpoint" / "sam2.1_hiera_base_plus.pt"
+        default_ckpt = pkg.parents[1] / "checkpoint" / "sam2.1_hiera_base_plus.pt"
         self.checkpoint = str(default_ckpt)
         self.lbl_ckpt = QLabel(f"Checkpoint: {self.checkpoint}")
         self.lbl_ckpt.setWordWrap(True)
@@ -268,7 +270,9 @@ class SectionIdentificationGUI(QWidget):
                 points_per_side=self.sp_pps.value(),
                 points_per_batch=self.sp_ppb.value(),
                 pred_iou_thresh=self.sp_iou.value(),
-                min_mask_region_area=self.sp_minarea.value())
+                crop_n_layers=self.sp_crop.value(),
+                min_mask_region_area=self.sp_minarea.value(),
+                target_long_side=self.sp_target.value())
             self.masks = masks
             polys_xy = [mask_to_polygon(m["segmentation"]) for m in masks]
             polys_xy = [p for p in polys_xy if p is not None and len(p) >= 3]
