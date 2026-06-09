@@ -87,6 +87,15 @@ class SectionIdentificationGUI(QWidget):
         self._det_t0 = 0.0
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._tick_elapsed)
+        # Calibration + tiled-streaming state.
+        self.calibration = None
+        self.calib_layer = None          # 'Calibration examples' Shapes layer
+        self.tiles_layer = None          # tile-grid preview
+        self.current_tile_layer = None   # highlighted current tile
+        self.raw_layer = None            # live raw detections (tiled streaming)
+        self._raw_sections = []          # accumulated {poly(overview), area}
+        self._stream_mode = False
+        self._proc_buf = ""              # stdout line buffer for the worker
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -120,9 +129,28 @@ class SectionIdentificationGUI(QWidget):
         form.addRow("overview long side (px)", self.sp_target)
         layout.addLayout(form)
 
-        self.chk_filter = QCheckBox("Filter for sections (shape + area)")
+        self.chk_filter = QCheckBox("Filter for sections (area DBSCAN)")
         self.chk_filter.setChecked(True)
         layout.addWidget(self.chk_filter)
+        self.chk_tiled = QCheckBox(
+            "Tiled streaming detector (challenging wafers: bounded memory, live view)")
+        layout.addWidget(self.chk_tiled)
+
+        # --- Calibration from drawn examples ---
+        cal_row = QHBoxLayout()
+        self.btn_calibrate = QPushButton("Calibrate from examples")
+        self.btn_preview = QPushButton("Preview tiling + points")
+        cal_row.addWidget(self.btn_calibrate)
+        cal_row.addWidget(self.btn_preview)
+        layout.addLayout(cal_row)
+        layout.addWidget(QLabel(
+            "<i>Draw 2-5 example sections in the 'Calibration examples' layer, then "
+            "Calibrate to auto-set section size, area filter and tile size. Preview "
+            "shows how SAM will tile/sample the wafer before running.</i>"))
+        self.lbl_calib = QLabel("Not calibrated.")
+        self.lbl_calib.setWordWrap(True)
+        layout.addWidget(self.lbl_calib)
+
         det_row = QHBoxLayout()
         self.btn_auto = QPushButton("Run Automatic Detection")
         self.btn_stop = QPushButton("Stop")
@@ -194,6 +222,8 @@ class SectionIdentificationGUI(QWidget):
         self.btn_ckpt.clicked.connect(self.select_checkpoint)
         self.btn_manual.clicked.connect(self.run_manual)
         self.btn_stop.clicked.connect(self.stop_detection)
+        self.btn_calibrate.clicked.connect(self.calibrate_from_examples)
+        self.btn_preview.clicked.connect(self.preview_tiling)
 
     # ----- logging plumbing -----
     def write(self, text):
@@ -282,7 +312,9 @@ class SectionIdentificationGUI(QWidget):
                          "empty:\n" + traceback.format_exc())
             self._ensure_edit_layers([])
         self.masks = []
+        self._raw_sections = []
         self.filmstrip.clear()
+        self._ensure_calib_layer()  # ready for the user to draw examples
         try:
             if polys_xy:
                 self.rebuild_filmstrip()
@@ -293,6 +325,8 @@ class SectionIdentificationGUI(QWidget):
         for lyr in list(self.viewer.layers):
             self.viewer.layers.remove(lyr)
         self.image_layer = self.shapes_layer = self.fid_layer = None
+        self.calib_layer = self.tiles_layer = None
+        self.current_tile_layer = self.raw_layer = None
 
     def _ensure_edit_layers(self, polygons_xy):
         """(Re)create the editable Sections (Shapes) and Fiducials (Points) layers.
@@ -404,22 +438,34 @@ class SectionIdentificationGUI(QWidget):
         if self.proc is not None and self.proc.state() != QProcess.NotRunning:
             self.log_msg("Detection already running — press Stop first."); return
 
-        # Params that define the mask cache the worker will write (so we can load
-        # it back here). points_per_batch is NOT part of the cache key.
-        self._det_params = dict(
-            points_per_side=self.sp_pps.value(),
-            points_per_batch=self.sp_ppb.value(),
-            pred_iou_thresh=self.sp_iou.value(),
-            crop_n_layers=self.sp_crop.value(),
-            min_mask_region_area=self.sp_minarea.value())
-        args = ["-m", "section_identification.detect_worker",
-                "--image", self.image_path, "--checkpoint", self.checkpoint,
-                "--target-long-side", str(self.sp_target.value()),
-                "--points-per-side", str(self._det_params["points_per_side"]),
-                "--points-per-batch", str(self._det_params["points_per_batch"]),
-                "--pred-iou-thresh", str(self._det_params["pred_iou_thresh"]),
-                "--crop-n-layers", str(self._det_params["crop_n_layers"]),
-                "--min-area", str(self._det_params["min_mask_region_area"])]
+        common = ["-m", "section_identification.detect_worker",
+                  "--image", self.image_path, "--checkpoint", self.checkpoint,
+                  "--target-long-side", str(self.sp_target.value()),
+                  "--points-per-side", str(self.sp_pps.value()),
+                  "--points-per-batch", str(self.sp_ppb.value()),
+                  "--pred-iou-thresh", str(self.sp_iou.value())]
+        self._stream_mode = self.chk_tiled.isChecked()
+        if self._stream_mode:
+            cal = self.calibration or {}
+            tile_px = int(cal.get("tile_px", 512))
+            min_area = float(cal.get("min_area", self.sp_minarea.value() or 200))
+            max_area = float(cal.get("max_area", 1e12))
+            args = common + ["--mode", "tiled", "--tile-px", str(tile_px),
+                             "--min-area", str(min_area), "--max-area", str(max_area)]
+            self._reset_stream_layers()
+            self._raw_sections = []
+            self._det_params = None
+        else:
+            self._det_params = dict(
+                points_per_side=self.sp_pps.value(),
+                points_per_batch=self.sp_ppb.value(),
+                pred_iou_thresh=self.sp_iou.value(),
+                crop_n_layers=self.sp_crop.value(),
+                min_mask_region_area=self.sp_minarea.value())
+            args = common + ["--mode", "whole",
+                             "--crop-n-layers", str(self._det_params["crop_n_layers"]),
+                             "--min-area", str(self._det_params["min_mask_region_area"])]
+        self._proc_buf = ""
 
         self.proc = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
@@ -447,9 +493,19 @@ class SectionIdentificationGUI(QWidget):
             text = bytes(self.proc.readAllStandardOutput()).decode(errors="replace")
         except Exception:
             return
-        for line in text.splitlines():
-            if line.strip():
-                self.log_msg(line.rstrip())
+        self._proc_buf += text
+        *lines, self._proc_buf = self._proc_buf.split("\n")
+        for line in lines:
+            line = line.rstrip()
+            if not line:
+                continue
+            if line.startswith("STIM_TILES ") or line.startswith("STIM_TILE "):
+                try:
+                    self._handle_stim_line(line)
+                except Exception:
+                    pass  # never let a stream-parse error kill the GUI
+            else:
+                self.log_msg(line)
 
     def _on_proc_finished(self, code, status):
         self._elapsed_timer.stop(); self.lbl_elapsed.setText("")
@@ -457,29 +513,185 @@ class SectionIdentificationGUI(QWidget):
         self.progress.setVisible(False)
         self.proc = None
         if code != 0:
-            self.log_msg(f"⏹ detection stopped/failed (exit {code}). Nothing changed.")
+            self.log_msg(f"⏹ detection stopped/failed (exit {code}). "
+                         "Partial results (if any) are kept.")
+            if self._stream_mode:
+                self._finalize_tiled()
             return
         try:
-            # The worker wrote the (RLE) mask cache; this hits it instantly, then
-            # applies the area filter.
-            masks = automatic_identification(
-                self.image_path, checkpoint=self.checkpoint, image=self.overview,
-                apply_filtering=self.chk_filter.isChecked(),
-                target_long_side=self.sp_target.value(), **self._det_params)
-            self.masks = masks
-            polys_xy = [mask_to_polygon(m["segmentation"]) for m in masks]
-            polys_xy = [p for p in polys_xy if p is not None and len(p) >= 3]
-            self._ensure_edit_layers(polys_xy)
-            self.log_msg(f"✔️ {len(polys_xy)} sections → editable 'Sections' layer.")
-            self.rebuild_filmstrip()
-            self.save_project()
+            if self._stream_mode:
+                self._finalize_tiled()
+            else:
+                masks = automatic_identification(
+                    self.image_path, checkpoint=self.checkpoint, image=self.overview,
+                    apply_filtering=self.chk_filter.isChecked(),
+                    target_long_side=self.sp_target.value(), **self._det_params)
+                self.masks = masks
+                polys_xy = [mask_to_polygon(m["segmentation"]) for m in masks]
+                polys_xy = [p for p in polys_xy if p is not None and len(p) >= 3]
+                self._ensure_edit_layers(polys_xy)
+                self.log_msg(f"✔️ {len(polys_xy)} sections → 'Sections' layer.")
+                self.rebuild_filmstrip()
+                self.save_project()
         except Exception:
             self.log_msg("❌ loading detection results failed:\n" + traceback.format_exc())
+
+    # ----- tiled streaming: live tile/section display -----
+    def _set_shapes(self, attr, name, data, edge="white", face=(0, 0, 0, 0), width=2):
+        lyr = getattr(self, attr, None)
+        if lyr is not None and lyr in self.viewer.layers:
+            self.viewer.layers.remove(lyr)
+        lyr = self.viewer.add_shapes(data, shape_type="polygon", name=name,
+                                     face_color=list(face), edge_width=width)
+        try:
+            lyr.edge_color = edge
+        except Exception:
+            pass
+        setattr(self, attr, lyr)
+        return lyr
+
+    @staticmethod
+    def _box_rect(box):
+        x, y, w, h = box
+        return np.array([[y, x], [y, x + w], [y + h, x + w], [y + h, x]], dtype=float)
+
+    def _reset_stream_layers(self):
+        for attr in ("tiles_layer", "current_tile_layer", "raw_layer"):
+            lyr = getattr(self, attr, None)
+            if lyr is not None and lyr in self.viewer.layers:
+                try:
+                    self.viewer.layers.remove(lyr)
+                except Exception:
+                    pass
+            setattr(self, attr, None)
+
+    def _handle_stim_line(self, line):
+        if line.startswith("STIM_TILES "):
+            boxes = json.loads(line[len("STIM_TILES "):])
+            self._set_shapes("tiles_layer", "Tiles", [self._box_rect(b) for b in boxes],
+                             edge="yellow", width=1)
+            self.log_msg(f"Tiling into {len(boxes)} tiles…")
+            return
+        # STIM_TILE
+        d = json.loads(line[len("STIM_TILE "):])
+        k, n, box = d["k"], d["n"], d["box"]
+        # highlight current tile
+        self._set_shapes("current_tile_layer", "Current tile", [self._box_rect(box)],
+                         edge="cyan", width=3)
+        # append new sections to the live Raw layer
+        new = [xy_to_napari(np.asarray(s["poly"], dtype=float)) for s in d["sections"]
+               if len(s["poly"]) >= 3]
+        for s in d["sections"]:
+            if len(s["poly"]) >= 3:
+                self._raw_sections.append(s)
+        if new:
+            if self.raw_layer is None or self.raw_layer not in self.viewer.layers:
+                self._set_shapes("raw_layer", "Raw detections", new,
+                                 edge="orange", face=(1, 0.5, 0, 0.15), width=2)
+            else:
+                try:
+                    self.raw_layer.add(new, shape_type="polygon")
+                except Exception:
+                    self.raw_layer.data = list(self.raw_layer.data) + new
+        # progress + ETA
+        elapsed = max(1e-3, time.time() - self._det_t0)
+        eta = elapsed / k * (n - k)
+        self.lbl_elapsed.setText(
+            f"⏱ tile {k}/{n} · {len(self._raw_sections)} raw sections · "
+            f"{int(elapsed)}s elapsed · ~{int(eta)}s left")
+
+    def _finalize_tiled(self):
+        """Apply the area filter to streamed raw sections and populate 'Sections'."""
+        raw = self._raw_sections
+        kept = raw
+        if self.chk_filter.isChecked() and len(raw) >= 3:
+            try:
+                from section_identification.filtering import filtering
+                masks_like = [{"area": float(s["area"])} for s in raw]
+                lo = max(50.0, min(m["area"] for m in masks_like))
+                hi = max(m["area"] for m in masks_like) + 1.0
+                chosen, _params = filtering(masks_like, np.linspace(lo, hi, 12), range(2, 5))
+                chosen_ids = {id(m) for m in chosen}
+                kept = [s for s, m in zip(raw, masks_like) if id(m) in chosen_ids]
+            except Exception:
+                kept = raw
+        polys_xy = [np.asarray(s["poly"], dtype=float) for s in kept]
+        self._ensure_edit_layers(polys_xy)
+        self.log_msg(f"✔️ {len(raw)} raw → {len(polys_xy)} kept sections "
+                     f"(orange = raw, red = kept). Edit in 'Sections'.")
+        self.rebuild_filmstrip()
+        self.save_project()
 
     def stop_detection(self):
         if self.proc and self.proc.state() != QProcess.NotRunning:
             self.log_msg("■ Stopping detection…")
             self.proc.kill()
+
+    # ----- calibration from drawn examples + tiling preview -----
+    def _ensure_calib_layer(self):
+        if self.calib_layer is None or self.calib_layer not in self.viewer.layers:
+            self.calib_layer = self.viewer.add_shapes(
+                [], shape_type="polygon", name="Calibration examples",
+                face_color=[0, 1, 0, 0.2], edge_width=3)
+            try:
+                self.calib_layer.edge_color = "lime"
+            except Exception:
+                pass
+        return self.calib_layer
+
+    def calibrate_from_examples(self):
+        if self.overview is None:
+            self.log_msg("⚠️ Load an image first."); return
+        lyr = self._ensure_calib_layer()
+        polys = [napari_to_xy(d) for d in lyr.data if len(np.asarray(d)) >= 3]
+        if not polys:
+            self.log_msg("Draw 2-5 example sections in the 'Calibration examples' "
+                         "layer (polygon tool), then click Calibrate.")
+            try:
+                self.viewer.layers.selection.active = lyr
+            except Exception:
+                pass
+            return
+        from section_identification.calibration import calibrate, summary
+        try:
+            self.calibration = calibrate(polys, geom=self.geom)
+        except Exception:
+            self.log_msg("❌ calibration failed:\n" + traceback.format_exc()); return
+        self.sp_minarea.setValue(int(self.calibration["min_area"]))
+        self.lbl_calib.setText(summary(self.calibration))
+        self.log_msg("✔️ " + summary(self.calibration))
+        self.chk_tiled.setChecked(True)
+        self.preview_tiling()
+
+    def preview_tiling(self):
+        """Overlay the actual tile grid + a sample SAM point grid (no detection)."""
+        if self.overview is None:
+            self.log_msg("⚠️ Load an image first."); return
+        from section_identification.tiled_detect import plan_tiles
+        H, W = self.overview.shape[:2]
+        tile_px = int(self.calibration["tile_px"]) if self.calibration else 512
+        boxes = plan_tiles(W, H, tile_px)
+        self._set_shapes("tiles_layer", "Tiles (preview)",
+                         [self._box_rect(b) for b in boxes], edge="yellow", width=1)
+        # sample point grid for the first tile only (representative density)
+        pps = self.sp_pps.value()
+        if boxes:
+            x, y, w, h = boxes[0]
+            xs = np.linspace(x, x + w, pps + 2)[1:-1]
+            ys = np.linspace(y, y + h, pps + 2)[1:-1]
+            pts = np.array([[yy, xx] for yy in ys for xx in xs], dtype=float)
+            lyr = getattr(self, "_preview_pts", None)
+            if lyr is not None and lyr in self.viewer.layers:
+                self.viewer.layers.remove(lyr)
+            self._preview_pts = self.viewer.add_points(
+                pts, name="SAM point grid (1 tile)", size=max(2, tile_px // 80))
+        eff = 1024.0 / tile_px
+        msg = (f"Preview: {len(boxes)} tiles of {tile_px}px, points_per_side={pps} "
+               f"→ {len(boxes) * pps * pps} prompt points; SAM upscale ×{eff:.1f}")
+        if self.calibration:
+            secpx = self.calibration["section_px"]
+            msg += f"; section ~{secpx:.0f}px → ~{secpx * eff:.0f}px to SAM"
+        self.log_msg(msg)
 
     # ----- polygons from the Shapes layer -----
     def current_polygons_xy(self):
