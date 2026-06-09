@@ -1,435 +1,363 @@
-# interface.py
-import os
-from pathlib import Path
-import sys
-import pickle
-import traceback
+"""STiM unified napari GUI.
 
+One window for the whole workflow: load an image (including whole-slide ``.czi``,
+read from the pyramid), run SAM 2.1 automatic detection, **edit the section
+polygons and fiducials natively in napari** (a Shapes layer + a Points layer —
+no more separate OpenCV window), recover serial order by cross-correlation via a
+reorderable filmstrip, and export CSV / GeoJSON / a ZEN-annotated CZI.
+
+Coordinate convention: napari layer data is ``(row, col)`` = ``(y, x)``; our
+detection/export code uses ``(x, y)``. The helpers below convert at the boundary.
+"""
+
+import os
+import sys
+import traceback
+from pathlib import Path
+
+import numpy as np
+from qtpy.QtCore import Qt, QSize
+from qtpy.QtGui import QIcon, QImage, QPixmap
 from qtpy.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QPushButton, QCheckBox,
-    QFileDialog, QTextEdit, QInputDialog, QProgressBar,
-    QMessageBox, QApplication
+    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QProgressBar, QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
-from qtpy.QtCore import Qt
 
 import napari
-import numpy as np
-from PIL import Image
 
 from section_identification.section_detector import automatic_identification
-from section_identification.interactive import run_sam_interactive
-from section_identification.export import export_mask_coordinates
-from section_identification.interactive_helpers import display_help
+from section_identification.export import export_polygons, mask_to_polygon
+from section_identification import czi_io, ordering
+from section_identification.device import describe as describe_device
+
+
+# --------------------------------------------------------------------------- #
+# Coordinate / image helpers
+# --------------------------------------------------------------------------- #
+def xy_to_napari(poly_xy):
+    """(x, y) Nx2 -> napari (y, x) Nx2."""
+    p = np.asarray(poly_xy, dtype=float).reshape(-1, 2)
+    return p[:, ::-1]
+
+
+def napari_to_xy(poly_yx):
+    """napari (y, x) Nx2 -> (x, y) Nx2."""
+    p = np.asarray(poly_yx, dtype=float).reshape(-1, 2)
+    return p[:, ::-1]
+
+
+def numpy_to_qicon(arr, size=72):
+    """uint8 RGB crop -> QIcon thumbnail."""
+    import cv2
+
+    a = arr
+    if a.ndim == 2:
+        a = np.repeat(a[:, :, None], 3, axis=2)
+    a = np.ascontiguousarray(cv2.resize(a.astype(np.uint8), (size, size)))
+    h, w, _ = a.shape
+    img = QImage(a.data, w, h, 3 * w, QImage.Format_RGB888)
+    return QIcon(QPixmap.fromImage(img.copy()))
+
 
 class SectionIdentificationGUI(QWidget):
     def __init__(self, napari_viewer):
         super().__init__()
         self.viewer = napari_viewer
         self.image_path = None
+        self.overview = None       # uint8 RGB overview
+        self.geom = None           # CziGeometry (None for non-CZI)
+        self.masks = []            # detected mask dicts (overview coords)
         self.image_layer = None
-        self.mask_layer = None
-        self.box_layer = None
-        self.id_points_layer = None
-        self.latest_mode = None
-        self.latest_masks = None
-        self.latest_new_masks = None
-        self.latest_stored_masks = None
-        self.latest_fiducials = None
-        self.box_layer = None
-        self.id_points_layer = None
+        self.shapes_layer = None
+        self.fid_layer = None
 
-        # Layout
         layout = QVBoxLayout()
         self.setLayout(layout)
 
+        layout.addWidget(QLabel(f"<b>Device:</b> {describe_device()}"))
+
         # --- File selection ---
-        self.btn_select = QPushButton("Select Image…")
+        self.btn_select = QPushButton("Select Image / CZI…")
         self.lbl_path = QLabel("No image selected")
         self.lbl_path.setWordWrap(True)
         layout.addWidget(self.btn_select)
         layout.addWidget(self.lbl_path)
 
-        # Cache info
-        self.lbl_cache = QLabel("")
-        layout.addWidget(self.lbl_cache)
+        # --- SAM parameters ---
+        layout.addWidget(QLabel("<b>SAM 2.1 parameters</b>"))
+        form = QFormLayout()
+        self.sp_pps = QSpinBox(); self.sp_pps.setRange(4, 128); self.sp_pps.setValue(32)
+        self.sp_ppb = QSpinBox(); self.sp_ppb.setRange(8, 256); self.sp_ppb.setValue(64)
+        self.sp_iou = QDoubleSpinBox(); self.sp_iou.setRange(0.0, 1.0)
+        self.sp_iou.setSingleStep(0.05); self.sp_iou.setValue(0.80)
+        self.sp_minarea = QSpinBox(); self.sp_minarea.setRange(0, 100000)
+        self.sp_minarea.setValue(100)
+        self.sp_target = QSpinBox(); self.sp_target.setRange(1024, 16384)
+        self.sp_target.setSingleStep(512); self.sp_target.setValue(4096)
+        form.addRow("points_per_side", self.sp_pps)
+        form.addRow("points_per_batch (mem)", self.sp_ppb)
+        form.addRow("pred_iou_thresh", self.sp_iou)
+        form.addRow("min_mask_region_area", self.sp_minarea)
+        form.addRow("overview long side (px)", self.sp_target)
+        layout.addLayout(form)
 
-        # --- Automatic detector ---
-        layout.addWidget(QLabel("<b>Automatic Detector</b>"))
-        self.chk_compress = QCheckBox("Compress image before detection (currently not working)")
-        self.chk_filter   = QCheckBox("Filter for sections")
-        self.btn_auto     = QPushButton("Launch Automatic Detector")
-        layout.addWidget(self.chk_compress)
+        self.chk_filter = QCheckBox("Filter for sections (shape + area)")
+        self.chk_filter.setChecked(True)
         layout.addWidget(self.chk_filter)
+        self.btn_auto = QPushButton("Run Automatic Detection")
         layout.addWidget(self.btn_auto)
 
-        # --- Manual detector ---
-        layout.addWidget(QLabel("<b>Manual Detector</b>"))
-        self.btn_manual = QPushButton("Launch Manual Detector")
-        layout.addWidget(self.btn_manual)
+        # --- Editing hint ---
+        layout.addWidget(QLabel(
+            "<i>Edit polygons in the 'Sections' layer (select tool: move/delete "
+            "vertices; add polygons). Drop fiducials in the 'Fiducials' layer.</i>"))
 
-        # Export button
-        self.btn_export = QPushButton("Export Coordinates")
+        # --- Ordering filmstrip ---
+        layout.addWidget(QLabel("<b>Serial order (drag to reorder)</b>"))
+        self.btn_order = QPushButton("Auto-order by cross-correlation")
+        layout.addWidget(self.btn_order)
+        self.filmstrip = QListWidget()
+        self.filmstrip.setViewMode(QListWidget.IconMode)
+        self.filmstrip.setFlow(QListWidget.LeftToRight)
+        self.filmstrip.setWrapping(True)
+        self.filmstrip.setIconSize(QSize(72, 72))
+        self.filmstrip.setDragDropMode(QListWidget.InternalMove)
+        self.filmstrip.setFixedHeight(120)
+        layout.addWidget(self.filmstrip)
+        self.btn_refresh_strip = QPushButton("Refresh filmstrip from polygons")
+        layout.addWidget(self.btn_refresh_strip)
+
+        # --- Export ---
+        self.btn_export = QPushButton("Export (CSV + GeoJSON + annotated CZI)")
         layout.addWidget(self.btn_export)
 
-        # --- Log window ---
-        layout.addWidget(QLabel("<b>Log</b>"))
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setFixedHeight(200)
-        layout.addWidget(self.log)
-
-        # Authorship statement
-        self.lbl_authorship = QLabel(
-            "Developed by Frederico Araujo (fredrfaa@gmail.com)"
-        )
-        self.lbl_authorship.setAlignment(Qt.AlignCenter)
-        self.lbl_authorship.setStyleSheet("font-size: 12px; color: gray;")
-        layout.addWidget(self.lbl_authorship)
-
-        # Progress bar for long-running operations
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
-
-        # Default SAM checkpoint path (two levels up from package, in 'checkpoint' folder)
-        package_path = Path(os.path.abspath(__file__))
-        default_ckpt = package_path.parents[2] / "checkpoint" / "sam_vit_h_4b8939.pth"
+        # --- Checkpoint ---
+        pkg = Path(os.path.abspath(__file__))
+        default_ckpt = pkg.parents[2] / "checkpoint" / "sam2.1_hiera_base_plus.pt"
         self.checkpoint = str(default_ckpt)
         self.lbl_ckpt = QLabel(f"Checkpoint: {self.checkpoint}")
         self.lbl_ckpt.setWordWrap(True)
         layout.addWidget(self.lbl_ckpt)
-
-        # Button to select custom checkpoint
-        self.btn_ckpt = QPushButton("Select SAM Checkpoint")
+        self.btn_ckpt = QPushButton("Select SAM 2.1 Checkpoint (.pt)")
         layout.addWidget(self.btn_ckpt)
-        self.btn_ckpt.clicked.connect(self.select_checkpoint)
 
-        # Redirect stdout/stderr to log
+        # --- Log ---
+        layout.addWidget(QLabel("<b>Log</b>"))
+        self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setFixedHeight(160)
+        layout.addWidget(self.log)
+        self.progress = QProgressBar(); self.progress.setVisible(False)
+        layout.addWidget(self.progress)
+
+        # stdout -> log
         self._old_stdout = sys.stdout
-        self._old_stderr = sys.stderr
         sys.stdout = self
-        sys.stderr = self
 
-        # Signal connections
+        # signals
         self.btn_select.clicked.connect(self.select_image)
         self.btn_auto.clicked.connect(self.run_auto)
-        self.btn_manual.clicked.connect(self.run_manual)
+        self.btn_order.clicked.connect(self.auto_order)
+        self.btn_refresh_strip.clicked.connect(self.rebuild_filmstrip)
         self.btn_export.clicked.connect(self.export_coordinates)
-    def select_checkpoint(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select SAM checkpoint (.pth file)", "", "PyTorch Checkpoint (*.pth)"
-        )
-        if path:
-            self.checkpoint = path
-            self.lbl_ckpt.setText(f"Checkpoint: {self.checkpoint}")
+        self.btn_ckpt.clicked.connect(self.select_checkpoint)
 
-    def append_log(self, text):
-        """Append a line to the log window and also write to the original stdout."""
-        self.log.append(text)
-        QApplication.processEvents()
-        self._old_stdout.write(text + "\n")
-        self._old_stdout.flush()
-
+    # ----- logging plumbing -----
     def write(self, text):
-        # Forward text to original stdout, and append to log if non-empty.
-        self._old_stdout.write(text)
-        self._old_stdout.flush()
+        self._old_stdout.write(text); self._old_stdout.flush()
         if text.strip():
-            # Avoid duplicating newlines
-            self.log.append(text.rstrip())
-            QApplication.processEvents()
+            self.log.append(text.rstrip()); QApplication.processEvents()
+
     def flush(self):
         pass
 
+    def log_msg(self, text):
+        print(text)
+
+    # ----- checkpoint -----
+    def select_checkpoint(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select SAM 2.1 checkpoint", "",
+            "Checkpoints (*.pt *.pth)")
+        if path:
+            self.checkpoint = path
+            self.lbl_ckpt.setText(f"Checkpoint: {path}")
+
+    # ----- load image -----
     def select_image(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select an image file", "", "Images (*.png *.jpg *.tif *.bmp)"
-        )
+            self, "Select an image", "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.czi)")
         if not path:
             return
-
         self.image_path = path
         self.lbl_path.setText(f"Selected: {path}")
-
-        # Show in napari
-        img = np.array(Image.open(path).convert("RGB"))
-        if self.image_layer and self.image_layer in self.viewer.layers:
-            self.viewer.layers.remove(self.image_layer)
-        self.image_layer = self.viewer.add_image(img, name="Base Image")
-
-        if self.mask_layer and self.mask_layer in self.viewer.layers:
-            self.viewer.layers.remove(self.mask_layer)
-        self.mask_layer = None
-
-        # Check cache
-        folder = f"{os.path.splitext(path)[0]}_files"
-        if os.path.isdir(folder):
-            contents = os.listdir(folder)
-            self.lbl_cache.setText(f"Cache folder found: {os.path.basename(folder)} contains {len(contents)} files")
-        else:
-            self.lbl_cache.setText("No cache folder found")
-
-        # Reset latest trackers
-        self.latest_mode = None
-        self.latest_masks = None
-        self.latest_new_masks = None
-        self.latest_stored_masks = None
-        self.latest_fiducials = None
-
-    def run_auto(self):
-        if not self.image_path:
-            self.append_log("⚠️ Please select an image first.")
-            return
-        # Verify checkpoint exists
-        if not os.path.isfile(self.checkpoint):
-            QMessageBox.information(
-                self,
-                "Missing checkpoint",
-                f"SAM checkpoint not found at:\n{self.checkpoint}\n\nPlease download from https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth or select via the button."
-            )
-            self.select_checkpoint()
-            if not os.path.isfile(self.checkpoint):
-                return
-
-        # Show busy indicator
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(True)
-        QApplication.processEvents()
-
-        self.append_log("▶ Running automatic_identification…")
-        compress = self.chk_compress.isChecked()
-        apply_filtering = self.chk_filter.isChecked()
-
-        # Check for first-run warning
-        dir_name = os.path.dirname(self.image_path)
-        base_name = os.path.splitext(os.path.basename(self.image_path))[0]
-        folder = os.path.join(dir_name, f"{base_name}_files")
-        if not os.path.isdir(folder):
-            QMessageBox.information(
-                self,
-                "First run",
-                "No intermediate data file found; first run may take several minutes."
-            )
-
+        self.log_msg(f"Loading {os.path.basename(path)}…")
         try:
-            masks = automatic_identification(
-                self.image_path,
-                checkpoint=self.checkpoint,
-                compress=compress,
-                apply_filtering=apply_filtering
-            )
-            self.handle_auto_result(masks)
-        except Exception as e:
-            self.handle_auto_error(traceback.format_exc())
-        finally:
-            # Hide busy indicator
-            self.progress_bar.setVisible(False)
-            self.btn_auto.setEnabled(True)
-
-    def handle_auto_result(self, masks):
-        """Handle results from the automatic detector thread."""
-        self.append_log(f"✔️ automatic_identification returned {len(masks)} masks")
-        img = np.array(Image.open(self.image_path).convert("RGB"))
-        label_img = np.zeros(img.shape[:2], dtype=int)
-        for i, mask in enumerate(masks, start=1):
-            label_img[mask['segmentation'] > 0] = i
-
-        # Remove previous mask layer if present
-        if self.mask_layer and self.mask_layer in self.viewer.layers:
-            self.viewer.layers.remove(self.mask_layer)
-        self.mask_layer = self.viewer.add_labels(label_img, name="Auto Masks")
-
-        # Remove previous box and ID layers
-        if self.box_layer and self.box_layer in self.viewer.layers:
-            self.viewer.layers.remove(self.box_layer)
-        if self.id_points_layer and self.id_points_layer in self.viewer.layers:
-            self.viewer.layers.remove(self.id_points_layer)
-
-        # Compute bounding boxes and centroids for each mask
-        bboxes = []
-        centroids = []
-        ids = []
-        for i, mask in enumerate(masks, start=1):
-            seg = mask['segmentation']
-            binary = (seg > 0)
-            coords = np.column_stack(np.where(binary))
-            y0, x0 = coords.min(axis=0)
-            y1, x1 = coords.max(axis=0)
-            bboxes.append([[y0, x0], [y0, x1], [y1, x1], [y1, x0]])
-            centroids.append([(y0 + y1) / 2, (x0 + x1) / 2])
-            ids.append(i)
-
-        # Add bounding box layer (transparent fill)
-        self.box_layer = self.viewer.add_shapes(
-            bboxes,
-            shape_type='polygon',
-            edge_color='red',
-            face_color=[0, 0, 0, 0],
-            edge_width=6,
-            name='Mask Boxes'
-        )
-        self.box_layer.visible = True
-
-        # Add ID points layer with small text
-        self.id_points_layer = self.viewer.add_points(
-            np.array(centroids),
-            properties={'id': ids},
-            text='id',
-            name='Mask IDs',
-            size=5
-        )
-        self.id_points_layer.text_size = 5
-        self.id_points_layer.visible = True
-
-        # Store latest state
-        self.latest_mode = 'auto'
-        self.latest_masks = masks
-
-    def handle_auto_error(self, error_str):
-        """Log an error from the automatic detector thread."""
-        self.append_log("❌ Error in automatic_identification:")
-        self.append_log(error_str)
-
-
-    def run_manual(self):
-        if not self.image_path:
-            self.append_log("⚠️ Please select an image first.")
-            return
-        # Verify checkpoint exists
-        if not os.path.isfile(self.checkpoint):
-            QMessageBox.information(
-                self,
-                "Missing checkpoint",
-                f"SAM checkpoint not found at:\n{self.checkpoint}\n\nPlease download from https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth or select via the button."
-            )
-            self.select_checkpoint()
-            if not os.path.isfile(self.checkpoint):
-                return
-
-        # Determine manual cache state file path
-        dir_name = os.path.dirname(self.image_path)
-        base_name = os.path.splitext(os.path.basename(self.image_path))[0]
-        folder = os.path.join(dir_name, f"{base_name}_files")
-        state_fn = os.path.join(folder, f"{base_name}_interactive_state.pkl")
-        cache_exists = os.path.isfile(state_fn)
-        if not cache_exists:
-            QMessageBox.information(
-                self,
-                "First run",
-                "No intermediate data file found. Manual detector interface might take longer to load on first run."
-            )
-
-        # Show busy indicator
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setVisible(True)
-        QApplication.processEvents()
-
-        display_help()
-
-        self.append_log("▶ Launching manual interface…")
-        try:
-            import cv2
-            new_masks, stored_masks, fiducials = run_sam_interactive(
-                self.image_path,
-                checkpoint=self.checkpoint,
-                stored_masks=self.latest_masks if self.latest_mode == 'auto' else [],
-                model_type="vit_h",
-                device="cpu"
-            )
-
-            self.append_log(f"✔️ Manual session done. {len(new_masks)} new masks, {len(stored_masks)} stored masks, {len(fiducials)} fiducials.")
-
-            img = np.array(Image.open(self.image_path).convert("RGB"))
-            label_img = np.zeros(img.shape[:2], dtype=int)
-            # stored_masks are initial, new_masks added separately
-            for i, mask in enumerate(stored_masks, start=1):
-                label_img[(mask['segmentation']>0)] = i
-            offset = len(stored_masks)
-            for j, mask in enumerate(new_masks, start=1):
-                label_img[(mask['segmentation']>0)] = offset + j
-
-            if self.mask_layer:
-                self.viewer.layers.remove(self.mask_layer)
-            self.mask_layer = self.viewer.add_labels(label_img, name="Manual Masks")
-
-            # Add box_layer and id_points_layer with visibility False
-            if self.box_layer and self.box_layer in self.viewer.layers:
-                self.viewer.layers.remove(self.box_layer)
-            self.box_layer = self.viewer.add_shapes([], name="Boxes")
-            self.box_layer.visible = False
-
-            if self.id_points_layer and self.id_points_layer in self.viewer.layers:
-                self.viewer.layers.remove(self.id_points_layer)
-            self.id_points_layer = self.viewer.add_points([], name="ID Points")
-            self.id_points_layer.visible = False
-
-            self.latest_mode = 'manual'
-            self.latest_new_masks = new_masks
-            self.latest_stored_masks = stored_masks
-            self.latest_fiducials = fiducials
-
-            # Remove old box/points layers
-            if self.box_layer and self.box_layer in self.viewer.layers:
-                self.viewer.layers.remove(self.box_layer)
-            if self.id_points_layer and self.id_points_layer in self.viewer.layers:
-                self.viewer.layers.remove(self.id_points_layer)
-
-            # Combine masks for bounding boxes
-            combined = stored_masks + new_masks
-            bboxes = []
-            centroids = []
-            ids = []
-            for i, mask in enumerate(combined, start=1):
-                seg = mask['segmentation']
-                binary = (seg > 0)
-                coords = np.column_stack(np.where(binary))
-                y0, x0 = coords.min(axis=0)
-                y1, x1 = coords.max(axis=0)
-                bboxes.append([[y0, x0], [y0, x1], [y1, x1], [y1, x0]])
-                centroids.append([(y0 + y1)/2, (x0 + x1)/2])
-                ids.append(i)
-
-            self.box_layer = self.viewer.add_shapes(
-                bboxes,
-                shape_type='polygon',
-                edge_color='red',
-                face_color=[0, 0, 0, 0],    # transparent fill
-                edge_width=6,
-                name='Mask Boxes'
-            )
-            self.id_points_layer = self.viewer.add_points(
-                np.array(centroids),
-                properties={'id': ids},
-                text='id',
-                name='Mask IDs',
-                size=5
-            )
-            self.id_points_layer.text_size = 5
-
+            if czi_io.is_czi(path):
+                arr, geom, meta = czi_io.read_czi_overview(
+                    path, target_long_side=self.sp_target.value())
+                self.geom = geom
+                self.overview = czi_io.to_rgb8(arr)
+                self.log_msg(f"CZI full {meta['size_x']}x{meta['size_y']}, "
+                             f"overview {self.overview.shape}, zoom {meta['zoom']:.4g}")
+            else:
+                from PIL import Image
+                self.overview = np.array(Image.open(path).convert("RGB"))
+                self.geom = None
         except Exception:
-            self.append_log("❌ Error in manual interface:")
-            self.append_log(traceback.format_exc())
-        finally:
-            # Hide busy indicator
-            self.progress_bar.setVisible(False)
-
-    def export_coordinates(self):
-        if not self.image_path or self.latest_mode is None:
-            self.append_log("⚠️ No masks to export. Run detection first.")
+            self.log_msg("❌ load failed:\n" + traceback.format_exc())
             return
-        self.append_log("▶ Exporting coordinates…")
-        if self.latest_mode == 'auto':
-            masks = self.latest_masks
-            export_mask_coordinates(self.image_path, [], masks, [])
-        else:
-            export_mask_coordinates(self.image_path, self.latest_new_masks, self.latest_stored_masks, self.latest_fiducials)
-        self.append_log("✔️ Coordinates exported.")
+
+        self._reset_layers()
+        self.image_layer = self.viewer.add_image(self.overview, name="Overview")
+        self._ensure_edit_layers([])
+        self.masks = []
+        self.filmstrip.clear()
+
+    def _reset_layers(self):
+        for lyr in list(self.viewer.layers):
+            self.viewer.layers.remove(lyr)
+        self.image_layer = self.shapes_layer = self.fid_layer = None
+
+    def _ensure_edit_layers(self, polygons_xy):
+        """(Re)create the editable Sections (Shapes) and Fiducials (Points) layers.
+
+        napari renamed ``edge_color`` -> ``border_color`` on Points across
+        versions, so we create the layers minimally and set styling afterwards,
+        tolerating whichever name this napari build uses.
+        """
+        if self.shapes_layer is not None and self.shapes_layer in self.viewer.layers:
+            self.viewer.layers.remove(self.shapes_layer)
+        data = [xy_to_napari(p) for p in polygons_xy] if polygons_xy else []
+        self.shapes_layer = self.viewer.add_shapes(
+            data, shape_type="polygon", name="Sections",
+            face_color=[1, 0, 0, 0.12], edge_width=3)
+        try:
+            self.shapes_layer.edge_color = "red"
+        except Exception:
+            pass
+        if self.fid_layer is None or self.fid_layer not in self.viewer.layers:
+            self.fid_layer = self.viewer.add_points(
+                np.empty((0, 2)), name="Fiducials", size=20)
+            for attr, val in (("face_color", "cyan"), ("border_color", "blue"),
+                              ("edge_color", "blue")):
+                try:
+                    setattr(self.fid_layer, attr, val)
+                except Exception:
+                    pass
+
+    # ----- detection -----
+    def run_auto(self):
+        if self.overview is None:
+            self.log_msg("⚠️ Select an image first."); return
+        if not os.path.isfile(self.checkpoint):
+            QMessageBox.information(
+                self, "Missing checkpoint",
+                f"SAM 2.1 checkpoint not found:\n{self.checkpoint}\n\nDownload "
+                "sam2.1_hiera_base_plus.pt or select one.")
+            self.select_checkpoint()
+            if not os.path.isfile(self.checkpoint):
+                return
+        self.progress.setRange(0, 0); self.progress.setVisible(True)
+        QApplication.processEvents()
+        try:
+            self.log_msg("▶ Running SAM 2.1 automatic detection…")
+            masks = automatic_identification(
+                self.image_path, checkpoint=self.checkpoint, image=self.overview,
+                apply_filtering=self.chk_filter.isChecked(),
+                points_per_side=self.sp_pps.value(),
+                points_per_batch=self.sp_ppb.value(),
+                pred_iou_thresh=self.sp_iou.value(),
+                min_mask_region_area=self.sp_minarea.value())
+            self.masks = masks
+            polys_xy = [mask_to_polygon(m["segmentation"]) for m in masks]
+            polys_xy = [p for p in polys_xy if p is not None and len(p) >= 3]
+            self._ensure_edit_layers(polys_xy)
+            self.log_msg(f"✔️ {len(polys_xy)} sections → editable 'Sections' layer.")
+            self.rebuild_filmstrip()
+        except Exception:
+            self.log_msg("❌ detection error:\n" + traceback.format_exc())
+        finally:
+            self.progress.setVisible(False)
+
+    # ----- polygons from the Shapes layer -----
+    def current_polygons_xy(self):
+        if self.shapes_layer is None:
+            return []
+        return [napari_to_xy(d) for d in self.shapes_layer.data
+                if len(np.asarray(d)) >= 3]
+
+    def current_fiducials_xy(self):
+        if self.fid_layer is None or len(self.fid_layer.data) == 0:
+            return []
+        return [tuple(map(float, napari_to_xy(p).ravel()))
+                for p in self.fid_layer.data]
+
+    # ----- filmstrip / ordering -----
+    def rebuild_filmstrip(self, order=None):
+        self.filmstrip.clear()
+        polys = self.current_polygons_xy()
+        if not polys:
+            return
+        idx_order = order if order is not None else list(range(len(polys)))
+        for rank, i in enumerate(idx_order, start=1):
+            p = np.asarray(polys[i]).reshape(-1, 2)
+            x0, y0 = p[:, 0].min(), p[:, 1].min()
+            x1, y1 = p[:, 0].max(), p[:, 1].max()
+            crop = self.overview[int(y0):int(y1) + 1, int(x0):int(x1) + 1]
+            item = QListWidgetItem(f"{rank}")
+            if crop.size:
+                item.setIcon(numpy_to_qicon(crop))
+            item.setData(Qt.UserRole, i)  # original polygon index
+            self.filmstrip.addItem(item)
+
+    def auto_order(self):
+        polys = self.current_polygons_xy()
+        if len(polys) < 2:
+            self.log_msg("Need ≥2 sections to order."); return
+        bboxes = ordering.polygons_to_bboxes(polys)
+        order, _ = ordering.order_sections(self.overview, bboxes, method="spectral")
+        self.log_msg(f"Cross-correlation order: {list(order)}")
+        self.rebuild_filmstrip(order=list(order))
+
+    def _export_order(self, n):
+        """Return polygon-index order from the filmstrip (identity if mismatched)."""
+        if self.filmstrip.count() == n:
+            order = [self.filmstrip.item(k).data(Qt.UserRole)
+                     for k in range(self.filmstrip.count())]
+            if sorted(order) == list(range(n)):
+                return order
+        return list(range(n))
+
+    # ----- export -----
+    def export_coordinates(self):
+        if self.image_path is None:
+            self.log_msg("⚠️ Nothing to export."); return
+        polys = self.current_polygons_xy()
+        if not polys:
+            self.log_msg("⚠️ No section polygons to export."); return
+        order = self._export_order(len(polys))
+        polys_ordered = [polys[i] for i in order]
+        section_ids = [f"section_{k}" for k in range(1, len(polys_ordered) + 1)]
+        fids = self.current_fiducials_xy()
+        self.log_msg(f"▶ Exporting {len(polys_ordered)} sections, "
+                     f"{len(fids)} fiducials…")
+        try:
+            outputs = export_polygons(
+                self.image_path, polys_ordered, fids, geom=self.geom,
+                section_ids=section_ids)
+            self.log_msg("✔️ Exported: " + ", ".join(
+                f"{k}={v}" for k, v in outputs.items()))
+        except Exception:
+            self.log_msg("❌ export error:\n" + traceback.format_exc())
+
 
 def main():
     viewer = napari.Viewer()
     gui = SectionIdentificationGUI(viewer)
-    viewer.window.add_dock_widget(gui, name="Section Identification", area="right")
+    viewer.window.add_dock_widget(gui, name="STiM", area="right")
     napari.run()
+
 
 if __name__ == "__main__":
     main()

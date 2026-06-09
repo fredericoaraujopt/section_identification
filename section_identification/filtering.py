@@ -1,100 +1,124 @@
+"""Filter SAM masks down to real tissue sections.
+
+Two stages:
+  1. **Shape gating** (new) — drop masks that cannot be sections regardless of
+     area: the whole-field background blob, slivers, and very non-convex /
+     non-compact shapes. Uses solidity, extent and aspect ratio.
+  2. **Area DBSCAN** (original) — sections on a wafer are size-consistent, so we
+     cluster surviving masks by area and keep the dominant cluster.
+
+Shape gating makes the area clustering far more robust: it removes the outliers
+(background, debris, support film, grid bars) that previously skewed DBSCAN.
+"""
+
 import numpy as np
 from sklearn.cluster import DBSCAN
 
-def filtering(sorted_masks, eps_values, min_samples_values):
+
+# --------------------------------------------------------------------------- #
+# Stage 1: shape gating
+# --------------------------------------------------------------------------- #
+def mask_shape_stats(mask):
+    """Compute area, extent, solidity, aspect ratio and border-touch for a mask."""
+    import cv2
+
+    seg = np.squeeze(mask["segmentation"]).astype(np.uint8)
+    h, w = seg.shape
+    contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    cnt = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(cnt))
+    if area <= 0:
+        return None
+    x, y, bw, bh = cv2.boundingRect(cnt)
+    hull = cv2.convexHull(cnt)
+    hull_area = float(cv2.contourArea(hull)) or area
+    extent = area / float(bw * bh) if bw * bh else 0.0
+    solidity = area / hull_area if hull_area else 0.0
+    aspect = max(bw, bh) / float(min(bw, bh)) if min(bw, bh) else 999.0
+    touches_border = (x <= 1 or y <= 1 or x + bw >= w - 1 or y + bh >= h - 1)
+    return {
+        "area": area, "extent": extent, "solidity": solidity,
+        "aspect": aspect, "touches_border": touches_border,
+        "area_frac": area / float(h * w),
+    }
+
+
+def shape_prefilter(masks, min_solidity=0.80, min_extent=0.30, max_aspect=6.0,
+                    max_area_frac=0.40, drop_border=False):
+    """Keep only masks whose shape is plausible for a section.
+
+    Drops: the near-full-frame background mask (``area_frac > max_area_frac``),
+    slivers (low extent / high aspect), very concave blobs (low solidity), and
+    optionally any mask touching the image border.
     """
-    Filters the identified masks by clustering their areas using DBSCAN.
+    kept = []
+    for m in masks:
+        s = mask_shape_stats(m)
+        if s is None:
+            continue
+        if s["area_frac"] > max_area_frac:
+            continue
+        if s["solidity"] < min_solidity:
+            continue
+        if s["extent"] < min_extent:
+            continue
+        if s["aspect"] > max_aspect:
+            continue
+        if drop_border and s["touches_border"]:
+            continue
+        kept.append(m)
+    return kept
 
-    This function systematically runs DBSCAN over a grid of parameters (eps_values, min_samples_values),
-    identifies the largest cluster for each combination, and tracks which largest cluster (as a set of
-    mask indices) occurs most frequently.
 
-    Parameters
-    ----------
-    sorted_masks : list of dict
-        Each dict should have at least the key 'area', e.g., mask['area'].
-    eps_values : list or array-like
-        Values of eps to try in DBSCAN.
-    min_samples_values : list or array-like
-        Values of min_samples to try in DBSCAN.
-
-    Returns
-    -------
-    chosen_filtered_masks : list of dict
-        The masks corresponding to the most commonly occurring largest cluster.
-    chosen_params : tuple
-        The (eps, min_samples) pair that produced this largest cluster.
-    """
-
-    # Prepare mask areas for clustering
-    mask_areas = np.array([mask['area'] for mask in sorted_masks]).reshape(-1, 1)
-
-    # Dictionary to track frequency of each "largest cluster" set
+# --------------------------------------------------------------------------- #
+# Stage 2: area DBSCAN (original behaviour, run on shape-gated masks)
+# --------------------------------------------------------------------------- #
+def _area_dbscan(sorted_masks, eps_values, min_samples_values):
+    mask_areas = np.array([mask["area"] for mask in sorted_masks]).reshape(-1, 1)
     cluster_frequency = {}
-
-    # Iterate over all eps and min_samples values
     for eps in eps_values:
         for min_samples in min_samples_values:
-            dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-            clusters = dbscan.fit_predict(mask_areas)
-
-            # Identify largest cluster label (exclude noise = -1)
-            unique_clusters = np.unique(clusters)
-            largest_cluster_label = None
-            largest_cluster_size = -1
-            for c in unique_clusters:
+            clusters = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(mask_areas)
+            largest_label, largest_size = None, -1
+            for c in np.unique(clusters):
                 if c == -1:
                     continue
-                size_c = np.sum(clusters == c)
-                if size_c > largest_cluster_size:
-                    largest_cluster_size = size_c
-                    largest_cluster_label = c
-
-            # Handle cases with no valid clusters
-            if largest_cluster_label is None:
+                size_c = int(np.sum(clusters == c))
+                if size_c > largest_size:
+                    largest_size, largest_label = size_c, c
+            if largest_label is None:
                 continue
-
-            # Get indices of the largest cluster
-            indices_in_largest_cluster = {
-                idx for idx, clbl in enumerate(clusters) if clbl == largest_cluster_label
-            }
-            cluster_key = frozenset(indices_in_largest_cluster)
-
-            # Update frequency dictionary
-            if cluster_key not in cluster_frequency:
-                cluster_frequency[cluster_key] = {
-                    'count': 0,
-                    'params': []
-                }
-            cluster_frequency[cluster_key]['count'] += 1
-            cluster_frequency[cluster_key]['params'].append((eps, min_samples))
+            key = frozenset(i for i, cl in enumerate(clusters) if cl == largest_label)
+            entry = cluster_frequency.setdefault(key, {"count": 0, "params": []})
+            entry["count"] += 1
+            entry["params"].append((eps, min_samples))
 
     if not cluster_frequency:
-        print("No non-noise clusters found for any parameter combination.")
         return [], (None, None)
 
-    # Find the most frequent largest cluster
-    max_count = 0
-    most_common_cluster_key = None
-    for c_key, info in cluster_frequency.items():
-        if info['count'] > max_count:
-            max_count = info['count']
-            most_common_cluster_key = c_key
+    best_key = max(cluster_frequency, key=lambda k: cluster_frequency[k]["count"])
+    chosen_params = cluster_frequency[best_key]["params"][0]
+    return [sorted_masks[i] for i in best_key], chosen_params
 
-    most_common_cluster_info = cluster_frequency[most_common_cluster_key]
-    chosen_params = most_common_cluster_info['params'][0]
 
-    # Build the final list of filtered masks
-    most_common_indices = list(most_common_cluster_key)
-    chosen_filtered_masks = [sorted_masks[i] for i in most_common_indices]
+def filtering(sorted_masks, eps_values, min_samples_values, apply_shape_gate=True,
+              shape_kwargs=None):
+    """Filter masks to the dominant cluster of section-shaped masks.
 
-    # Print cluster size and chosen parameters
-    total_masks = len(sorted_masks)
-    chosen_count = len(chosen_filtered_masks)
-    print(
-        f"Most common largest cluster size: {chosen_count} "
-        f"out of {total_masks} total masks.\n"
-        f"Chosen parameters: eps={chosen_params[0]}, min_samples={chosen_params[1]}"
-    )
+    Backward compatible with the original ``filtering(masks, eps, min_samples)``
+    call; shape gating runs first and can be disabled.
+    """
+    masks = sorted_masks
+    if apply_shape_gate:
+        before = len(masks)
+        masks = shape_prefilter(masks, **(shape_kwargs or {}))
+        print(f"Shape gate: kept {len(masks)}/{before} masks.")
+    if not masks:
+        return [], (None, None)
 
-    return chosen_filtered_masks, chosen_params
+    chosen, chosen_params = _area_dbscan(masks, eps_values, min_samples_values)
+    print(f"Area DBSCAN: kept {len(chosen)}/{len(masks)} masks "
+          f"(eps={chosen_params[0]}, min_samples={chosen_params[1]}).")
+    return chosen, chosen_params

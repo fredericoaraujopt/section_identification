@@ -10,3 +10,13 @@ __pycache__
 images_local/
 section_identification/TESTING_local.ipynb
 section_identification/test.py
+section_identification/demo.ipynb
+# STiM upgrade: large / local artifacts
+checkpoint/
+*_files/
+*_STiM.czi
+*_overlay.png
+*.geojson
+.env_backup_py39.txt
+.pip_backup_py39.txt
+.claude/
