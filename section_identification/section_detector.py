@@ -201,9 +201,14 @@ def automatic_identification(image_path, checkpoint, image=None, model_cfg=None,
             generated_masks = mask_generator.generate(image)
         print(f"Generated {len(generated_masks)} masks.")
         sorted_masks = sorted(generated_masks, key=lambda x: x["area"], reverse=True)
-        with open(cache_file, "wb") as f:
-            pickle.dump(sorted_masks, f)
-        print("Cached masks.")
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(sorted_masks, f)
+            print("Cached masks.")
+        except OSError as e:
+            # Don't lose a long detection run if the cache dir is gone (e.g. an
+            # external drive unmounted mid-run).
+            print(f"[warn] could not write mask cache ({e}); continuing without cache.")
 
     if apply_filtering:
         print("Filtering masks…")

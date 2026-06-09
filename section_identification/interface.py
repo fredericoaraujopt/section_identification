@@ -29,7 +29,10 @@ import napari
 from section_identification.section_detector import automatic_identification
 from section_identification.export import export_polygons, mask_to_polygon
 from section_identification import czi_io, ordering
-from section_identification.device import describe as describe_device
+from section_identification.device import describe as describe_device, device_str
+# NB: run_sam_interactive / display_help are imported lazily inside run_manual,
+# because interactive.py imports onnxruntime at module load — keeping it lazy
+# means the GUI still starts even if the manual-editor deps aren't installed.
 
 
 # --------------------------------------------------------------------------- #
@@ -71,9 +74,6 @@ class SectionIdentificationGUI(QWidget):
         self.image_layer = None
         self.shapes_layer = None
         self.fid_layer = None
-        self.predictor = None          # SAM 2.1 image predictor (click-to-add)
-        self.sam_click_enabled = False
-        self._device = None
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -113,16 +113,14 @@ class SectionIdentificationGUI(QWidget):
         self.btn_auto = QPushButton("Run Automatic Detection")
         layout.addWidget(self.btn_auto)
 
-        # --- SAM-assisted real-time correction ---
-        layout.addWidget(QLabel("<b>Manual correction</b>"))
-        self.btn_samclick = QPushButton("SAM 2.1 click-to-add: OFF")
-        self.btn_samclick.setCheckable(True)
-        layout.addWidget(self.btn_samclick)
+        # --- Manual detector (original SAM-assisted ONNX editor) ---
+        layout.addWidget(QLabel("<b>Manual Detector</b>"))
+        self.btn_manual = QPushButton("Launch Manual Detector")
+        layout.addWidget(self.btn_manual)
         layout.addWidget(QLabel(
-            "<i>Fix false negatives: toggle ON, then click a missed section — "
-            "SAM 2.1 segments it and adds it to 'Sections'. Fix false positives: "
-            "select a polygon in 'Sections' and press Delete. Drop registration "
-            "points in the 'Fiducials' layer.</i>"))
+            "<i>Opens the interactive SAM editor: hover to preview a mask, click "
+            "to add; 'r' to remove; 'm' for fiducials; Esc to finish. Results load "
+            "back into the 'Sections' layer.</i>"))
 
         # --- Ordering filmstrip ---
         layout.addWidget(QLabel("<b>Serial order (drag to reorder)</b>"))
@@ -143,10 +141,13 @@ class SectionIdentificationGUI(QWidget):
         self.btn_export = QPushButton("Export (CSV + GeoJSON + annotated CZI)")
         layout.addWidget(self.btn_export)
 
-        # --- Checkpoint ---
+        # --- Checkpoints ---
         pkg = Path(os.path.abspath(__file__))
-        default_ckpt = pkg.parents[1] / "checkpoint" / "sam2.1_hiera_base_plus.pt"
-        self.checkpoint = str(default_ckpt)
+        ckpt_dir = pkg.parents[1] / "checkpoint"
+        self.checkpoint = str(ckpt_dir / "sam2.1_hiera_base_plus.pt")  # SAM 2.1 (auto)
+        # SAM 1 checkpoint used by the manual ONNX editor (vit_b by default).
+        self.sam1_checkpoint = str(ckpt_dir / "sam_vit_b_01ec64.pth")
+        self.sam1_model_type = "vit_b"
         self.lbl_ckpt = QLabel(f"Checkpoint: {self.checkpoint}")
         self.lbl_ckpt.setWordWrap(True)
         layout.addWidget(self.lbl_ckpt)
@@ -171,10 +172,7 @@ class SectionIdentificationGUI(QWidget):
         self.btn_refresh_strip.clicked.connect(self.rebuild_filmstrip)
         self.btn_export.clicked.connect(self.export_coordinates)
         self.btn_ckpt.clicked.connect(self.select_checkpoint)
-        self.btn_samclick.clicked.connect(self.toggle_sam_click)
-        # Viewer-level click handler for SAM click-to-add (fires regardless of
-        # which layer is active; gated by self.sam_click_enabled).
-        self.viewer.mouse_drag_callbacks.append(self._on_viewer_click)
+        self.btn_manual.clicked.connect(self.run_manual)
 
     # ----- logging plumbing -----
     def write(self, text):
@@ -207,11 +205,6 @@ class SectionIdentificationGUI(QWidget):
         self.image_path = path
         self.lbl_path.setText(f"Selected: {path}")
         self.log_msg(f"Loading {os.path.basename(path)}…")
-        # New image -> stale predictor; re-encode on next SAM click.
-        self.predictor = None
-        self.sam_click_enabled = False
-        self.btn_samclick.setChecked(False)
-        self.btn_samclick.setText("SAM 2.1 click-to-add: OFF")
         try:
             if czi_io.is_czi(path):
                 arr, geom, meta = czi_io.read_czi_overview(
@@ -409,87 +402,90 @@ class SectionIdentificationGUI(QWidget):
         except Exception:
             self.log_msg("❌ export error:\n" + traceback.format_exc())
 
-    # ----- SAM 2.1 click-to-add (real-time correction of false negatives) -----
-    def toggle_sam_click(self):
-        if self.btn_samclick.isChecked():
-            if self.overview is None:
-                self.log_msg("⚠️ Load an image first.")
-                self.btn_samclick.setChecked(False)
-                return
-            try:
-                self._ensure_predictor()
-            except Exception:
-                self.log_msg("❌ SAM predictor init failed:\n" + traceback.format_exc())
-                self.btn_samclick.setChecked(False)
-                return
-            self.sam_click_enabled = True
-            self.btn_samclick.setText("SAM 2.1 click-to-add: ON — click missed sections")
-        else:
-            self.sam_click_enabled = False
-            self.btn_samclick.setText("SAM 2.1 click-to-add: OFF")
+    # ----- manual detector (original SAM-assisted ONNX editor) -----
+    def _image_file_for_interactive(self):
+        """Return an image-file path for the interactive editor.
 
-    def _ensure_predictor(self):
-        """Build the SAM 2.1 image predictor and encode the current overview once."""
-        if self.predictor is not None:
+        The interactive editor reads an image file with ``cv2.imread``; for a CZI
+        we write the current overview to a PNG (the editor then works in overview
+        pixel space, which export maps back to full resolution via ``geom``).
+        """
+        if not czi_io.is_czi(self.image_path):
+            return self.image_path
+        import cv2
+        base = os.path.splitext(self.image_path)[0]
+        out_dir = f"{base}_files"
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            png = os.path.join(out_dir, os.path.basename(base) + "_overview.png")
+            cv2.imwrite(png, cv2.cvtColor(self.overview, cv2.COLOR_RGB2BGR))
+            return png
+        except Exception:
+            self.log_msg("❌ could not write overview PNG for the manual editor:\n"
+                         + traceback.format_exc())
+            return None
+
+    def run_manual(self):
+        if self.overview is None:
+            self.log_msg("⚠️ Load an image first."); return
+        if not os.path.isfile(self.sam1_checkpoint):
+            QMessageBox.information(
+                self, "Missing SAM 1 checkpoint",
+                f"The manual editor uses a SAM 1 checkpoint:\n{self.sam1_checkpoint}"
+                "\n\nDownload sam_vit_b_01ec64.pth (or sam_vit_h_4b8939.pth) or "
+                "select one now.")
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Select SAM 1 checkpoint", "", "Checkpoints (*.pth *.pt)")
+            if not path:
+                return
+            self.sam1_checkpoint = path
+            if "vit_h" in os.path.basename(path):
+                self.sam1_model_type = "vit_h"
+            elif "vit_l" in os.path.basename(path):
+                self.sam1_model_type = "vit_l"
+            else:
+                self.sam1_model_type = "vit_b"
+
+        try:
+            from section_identification.interactive import run_sam_interactive
+            from section_identification.interactive_helpers import display_help
+        except Exception:
+            QMessageBox.warning(
+                self, "Manual editor unavailable",
+                "The manual editor needs 'onnxruntime' and 'segment-anything' "
+                "installed in this environment:\n\n"
+                "  pip install onnxruntime segment-anything")
             return
-        from section_identification.section_detector import build_image_predictor
-        from section_identification.device import get_device, autocast_ctx
-        self._device = get_device()
+
+        img_path = self._image_file_for_interactive()
+        if img_path is None:
+            return
+
         self.progress.setRange(0, 0); self.progress.setVisible(True)
         QApplication.processEvents()
-        self.log_msg("Initialising SAM 2.1 predictor (encoding overview)…")
         try:
-            self.predictor = build_image_predictor(self.checkpoint, None, self._device)
-            with autocast_ctx(self._device):
-                self.predictor.set_image(self.overview)
-            self.log_msg("✔️ SAM click-to-add ready.")
+            display_help()
+            self.log_msg("▶ Launching manual interactive editor (separate window; "
+                         "the GUI is busy until you press Esc)…")
+            new_masks, stored_masks, fiducials = run_sam_interactive(
+                img_path, checkpoint=self.sam1_checkpoint,
+                stored_masks=self.masks if self.masks else [],
+                model_type=self.sam1_model_type, device=device_str())
+            self.log_msg(f"✔️ Manual session: {len(new_masks)} new, "
+                         f"{len(stored_masks)} stored, {len(fiducials)} fiducials.")
+            # Funnel results into the editable napari layers + export path.
+            combined = list(stored_masks) + list(new_masks)
+            self.masks = combined
+            polys_xy = [mask_to_polygon(m["segmentation"]) for m in combined]
+            polys_xy = [p for p in polys_xy if p is not None and len(p) >= 3]
+            self._ensure_edit_layers(polys_xy)
+            if fiducials and self.fid_layer is not None:
+                self.fid_layer.data = np.asarray(fiducials, dtype=float)[:, ::-1]
+            self.rebuild_filmstrip()
+        except Exception:
+            self.log_msg("❌ manual editor error:\n" + traceback.format_exc())
         finally:
             self.progress.setVisible(False)
-
-    def _on_viewer_click(self, viewer, event):
-        if not self.sam_click_enabled or self.image_layer is None:
-            return
-        if getattr(event, "button", 1) != 1:  # left button only
-            return
-        try:
-            pos = self.image_layer.world_to_data(event.position)
-        except Exception:
-            return
-        y, x = float(pos[0]), float(pos[1])
-        h, w = self.overview.shape[:2]
-        if 0 <= x < w and 0 <= y < h:
-            self._sam_add_at(x, y)
-
-    def _sam_add_at(self, x, y):
-        from section_identification.device import autocast_ctx
-        try:
-            with autocast_ctx(self._device):
-                masks, scores, _ = self.predictor.predict(
-                    point_coords=np.array([[x, y]], dtype=float),
-                    point_labels=np.array([1], dtype=int),
-                    multimask_output=True)
-            # Sections are small/local: prefer the highest-scoring mask that
-            # isn't a near-whole-image blob; fall back to the smallest mask.
-            masks = np.asarray(masks)
-            areas = masks.reshape(len(masks), -1).sum(axis=1)
-            img_area = float(masks[0].size)
-            compact = [i for i in range(len(masks)) if areas[i] < 0.3 * img_area]
-            idx = (max(compact, key=lambda k: scores[k]) if compact
-                   else int(np.argmin(areas)))
-            best = masks[idx]
-            poly = mask_to_polygon((best > 0).astype(np.uint8))
-            if poly is None or len(poly) < 3:
-                self.log_msg("No mask at that point.")
-                return
-            napari_poly = xy_to_napari(poly)
-            try:
-                self.shapes_layer.add(napari_poly, shape_type="polygon")
-            except Exception:
-                self.shapes_layer.data = list(self.shapes_layer.data) + [napari_poly]
-            self.log_msg(f"➕ Added section at ({x:.0f},{y:.0f}); "
-                         f"{len(self.shapes_layer.data)} total.")
-        except Exception:
-            self.log_msg("❌ SAM click failed:\n" + traceback.format_exc())
 
 
 def main():

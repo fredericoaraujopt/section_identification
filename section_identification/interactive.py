@@ -137,6 +137,7 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
     final_model_path = install_and_export_sam_onnx(
         image_path=image_path,
         checkpoint=checkpoint,
+        model_type=model_type,
         )
 
     # Step 2: Create or load the embedding for the image.

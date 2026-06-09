@@ -26,8 +26,13 @@ setup(
         "napari",
         "qtpy",
         "ipywidgets",
-        # interactive/ONNX helpers (kept for the legacy/web export paths)
+        # Manual SAM-assisted editor (SAM 1 + ONNX interactive window)
+        "segment-anything",
+        "onnx",
         "onnxruntime",
+        "onnxscript",      # required by torch>=2.x ONNX export tooling
+        "ipycanvas",
+        "ipyevents",
         "pycocotools",
     ],
     entry_points={
