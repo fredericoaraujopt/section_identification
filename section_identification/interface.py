@@ -96,6 +96,10 @@ class SectionIdentificationGUI(QWidget):
         self._raw_sections = []          # accumulated {poly(overview), area}
         self._stream_mode = False
         self._proc_buf = ""              # stdout line buffer for the worker
+        # Zoomable SAM-on-click corrector (napari zooms natively).
+        self.predictor = None
+        self.sam_click_enabled = False
+        self._click_device = None
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -161,14 +165,20 @@ class SectionIdentificationGUI(QWidget):
         self.lbl_elapsed = QLabel("")
         layout.addWidget(self.lbl_elapsed)
 
-        # --- Manual detector (original SAM-assisted ONNX editor) ---
+        # --- Manual correction ---
         layout.addWidget(QLabel("<b>Manual Detector</b>"))
-        self.btn_manual = QPushButton("Launch Manual Detector")
+        self.btn_samclick = QPushButton("SAM click-to-add (zoomable): OFF")
+        self.btn_samclick.setCheckable(True)
+        layout.addWidget(self.btn_samclick)
+        layout.addWidget(QLabel(
+            "<i>Zoom into the image (scroll), toggle ON, then click a missed "
+            "section — SAM 2.1 segments it into 'Sections'. Remove a wrong one: "
+            "select it in 'Sections' and press Delete.</i>"))
+        self.btn_manual = QPushButton("Launch OpenCV Manual Detector (SAM 1)")
         layout.addWidget(self.btn_manual)
         layout.addWidget(QLabel(
-            "<i>Opens the interactive SAM editor: hover to preview a mask, click "
-            "to add; 'r' to remove; 'm' for fiducials; Esc to finish. Results load "
-            "back into the 'Sections' layer.</i>"))
+            "<i>Alternative: the original separate-window editor (hover-preview, "
+            "click add, 'r' remove, 'm' fiducials, Esc finish).</i>"))
 
         # --- Ordering filmstrip ---
         layout.addWidget(QLabel("<b>Serial order (drag to reorder)</b>"))
@@ -224,6 +234,8 @@ class SectionIdentificationGUI(QWidget):
         self.btn_stop.clicked.connect(self.stop_detection)
         self.btn_calibrate.clicked.connect(self.calibrate_from_examples)
         self.btn_preview.clicked.connect(self.preview_tiling)
+        self.btn_samclick.clicked.connect(self.toggle_sam_click)
+        self.viewer.mouse_drag_callbacks.append(self._on_viewer_click)
 
     # ----- logging plumbing -----
     def write(self, text):
@@ -255,6 +267,11 @@ class SectionIdentificationGUI(QWidget):
             return
         self.image_path = path
         self.lbl_path.setText(f"Selected: {path}")
+        # new image -> stale click predictor; re-encode on next click
+        self.predictor = None
+        self.sam_click_enabled = False
+        self.btn_samclick.setChecked(False)
+        self.btn_samclick.setText("SAM click-to-add (zoomable): OFF")
         self.log_msg(f"Loading {os.path.basename(path)}…")
         try:
             if czi_io.is_czi(path):
@@ -626,6 +643,83 @@ class SectionIdentificationGUI(QWidget):
         if self.proc and self.proc.state() != QProcess.NotRunning:
             self.log_msg("■ Stopping detection…")
             self.proc.kill()
+
+    # ----- zoomable SAM-on-click correction (napari zooms natively) -----
+    def toggle_sam_click(self):
+        if self.btn_samclick.isChecked():
+            if self.overview is None:
+                self.log_msg("⚠️ Load an image first.")
+                self.btn_samclick.setChecked(False); return
+            try:
+                self._ensure_predictor()
+            except Exception:
+                self.log_msg("❌ SAM predictor init failed:\n" + traceback.format_exc())
+                self.btn_samclick.setChecked(False); return
+            self.sam_click_enabled = True
+            self.btn_samclick.setText("SAM click-to-add (zoomable): ON — click sections")
+        else:
+            self.sam_click_enabled = False
+            self.btn_samclick.setText("SAM click-to-add (zoomable): OFF")
+
+    def _ensure_predictor(self):
+        if self.predictor is not None:
+            return
+        from section_identification.section_detector import build_image_predictor
+        from section_identification.device import get_device, autocast_ctx
+        self._click_device = get_device()
+        self.progress.setRange(0, 0); self.progress.setVisible(True)
+        QApplication.processEvents()
+        self.log_msg("Initialising SAM 2.1 predictor (encoding overview)…")
+        try:
+            self.predictor = build_image_predictor(self.checkpoint, None, self._click_device)
+            with autocast_ctx(self._click_device):
+                self.predictor.set_image(self.overview)
+            self.log_msg("✔️ SAM click-to-add ready.")
+        finally:
+            self.progress.setVisible(False)
+
+    def _on_viewer_click(self, viewer, event):
+        if not self.sam_click_enabled or self.image_layer is None:
+            return
+        if getattr(event, "button", 1) != 1:
+            return
+        try:
+            pos = self.image_layer.world_to_data(event.position)
+        except Exception:
+            return
+        y, x = float(pos[0]), float(pos[1])
+        h, w = self.overview.shape[:2]
+        if 0 <= x < w and 0 <= y < h:
+            self._sam_add_at(x, y)
+
+    def _sam_add_at(self, x, y):
+        from section_identification.device import autocast_ctx
+        try:
+            with autocast_ctx(self._click_device):
+                masks, scores, _ = self.predictor.predict(
+                    point_coords=np.array([[x, y]], dtype=float),
+                    point_labels=np.array([1], dtype=int), multimask_output=True)
+            masks = np.asarray(masks)
+            areas = masks.reshape(len(masks), -1).sum(axis=1)
+            img_area = float(masks[0].size)
+            compact = [i for i in range(len(masks)) if areas[i] < 0.3 * img_area]
+            idx = (max(compact, key=lambda k: scores[k]) if compact
+                   else int(np.argmin(areas)))
+            poly = mask_to_polygon((masks[idx] > 0).astype(np.uint8))
+            if poly is None or len(poly) < 3:
+                self.log_msg("No mask at that point."); return
+            napari_poly = xy_to_napari(poly)
+            if self.shapes_layer is None or self.shapes_layer not in self.viewer.layers:
+                self._ensure_edit_layers([])
+            try:
+                self.shapes_layer.add(napari_poly, shape_type="polygon")
+            except Exception:
+                self.shapes_layer.data = list(self.shapes_layer.data) + [napari_poly]
+            self.save_project()
+            self.log_msg(f"➕ section at ({x:.0f},{y:.0f}); "
+                         f"{len(self.shapes_layer.data)} total.")
+        except Exception:
+            self.log_msg("❌ SAM click failed:\n" + traceback.format_exc())
 
     # ----- calibration from drawn examples + tiling preview -----
     def _ensure_calib_layer(self):
