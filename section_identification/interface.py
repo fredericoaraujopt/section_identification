@@ -71,6 +71,9 @@ class SectionIdentificationGUI(QWidget):
         self.image_layer = None
         self.shapes_layer = None
         self.fid_layer = None
+        self.predictor = None          # SAM 2.1 image predictor (click-to-add)
+        self.sam_click_enabled = False
+        self._device = None
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -110,10 +113,16 @@ class SectionIdentificationGUI(QWidget):
         self.btn_auto = QPushButton("Run Automatic Detection")
         layout.addWidget(self.btn_auto)
 
-        # --- Editing hint ---
+        # --- SAM-assisted real-time correction ---
+        layout.addWidget(QLabel("<b>Manual correction</b>"))
+        self.btn_samclick = QPushButton("SAM 2.1 click-to-add: OFF")
+        self.btn_samclick.setCheckable(True)
+        layout.addWidget(self.btn_samclick)
         layout.addWidget(QLabel(
-            "<i>Edit polygons in the 'Sections' layer (select tool: move/delete "
-            "vertices; add polygons). Drop fiducials in the 'Fiducials' layer.</i>"))
+            "<i>Fix false negatives: toggle ON, then click a missed section — "
+            "SAM 2.1 segments it and adds it to 'Sections'. Fix false positives: "
+            "select a polygon in 'Sections' and press Delete. Drop registration "
+            "points in the 'Fiducials' layer.</i>"))
 
         # --- Ordering filmstrip ---
         layout.addWidget(QLabel("<b>Serial order (drag to reorder)</b>"))
@@ -162,6 +171,10 @@ class SectionIdentificationGUI(QWidget):
         self.btn_refresh_strip.clicked.connect(self.rebuild_filmstrip)
         self.btn_export.clicked.connect(self.export_coordinates)
         self.btn_ckpt.clicked.connect(self.select_checkpoint)
+        self.btn_samclick.clicked.connect(self.toggle_sam_click)
+        # Viewer-level click handler for SAM click-to-add (fires regardless of
+        # which layer is active; gated by self.sam_click_enabled).
+        self.viewer.mouse_drag_callbacks.append(self._on_viewer_click)
 
     # ----- logging plumbing -----
     def write(self, text):
@@ -194,6 +207,11 @@ class SectionIdentificationGUI(QWidget):
         self.image_path = path
         self.lbl_path.setText(f"Selected: {path}")
         self.log_msg(f"Loading {os.path.basename(path)}…")
+        # New image -> stale predictor; re-encode on next SAM click.
+        self.predictor = None
+        self.sam_click_enabled = False
+        self.btn_samclick.setChecked(False)
+        self.btn_samclick.setText("SAM 2.1 click-to-add: OFF")
         try:
             if czi_io.is_czi(path):
                 arr, geom, meta = czi_io.read_czi_overview(
@@ -214,7 +232,8 @@ class SectionIdentificationGUI(QWidget):
         self.image_layer = self.viewer.add_image(self.overview, name="Overview")
 
         # Load any existing STiM annotations stored inside the CZI so reopening
-        # an annotated CZI shows the saved polygons/fiducials.
+        # an annotated CZI shows the saved polygons/fiducials. Everything here is
+        # best-effort: a failure must NOT prevent the image from opening.
         polys_xy, fids_xy = [], []
         if self.geom is not None and czi_io.is_czi(path):
             try:
@@ -231,15 +250,25 @@ class SectionIdentificationGUI(QWidget):
                     self.log_msg(f"Loaded {len(polys_xy)} polygons + "
                                  f"{len(fids_xy)} fiducials from CZI annotations.")
             except Exception:
-                self.log_msg("[warn] could not read CZI annotations.")
+                self.log_msg("[warn] could not read CZI annotations:\n"
+                             + traceback.format_exc())
+                polys_xy, fids_xy = [], []
 
-        self._ensure_edit_layers(polys_xy)
-        if fids_xy and self.fid_layer is not None:
-            self.fid_layer.data = np.asarray(fids_xy, dtype=float)[:, ::-1]  # (x,y)->(y,x)
+        try:
+            self._ensure_edit_layers(polys_xy)
+            if fids_xy and self.fid_layer is not None:
+                self.fid_layer.data = np.asarray(fids_xy, dtype=float)[:, ::-1]
+        except Exception:
+            self.log_msg("[warn] building annotation layers failed; starting "
+                         "empty:\n" + traceback.format_exc())
+            self._ensure_edit_layers([])
         self.masks = []
         self.filmstrip.clear()
-        if polys_xy:
-            self.rebuild_filmstrip()
+        try:
+            if polys_xy:
+                self.rebuild_filmstrip()
+        except Exception:
+            self.log_msg("[warn] filmstrip build failed (annotations still loaded).")
 
     def _reset_layers(self):
         for lyr in list(self.viewer.layers):
@@ -379,6 +408,88 @@ class SectionIdentificationGUI(QWidget):
                 f"{k}={v}" for k, v in outputs.items()))
         except Exception:
             self.log_msg("❌ export error:\n" + traceback.format_exc())
+
+    # ----- SAM 2.1 click-to-add (real-time correction of false negatives) -----
+    def toggle_sam_click(self):
+        if self.btn_samclick.isChecked():
+            if self.overview is None:
+                self.log_msg("⚠️ Load an image first.")
+                self.btn_samclick.setChecked(False)
+                return
+            try:
+                self._ensure_predictor()
+            except Exception:
+                self.log_msg("❌ SAM predictor init failed:\n" + traceback.format_exc())
+                self.btn_samclick.setChecked(False)
+                return
+            self.sam_click_enabled = True
+            self.btn_samclick.setText("SAM 2.1 click-to-add: ON — click missed sections")
+        else:
+            self.sam_click_enabled = False
+            self.btn_samclick.setText("SAM 2.1 click-to-add: OFF")
+
+    def _ensure_predictor(self):
+        """Build the SAM 2.1 image predictor and encode the current overview once."""
+        if self.predictor is not None:
+            return
+        from section_identification.section_detector import build_image_predictor
+        from section_identification.device import get_device, autocast_ctx
+        self._device = get_device()
+        self.progress.setRange(0, 0); self.progress.setVisible(True)
+        QApplication.processEvents()
+        self.log_msg("Initialising SAM 2.1 predictor (encoding overview)…")
+        try:
+            self.predictor = build_image_predictor(self.checkpoint, None, self._device)
+            with autocast_ctx(self._device):
+                self.predictor.set_image(self.overview)
+            self.log_msg("✔️ SAM click-to-add ready.")
+        finally:
+            self.progress.setVisible(False)
+
+    def _on_viewer_click(self, viewer, event):
+        if not self.sam_click_enabled or self.image_layer is None:
+            return
+        if getattr(event, "button", 1) != 1:  # left button only
+            return
+        try:
+            pos = self.image_layer.world_to_data(event.position)
+        except Exception:
+            return
+        y, x = float(pos[0]), float(pos[1])
+        h, w = self.overview.shape[:2]
+        if 0 <= x < w and 0 <= y < h:
+            self._sam_add_at(x, y)
+
+    def _sam_add_at(self, x, y):
+        from section_identification.device import autocast_ctx
+        try:
+            with autocast_ctx(self._device):
+                masks, scores, _ = self.predictor.predict(
+                    point_coords=np.array([[x, y]], dtype=float),
+                    point_labels=np.array([1], dtype=int),
+                    multimask_output=True)
+            # Sections are small/local: prefer the highest-scoring mask that
+            # isn't a near-whole-image blob; fall back to the smallest mask.
+            masks = np.asarray(masks)
+            areas = masks.reshape(len(masks), -1).sum(axis=1)
+            img_area = float(masks[0].size)
+            compact = [i for i in range(len(masks)) if areas[i] < 0.3 * img_area]
+            idx = (max(compact, key=lambda k: scores[k]) if compact
+                   else int(np.argmin(areas)))
+            best = masks[idx]
+            poly = mask_to_polygon((best > 0).astype(np.uint8))
+            if poly is None or len(poly) < 3:
+                self.log_msg("No mask at that point.")
+                return
+            napari_poly = xy_to_napari(poly)
+            try:
+                self.shapes_layer.add(napari_poly, shape_type="polygon")
+            except Exception:
+                self.shapes_layer.data = list(self.shapes_layer.data) + [napari_poly]
+            self.log_msg(f"➕ Added section at ({x:.0f},{y:.0f}); "
+                         f"{len(self.shapes_layer.data)} total.")
+        except Exception:
+            self.log_msg("❌ SAM click failed:\n" + traceback.format_exc())
 
 
 def main():

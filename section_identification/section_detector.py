@@ -34,6 +34,21 @@ def _is_sam2_checkpoint(checkpoint: str) -> bool:
     return name.endswith(".pt") or "sam2" in name
 
 
+def build_image_predictor(checkpoint, model_cfg, device):
+    """Build a SAM 2.1 image predictor for interactive click-to-segment.
+
+    Used by the GUI to correct false negatives in real time: ``set_image`` once,
+    then ``predict(point_coords=...)`` per click. SAM 1 (.pth) is unsupported
+    here — interactive correction uses SAM 2.1 to match the detector.
+    """
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    cfg = model_cfg or _infer_sam2_cfg(checkpoint)
+    sam2 = build_sam2(cfg, str(checkpoint), device=str(device))
+    return SAM2ImagePredictor(sam2)
+
+
 def build_mask_generator(checkpoint, model_cfg, device, params):
     """Return an automatic mask generator (SAM 2.1 if possible, else SAM 1)."""
     if _is_sam2_checkpoint(checkpoint):
@@ -170,7 +185,7 @@ def automatic_identification(image_path, checkpoint, image=None, model_cfg=None,
     # settings don't collide.
     model_tag = os.path.splitext(os.path.basename(str(checkpoint)))[0]
     param_tag = (f"pps{params['points_per_side']}_cnl{params['crop_n_layers']}"
-                 f"_a{params['min_mask_region_area']}")
+                 f"_a{params['min_mask_region_area']}_iou{params['pred_iou_thresh']}")
     cache_file = (f"{file_directory}/"
                   f"{os.path.basename(os.path.splitext(image_path)[0])}"
                   f"_{model_tag}_{max(image.shape[:2])}_{param_tag}_masks.pkl")
