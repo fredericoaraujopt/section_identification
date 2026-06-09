@@ -19,4 +19,5 @@ checkpoint/
 *.geojson
 .env_backup_py39.txt
 .pip_backup_py39.txt
-.claude/
+.claude/section_examples/
+*_stim_project.json

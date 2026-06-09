@@ -144,7 +144,9 @@ def automatic_identification(image_path, checkpoint, image=None, model_cfg=None,
         "box_nms_thresh": 0.7,
         "crop_n_layers": 0,
         "min_mask_region_area": 100,
-        "output_mode": "binary_mask",
+        # RLE keeps the mask cache tiny (KB/mask) instead of a full binary array
+        # (~9 MB/mask at a 3072 overview -> multi-GB caches that trigger swap).
+        "output_mode": "coco_rle",
         "device": None,  # auto-select
     }
     params = {**default_params, **kwargs}

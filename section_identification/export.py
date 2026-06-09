@@ -21,14 +21,32 @@ import numpy as np
 # --------------------------------------------------------------------------- #
 # Mask -> polygon
 # --------------------------------------------------------------------------- #
+def decode_segmentation(segmentation):
+    """Return a 2D uint8 mask from either a binary array or an RLE dict.
+
+    SAM masks may be stored as full binary arrays (``output_mode='binary_mask'``)
+    or, to keep the cache small, as run-length-encoded dicts
+    (``'coco_rle'``/``'uncompressed_rle'``). This decodes either to an ``HxW``
+    array, decoding only one mask at a time (bounded memory).
+    """
+    if isinstance(segmentation, dict):
+        from pycocotools import mask as mask_utils
+        seg = dict(segmentation)
+        counts = seg.get("counts")
+        if isinstance(counts, str):  # coco_rle stores counts as a str for JSON
+            seg["counts"] = counts.encode("utf-8")
+        return mask_utils.decode(seg)
+    return np.squeeze(np.asarray(segmentation))
+
+
 def contours_from_mask(segmentation, simplify_eps=1.5, sample_points=None):
-    """Binary mask -> list of contours, each an ``Nx2`` int array (x, y).
+    """Binary/RLE mask -> list of contours, each an ``Nx2`` int array (x, y).
 
     ``simplify_eps`` is the Douglas–Peucker tolerance in pixels (0 disables).
     """
     import cv2
 
-    seg = np.squeeze(segmentation)
+    seg = decode_segmentation(segmentation)
     if seg.dtype != np.uint8:
         seg = (seg > 0).astype(np.uint8)
     contours, _ = cv2.findContours(seg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

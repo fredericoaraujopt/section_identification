@@ -10,13 +10,14 @@ Coordinate convention: napari layer data is ``(row, col)`` = ``(y, x)``; our
 detection/export code uses ``(x, y)``. The helpers below convert at the boundary.
 """
 
+import json
 import os
 import sys
 import traceback
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import Qt, QSize
+from qtpy.QtCore import Qt, QSize, QTimer
 from qtpy.QtGui import QIcon, QImage, QPixmap
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -74,6 +75,11 @@ class SectionIdentificationGUI(QWidget):
         self.image_layer = None
         self.shapes_layer = None
         self.fid_layer = None
+        # Debounced autosave: edits schedule a save 1.5 s later (so dragging a
+        # vertex doesn't write the project file on every mouse move).
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.timeout.connect(self.save_project)
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -224,11 +230,16 @@ class SectionIdentificationGUI(QWidget):
         self._reset_layers()
         self.image_layer = self.viewer.add_image(self.overview, name="Overview")
 
-        # Load any existing STiM annotations stored inside the CZI so reopening
-        # an annotated CZI shows the saved polygons/fiducials. Everything here is
-        # best-effort: a failure must NOT prevent the image from opening.
+        # Restore the working session. Prefer the autosaved project (the most
+        # recent state); fall back to annotations baked into a CZI. Everything
+        # here is best-effort: a failure must NOT prevent the image from opening.
         polys_xy, fids_xy = [], []
-        if self.geom is not None and czi_io.is_czi(path):
+        proj_polys, proj_fids = self.load_project()
+        if proj_polys is not None and (proj_polys or proj_fids):
+            polys_xy, fids_xy = proj_polys, proj_fids
+            self.log_msg(f"Restored {len(polys_xy)} sections + {len(fids_xy)} "
+                         f"fiducials from autosaved project.")
+        elif self.geom is not None and czi_io.is_czi(path):
             try:
                 from section_identification.czi_export import read_annotations
                 polys_full, fids_full = read_annotations(path)
@@ -294,6 +305,74 @@ class SectionIdentificationGUI(QWidget):
                     setattr(self.fid_layer, attr, val)
                 except Exception:
                     pass
+        # Autosave the working session whenever the user edits polygons/fiducials.
+        for layer in (self.shapes_layer, self.fid_layer):
+            try:
+                layer.events.data.connect(self._schedule_autosave)
+            except Exception:
+                pass
+
+    def _schedule_autosave(self, *args):
+        try:
+            self._autosave_timer.start(1500)
+        except Exception:
+            pass
+
+    # ----- project autosave / restore -----
+    def _project_path(self):
+        base = os.path.splitext(os.path.basename(self.image_path))[0]
+        return os.path.join(f"{os.path.splitext(self.image_path)[0]}_files",
+                            f"{base}_stim_project.json")
+
+    def _to_full(self, pts):
+        p = np.asarray(pts, dtype=float).reshape(-1, 2)
+        if self.geom is None:
+            return [[float(x), float(y)] for x, y in p]
+        fx, fy = self.geom.ds_to_full(p[:, 0], p[:, 1])
+        return [[float(a), float(b)] for a, b in zip(fx, fy)]
+
+    def _to_overview(self, pts):
+        p = np.asarray(pts, dtype=float).reshape(-1, 2)
+        if self.geom is None:
+            return p
+        x, y = self.geom.full_to_ds(p[:, 0], p[:, 1])
+        return np.column_stack([x, y])
+
+    def save_project(self):
+        """Persist the current sections + fiducials (full-res coords) to JSON.
+
+        Best-effort and silent: autosave must never crash or interrupt the GUI.
+        """
+        if self.image_path is None:
+            return
+        try:
+            data = {
+                "image": self.image_path,
+                "sections": [self._to_full(p) for p in self.current_polygons_xy()],
+                "fiducials": [self._to_full([f])[0] for f in self.current_fiducials_xy()],
+            }
+            path = self._project_path()
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def load_project(self):
+        """Return (polygons_overview, fiducials_overview) from the autosaved
+        project file, or (None, None) if there isn't one."""
+        if self.image_path is None:
+            return None, None
+        path = self._project_path()
+        if not os.path.isfile(path):
+            return None, None
+        try:
+            data = json.load(open(path))
+        except Exception:
+            return None, None
+        polys = [self._to_overview(s) for s in data.get("sections", [])]
+        fids = [tuple(self._to_overview([f])[0]) for f in data.get("fiducials", [])]
+        return polys, fids
 
     # ----- detection -----
     def run_auto(self):
@@ -326,6 +405,7 @@ class SectionIdentificationGUI(QWidget):
             self._ensure_edit_layers(polys_xy)
             self.log_msg(f"✔️ {len(polys_xy)} sections → editable 'Sections' layer.")
             self.rebuild_filmstrip()
+            self.save_project()  # persist immediately so a crash never loses it
         except Exception:
             self.log_msg("❌ detection error:\n" + traceback.format_exc())
         finally:
@@ -461,6 +541,23 @@ class SectionIdentificationGUI(QWidget):
         if img_path is None:
             return
 
+        # The OpenCV editor overlays stored masks as full-frame binary arrays.
+        # Masks are stored as RLE now, so decode them — but only if there aren't
+        # too many (decoding hundreds of full-res masks would blow up memory; for
+        # dense wafers use the napari zoom corrector instead).
+        from section_identification.export import decode_segmentation
+        stored = []
+        OVERLAY_CAP = 60
+        if self.masks and len(self.masks) <= OVERLAY_CAP:
+            for m in self.masks:
+                mm = dict(m)
+                mm["segmentation"] = decode_segmentation(m["segmentation"])
+                stored.append(mm)
+        elif self.masks:
+            self.log_msg(f"({len(self.masks)} sections is too many to overlay in the "
+                         "OpenCV editor — launching without overlay; new clicks are "
+                         "appended to the existing sections.)")
+
         self.progress.setRange(0, 0); self.progress.setVisible(True)
         QApplication.processEvents()
         try:
@@ -468,20 +565,24 @@ class SectionIdentificationGUI(QWidget):
             self.log_msg("▶ Launching manual interactive editor (separate window; "
                          "the GUI is busy until you press Esc)…")
             new_masks, stored_masks, fiducials = run_sam_interactive(
-                img_path, checkpoint=self.sam1_checkpoint,
-                stored_masks=self.masks if self.masks else [],
+                img_path, checkpoint=self.sam1_checkpoint, stored_masks=stored,
                 model_type=self.sam1_model_type, device=device_str())
             self.log_msg(f"✔️ Manual session: {len(new_masks)} new, "
                          f"{len(stored_masks)} stored, {len(fiducials)} fiducials.")
-            # Funnel results into the editable napari layers + export path.
-            combined = list(stored_masks) + list(new_masks)
-            self.masks = combined
-            polys_xy = [mask_to_polygon(m["segmentation"]) for m in combined]
-            polys_xy = [p for p in polys_xy if p is not None and len(p) >= 3]
+            new_polys = [mask_to_polygon(m["segmentation"])
+                         for m in list(stored_masks) + list(new_masks)]
+            new_polys = [p for p in new_polys if p is not None and len(p) >= 3]
+            if stored:
+                # Full set was overlaid/edited -> it is authoritative.
+                polys_xy = new_polys
+            else:
+                # Dense wafer: keep existing sections and append the new clicks.
+                polys_xy = self.current_polygons_xy() + new_polys
             self._ensure_edit_layers(polys_xy)
             if fiducials and self.fid_layer is not None:
                 self.fid_layer.data = np.asarray(fiducials, dtype=float)[:, ::-1]
             self.rebuild_filmstrip()
+            self.save_project()
         except Exception:
             self.log_msg("❌ manual editor error:\n" + traceback.format_exc())
         finally:
