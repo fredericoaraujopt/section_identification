@@ -212,9 +212,34 @@ class SectionIdentificationGUI(QWidget):
 
         self._reset_layers()
         self.image_layer = self.viewer.add_image(self.overview, name="Overview")
-        self._ensure_edit_layers([])
+
+        # Load any existing STiM annotations stored inside the CZI so reopening
+        # an annotated CZI shows the saved polygons/fiducials.
+        polys_xy, fids_xy = [], []
+        if self.geom is not None and czi_io.is_czi(path):
+            try:
+                from section_identification.czi_export import read_annotations
+                polys_full, fids_full = read_annotations(path)
+                for pf in polys_full:
+                    p = np.asarray(pf, dtype=float)
+                    xd, yd = self.geom.full_to_ds(p[:, 0], p[:, 1])
+                    polys_xy.append(np.column_stack([xd, yd]))
+                for (xf, yf) in fids_full:
+                    xd, yd = self.geom.full_to_ds(xf, yf)
+                    fids_xy.append((float(xd), float(yd)))
+                if polys_xy or fids_xy:
+                    self.log_msg(f"Loaded {len(polys_xy)} polygons + "
+                                 f"{len(fids_xy)} fiducials from CZI annotations.")
+            except Exception:
+                self.log_msg("[warn] could not read CZI annotations.")
+
+        self._ensure_edit_layers(polys_xy)
+        if fids_xy and self.fid_layer is not None:
+            self.fid_layer.data = np.asarray(fids_xy, dtype=float)[:, ::-1]  # (x,y)->(y,x)
         self.masks = []
         self.filmstrip.clear()
+        if polys_xy:
+            self.rebuild_filmstrip()
 
     def _reset_layers(self):
         for lyr in list(self.viewer.layers):

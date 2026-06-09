@@ -45,8 +45,8 @@ def mask_shape_stats(mask):
     }
 
 
-def shape_prefilter(masks, min_solidity=0.80, min_extent=0.30, max_aspect=6.0,
-                    max_area_frac=0.40, drop_border=False):
+def shape_prefilter(masks, min_solidity=0.85, min_extent=0.30, max_aspect=6.0,
+                    max_area_frac=0.05, drop_border=False):
     """Keep only masks whose shape is plausible for a section.
 
     Drops: the near-full-frame background mask (``area_frac > max_area_frac``),
@@ -103,12 +103,31 @@ def _area_dbscan(sorted_masks, eps_values, min_samples_values):
     return [sorted_masks[i] for i in best_key], chosen_params
 
 
-def filtering(sorted_masks, eps_values, min_samples_values, apply_shape_gate=True,
-              shape_kwargs=None):
-    """Filter masks to the dominant cluster of section-shaped masks.
+def area_band_filter(masks, lo_ratio=0.2, hi_ratio=5.0):
+    """Keep masks whose area is within ``[lo_ratio, hi_ratio] x median area``.
 
-    Backward compatible with the original ``filtering(masks, eps, min_samples)``
-    call; shape gating runs first and can be disabled.
+    After shape gating, the majority of masks are real sections, so the median
+    area is a good estimate of section size. Large debris (and merged/garbage
+    blobs) sit well above ``hi_ratio x median`` and are removed; this is the
+    main debris killer and is robust to the DBSCAN parameters.
+    """
+    if not masks:
+        return masks
+    areas = np.array([m["area"] for m in masks], dtype=float)
+    med = float(np.median(areas))
+    lo, hi = med * lo_ratio, med * hi_ratio
+    kept = [m for m, a in zip(masks, areas) if lo <= a <= hi]
+    print(f"Area band [{lo:.0f}, {hi:.0f}] (median {med:.0f}): "
+          f"kept {len(kept)}/{len(masks)} masks.")
+    return kept or masks
+
+
+def filtering(sorted_masks, eps_values, min_samples_values, apply_shape_gate=True,
+              shape_kwargs=None, area_band=(0.2, 5.0)):
+    """Filter masks to the dominant population of section-shaped, section-sized masks.
+
+    Stages: shape gate -> adaptive area band (debris killer) -> area DBSCAN.
+    Backward compatible with the original ``filtering(masks, eps, min_samples)``.
     """
     masks = sorted_masks
     if apply_shape_gate:
@@ -117,6 +136,9 @@ def filtering(sorted_masks, eps_values, min_samples_values, apply_shape_gate=Tru
         print(f"Shape gate: kept {len(masks)}/{before} masks.")
     if not masks:
         return [], (None, None)
+
+    if area_band:
+        masks = area_band_filter(masks, *area_band)
 
     chosen, chosen_params = _area_dbscan(masks, eps_values, min_samples_values)
     print(f"Area DBSCAN: kept {len(chosen)}/{len(masks)} masks "

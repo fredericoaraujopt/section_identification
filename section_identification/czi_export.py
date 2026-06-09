@@ -246,6 +246,39 @@ def _commit_metadata(dst_czi: str, new_xml: str) -> None:
         builder.commit()
 
 
+def read_annotations(czi_path: str):
+    """Read STiM annotations back from a CZI's ``<Layers>``.
+
+    Returns ``(polygons, fiducials)`` in full-resolution pixel coords:
+    ``polygons`` is a list of ``[(x,y), ...]`` (from ``<Polygon><Points>``) and
+    ``fiducials`` a list of ``(x,y)`` (from ``<Ellipse>`` centres). Lets the GUI
+    reopen an annotated CZI and show/edit what was saved.
+    """
+    xml = _read_metadata_xml(czi_path)
+    root = ET.fromstring(xml)
+    polygons = []
+    for p in root.findall(".//Polygon"):
+        pts_el = p.find("Geometry/Points")
+        if pts_el is None or not pts_el.text:
+            continue
+        pts = []
+        for token in pts_el.text.split():
+            if "," in token:
+                x, y = token.split(",")
+                pts.append((float(x), float(y)))
+        if len(pts) >= 3:
+            polygons.append(pts)
+    fiducials = []
+    for e in root.findall(".//Ellipse"):
+        g = e.find("Geometry")
+        if g is None:
+            continue
+        cx, cy = g.findtext("CenterX"), g.findtext("CenterY")
+        if cx is not None and cy is not None:
+            fiducials.append((float(cx), float(cy)))
+    return polygons, fiducials
+
+
 def roundtrip_check(dst_czi: str, expect_polygons: int | None = None) -> bool:
     """Re-read the CZI metadata and confirm STiM polygons are present."""
     try:

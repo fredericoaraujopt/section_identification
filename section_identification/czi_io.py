@@ -109,6 +109,12 @@ class CziGeometry:
         y = self.origin_y + np.asarray(y_ds, dtype=float) / self.zoom
         return x, y
 
+    def full_to_ds(self, x_full, y_full):
+        """Full-resolution-pixel -> overview-pixel (inverse of ds_to_full)."""
+        x = (np.asarray(x_full, dtype=float) - self.origin_x) * self.zoom
+        y = (np.asarray(y_full, dtype=float) - self.origin_y) * self.zoom
+        return x, y
+
     def full_to_stage_um(self, x_full, y_full):
         """Full-res-pixel -> stage microns. Best-effort; needs-verification.
 
