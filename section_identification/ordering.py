@@ -46,10 +46,12 @@ def extract_thumbnails(image: np.ndarray, bboxes, size: int = 64) -> np.ndarray:
             crop = np.zeros((size, size), dtype=gray.dtype)
         t = cv2.resize(crop.astype(np.float32), (size, size))
         t -= t.mean()
-        s = t.std()
-        if s > 1e-6:
-            t /= s
-        thumbs.append(t)
+        # Normalise to unit L2 so the inner product is a bounded NCC in [-1, 1].
+        # Constant crops (norm 0) stay all-zero rather than blowing up.
+        n = float(np.linalg.norm(t))
+        if n > 1e-6:
+            t /= n
+        thumbs.append(np.nan_to_num(t))
     return np.asarray(thumbs)
 
 
@@ -62,8 +64,9 @@ def similarity_matrix(thumbs: np.ndarray) -> np.ndarray:
     n = len(thumbs)
     if n == 0:
         return np.zeros((0, 0))
-    flat = thumbs.reshape(n, -1)
-    sim = (flat @ flat.T) / flat.shape[1]
+    flat = np.nan_to_num(thumbs.reshape(n, -1).astype(np.float64))
+    sim = flat @ flat.T  # thumbnails are unit-L2 -> entries are NCC in [-1, 1]
+    sim = np.clip(np.nan_to_num(sim), -1.0, 1.0)
     np.fill_diagonal(sim, 1.0)
     return sim
 
