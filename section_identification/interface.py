@@ -13,11 +13,12 @@ detection/export code uses ``(x, y)``. The helpers below convert at the boundary
 import json
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import Qt, QSize, QTimer
+from qtpy.QtCore import Qt, QSize, QTimer, QProcess, QProcessEnvironment
 from qtpy.QtGui import QIcon, QImage, QPixmap
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFormLayout,
@@ -80,6 +81,12 @@ class SectionIdentificationGUI(QWidget):
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(self.save_project)
+        # Detection runs in a separate process (no GUI freeze, clean Stop).
+        self.proc = None
+        self._det_params = None
+        self._det_t0 = 0.0
+        self._elapsed_timer = QTimer(self)
+        self._elapsed_timer.timeout.connect(self._tick_elapsed)
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -116,8 +123,15 @@ class SectionIdentificationGUI(QWidget):
         self.chk_filter = QCheckBox("Filter for sections (shape + area)")
         self.chk_filter.setChecked(True)
         layout.addWidget(self.chk_filter)
+        det_row = QHBoxLayout()
         self.btn_auto = QPushButton("Run Automatic Detection")
-        layout.addWidget(self.btn_auto)
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setVisible(False)
+        det_row.addWidget(self.btn_auto)
+        det_row.addWidget(self.btn_stop)
+        layout.addLayout(det_row)
+        self.lbl_elapsed = QLabel("")
+        layout.addWidget(self.lbl_elapsed)
 
         # --- Manual detector (original SAM-assisted ONNX editor) ---
         layout.addWidget(QLabel("<b>Manual Detector</b>"))
@@ -179,6 +193,7 @@ class SectionIdentificationGUI(QWidget):
         self.btn_export.clicked.connect(self.export_coordinates)
         self.btn_ckpt.clicked.connect(self.select_checkpoint)
         self.btn_manual.clicked.connect(self.run_manual)
+        self.btn_stop.clicked.connect(self.stop_detection)
 
     # ----- logging plumbing -----
     def write(self, text):
@@ -374,7 +389,7 @@ class SectionIdentificationGUI(QWidget):
         fids = [tuple(self._to_overview([f])[0]) for f in data.get("fiducials", [])]
         return polys, fids
 
-    # ----- detection -----
+    # ----- detection (runs in a separate process; GUI stays responsive) -----
     def run_auto(self):
         if self.overview is None:
             self.log_msg("⚠️ Select an image first."); return
@@ -386,30 +401,85 @@ class SectionIdentificationGUI(QWidget):
             self.select_checkpoint()
             if not os.path.isfile(self.checkpoint):
                 return
+        if self.proc is not None and self.proc.state() != QProcess.NotRunning:
+            self.log_msg("Detection already running — press Stop first."); return
+
+        # Params that define the mask cache the worker will write (so we can load
+        # it back here). points_per_batch is NOT part of the cache key.
+        self._det_params = dict(
+            points_per_side=self.sp_pps.value(),
+            points_per_batch=self.sp_ppb.value(),
+            pred_iou_thresh=self.sp_iou.value(),
+            crop_n_layers=self.sp_crop.value(),
+            min_mask_region_area=self.sp_minarea.value())
+        args = ["-m", "section_identification.detect_worker",
+                "--image", self.image_path, "--checkpoint", self.checkpoint,
+                "--target-long-side", str(self.sp_target.value()),
+                "--points-per-side", str(self._det_params["points_per_side"]),
+                "--points-per-batch", str(self._det_params["points_per_batch"]),
+                "--pred-iou-thresh", str(self._det_params["pred_iou_thresh"]),
+                "--crop-n-layers", str(self._det_params["crop_n_layers"]),
+                "--min-area", str(self._det_params["min_mask_region_area"])]
+
+        self.proc = QProcess(self)
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        self.proc.setProcessEnvironment(env)
+        self.proc.setProcessChannelMode(QProcess.MergedChannels)
+        self.proc.readyReadStandardOutput.connect(self._on_proc_output)
+        self.proc.finished.connect(self._on_proc_finished)
+        self.proc.errorOccurred.connect(
+            lambda e: self.log_msg(f"❌ detector process error: {e}"))
+        self.btn_auto.setEnabled(False)
+        self.btn_stop.setVisible(True)
         self.progress.setRange(0, 0); self.progress.setVisible(True)
-        QApplication.processEvents()
+        self._det_t0 = time.time(); self._elapsed_timer.start(1000)
+        self.log_msg("▶ Detecting in a background process — the GUI stays "
+                     "responsive; press Stop to cancel.")
+        self.proc.start(sys.executable, args)
+
+    def _tick_elapsed(self):
+        if self.proc and self.proc.state() != QProcess.NotRunning:
+            self.lbl_elapsed.setText(f"⏱ detector running… {int(time.time() - self._det_t0)} s")
+
+    def _on_proc_output(self):
         try:
-            self.log_msg("▶ Running SAM 2.1 automatic detection…")
+            text = bytes(self.proc.readAllStandardOutput()).decode(errors="replace")
+        except Exception:
+            return
+        for line in text.splitlines():
+            if line.strip():
+                self.log_msg(line.rstrip())
+
+    def _on_proc_finished(self, code, status):
+        self._elapsed_timer.stop(); self.lbl_elapsed.setText("")
+        self.btn_auto.setEnabled(True); self.btn_stop.setVisible(False)
+        self.progress.setVisible(False)
+        self.proc = None
+        if code != 0:
+            self.log_msg(f"⏹ detection stopped/failed (exit {code}). Nothing changed.")
+            return
+        try:
+            # The worker wrote the (RLE) mask cache; this hits it instantly, then
+            # applies the area filter.
             masks = automatic_identification(
                 self.image_path, checkpoint=self.checkpoint, image=self.overview,
                 apply_filtering=self.chk_filter.isChecked(),
-                points_per_side=self.sp_pps.value(),
-                points_per_batch=self.sp_ppb.value(),
-                pred_iou_thresh=self.sp_iou.value(),
-                crop_n_layers=self.sp_crop.value(),
-                min_mask_region_area=self.sp_minarea.value(),
-                target_long_side=self.sp_target.value())
+                target_long_side=self.sp_target.value(), **self._det_params)
             self.masks = masks
             polys_xy = [mask_to_polygon(m["segmentation"]) for m in masks]
             polys_xy = [p for p in polys_xy if p is not None and len(p) >= 3]
             self._ensure_edit_layers(polys_xy)
             self.log_msg(f"✔️ {len(polys_xy)} sections → editable 'Sections' layer.")
             self.rebuild_filmstrip()
-            self.save_project()  # persist immediately so a crash never loses it
+            self.save_project()
         except Exception:
-            self.log_msg("❌ detection error:\n" + traceback.format_exc())
-        finally:
-            self.progress.setVisible(False)
+            self.log_msg("❌ loading detection results failed:\n" + traceback.format_exc())
+
+    def stop_detection(self):
+        if self.proc and self.proc.state() != QProcess.NotRunning:
+            self.log_msg("■ Stopping detection…")
+            self.proc.kill()
 
     # ----- polygons from the Shapes layer -----
     def current_polygons_xy(self):
