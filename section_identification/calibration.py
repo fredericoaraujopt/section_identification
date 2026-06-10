@@ -49,6 +49,12 @@ def calibrate(example_polygons, geom=None, target_sam_px=100,
     tile_px = int(round(1024.0 * section_px / float(target_sam_px)))
     tile_px = int(np.clip(tile_px, 256, 1024))
 
+    # points_per_side so the grid spacing within a tile is <= ~half a section
+    # (>= 2 sample points across each section). Clamp to a sane range.
+    pps = int(np.clip(np.ceil(2.0 * tile_px / max(section_px, 1.0)), 16, 64))
+    # overlap so a whole section fits inside at least one tile (>= section + margin).
+    overlap = float(np.clip(1.5 * section_px / max(tile_px, 1.0), 0.15, 0.5))
+
     cal = {
         "n_examples": int(areas.size),
         "median_area": median_area,
@@ -56,6 +62,8 @@ def calibrate(example_polygons, geom=None, target_sam_px=100,
         "min_area": float(min_area_frac * median_area),
         "max_area": float(max_area_mult * median_area),
         "tile_px": tile_px,
+        "points_per_side": pps,
+        "overlap": overlap,
         "target_sam_px": float(target_sam_px),
     }
     if geom is not None and getattr(geom, "zoom", None):
@@ -69,7 +77,8 @@ def summary(cal):
     """One-line human-readable calibration summary for the GUI log."""
     s = (f"calibrated from {cal['n_examples']} examples: section ~{cal['section_px']:.0f}px "
          f"(area {cal['median_area']:.0f}); keep area {cal['min_area']:.0f}-{cal['max_area']:.0f}; "
-         f"tile_px={cal['tile_px']}")
+         f"tile_px={cal['tile_px']}, points_per_side={cal.get('points_per_side', '?')}, "
+         f"overlap={cal.get('overlap', 0):.2f}")
     if "section_px_full" in cal:
         s += f"  [full-res section ~{cal['section_px_full']:.0f}px]"
     return s

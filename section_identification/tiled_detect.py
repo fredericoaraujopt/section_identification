@@ -112,9 +112,19 @@ def tiled_detect(image, checkpoint, *, model_cfg=None, device=None,
             # sub-part nested inside it.
             masks = sorted(masks, key=lambda mm: -float(mm["area"]))
             tile_mean = float(gray.mean())
+            edge = 2  # px tolerance for "touches the tile edge"
             for m in masks:
                 area = float(m["area"])
                 if area < min_area or area > max_area:
+                    continue
+                bx, by, bw, bh = m["bbox"]  # tile-local x,y,w,h
+                # Own each section by the tile that fully contains it: drop masks
+                # touching a tile edge that is NOT an image border (with enough
+                # overlap every section is fully inside some tile). This prevents
+                # sections being cut/duplicated at tile boundaries.
+                if ((bx <= edge and tx > 0) or (by <= edge and ty > 0) or
+                        (bx + bw >= tw - edge and tx + tw < W) or
+                        (by + bh >= th - edge and ty + th < H)):
                     continue
                 dec = decode_segmentation(m["segmentation"])
                 inside = gray[dec > 0]
