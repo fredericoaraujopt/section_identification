@@ -24,7 +24,8 @@ def _polygon_area(poly):
 
 
 def calibrate(example_polygons, geom=None, target_sam_px=100,
-              min_area_frac=0.5, max_area_mult=2.0):
+              min_area_frac=0.5, max_area_mult=2.0, overview_long_side=None,
+              target_working_px=64, max_overview_long_side=12000):
     """Derive detector settings from example section polygons (overview coords).
 
     Returns a dict:
@@ -70,6 +71,14 @@ def calibrate(example_polygons, geom=None, target_sam_px=100,
         z = geom.zoom
         cal["section_px_full"] = section_px / z
         cal["median_area_full"] = median_area / (z * z)
+        # Recommend the overview resolution so a section has ~target_working_px
+        # real pixels in the working image (SAM runs on the overview, not the
+        # full image — raising this reads a finer pyramid level = real detail).
+        if overview_long_side:
+            full_long = overview_long_side / z
+            rec = full_long * (float(target_working_px) / max(section_px / z, 1.0))
+            cal["recommended_overview_long_side"] = int(
+                np.clip(rec, overview_long_side, max_overview_long_side))
     return cal
 
 

@@ -581,7 +581,8 @@ class SectionIdentificationGUI(QWidget):
             return
         from section_identification.calibration import calibrate, summary
         try:
-            self.calibration = calibrate(polys, geom=self.geom)
+            self.calibration = calibrate(
+                polys, geom=self.geom, overview_long_side=max(self.overview.shape[:2]))
         except Exception:
             self.log_msg("❌ calibration failed:\n" + traceback.format_exc()); return
         self.sp_minarea.setValue(int(self.calibration["min_area"]))
@@ -589,7 +590,16 @@ class SectionIdentificationGUI(QWidget):
             self.sp_pps.setValue(int(self.calibration["points_per_side"]))
         self.lbl_calib.setText(summary(self.calibration))
         self.log_msg("✔️ " + summary(self.calibration))
-        self.log_msg("(tick 'Tiled detector' to use these tiles, or run whole-image.)")
+        # SAM runs on the downsampled overview; recommend a finer one if needed.
+        rec = self.calibration.get("recommended_overview_long_side")
+        cur = max(self.overview.shape[:2])
+        if rec and rec > cur * 1.3:
+            self.sp_target.setValue(int(rec))
+            self.log_msg(f"⚠️ Sections are only ~{self.calibration['section_px']:.0f}px in "
+                         f"this {cur}px overview. Set overview long side to {rec} and "
+                         "RELOAD the image for real detail, then re-calibrate.")
+        else:
+            self.log_msg("(tick 'Tiled detector' to use these tiles, or run whole-image.)")
 
     def preview_tiling(self):
         if self.overview is None:
