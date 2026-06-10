@@ -67,18 +67,23 @@ def calibrate(example_polygons, geom=None, target_sam_px=100,
         "overlap": overlap,
         "target_sam_px": float(target_sam_px),
     }
-    if geom is not None and getattr(geom, "zoom", None):
-        z = geom.zoom
-        cal["section_px_full"] = section_px / z
-        cal["median_area_full"] = median_area / (z * z)
-        # Recommend the overview resolution so a section has ~target_working_px
-        # real pixels in the working image (SAM runs on the overview, not the
-        # full image — raising this reads a finer pyramid level = real detail).
-        if overview_long_side:
-            full_long = overview_long_side / z
-            rec = full_long * (float(target_working_px) / max(section_px / z, 1.0))
-            cal["recommended_overview_long_side"] = int(
-                np.clip(rec, overview_long_side, max_overview_long_side))
+    z = geom.zoom if (geom is not None and getattr(geom, "zoom", None)) else 1.0
+    section_px_full = section_px / z
+    cal["section_px_full"] = section_px_full
+    cal["median_area_full"] = median_area / (z * z)
+    if overview_long_side:
+        full_long = overview_long_side / z
+        # Whole-image SAM resizes the whole input to 1024, so a section is this
+        # many px to the network — INDEPENDENT of the overview resolution.
+        whole_sam_px = section_px_full * 1024.0 / max(full_long, 1.0)
+        cal["whole_image_section_px"] = float(whole_sam_px)
+        # If that's too small to segment, tiling is required (tiles magnify).
+        cal["tiling_recommended"] = bool(whole_sam_px < 28.0)
+        # Recommend a finer overview so a section has ~target_working_px REAL px
+        # (real detail for inspection/tiling; whole-image still resizes to 1024).
+        rec = full_long * (float(target_working_px) / max(section_px_full, 1.0))
+        cal["recommended_overview_long_side"] = int(
+            np.clip(rec, overview_long_side, max_overview_long_side))
     return cal
 
 

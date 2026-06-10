@@ -79,26 +79,27 @@ class SectionIdentificationGUI(QWidget):
         self.lbl_path = QLabel("No image selected"); self.lbl_path.setWordWrap(True)
         layout.addWidget(self.btn_select); layout.addWidget(self.lbl_path)
 
-        layout.addWidget(QLabel("<b>SAM 2.1 parameters</b>"))
+        layout.addWidget(QLabel("<b>Parameters</b> (Calibrate sets these for you)"))
         form = QFormLayout()
         self.sp_pps = QSpinBox(); self.sp_pps.setRange(4, 128); self.sp_pps.setValue(32)
-        self.sp_ppb = QSpinBox(); self.sp_ppb.setRange(8, 256); self.sp_ppb.setValue(64)
         self.sp_iou = QDoubleSpinBox(); self.sp_iou.setRange(0.0, 1.0)
         self.sp_iou.setSingleStep(0.05); self.sp_iou.setValue(0.80)
         self.sp_minarea = QSpinBox(); self.sp_minarea.setRange(0, 1000000); self.sp_minarea.setValue(50)
         self.sp_target = QSpinBox(); self.sp_target.setRange(1024, 16384)
-        self.sp_target.setSingleStep(512); self.sp_target.setValue(3072)
+        self.sp_target.setSingleStep(512); self.sp_target.setValue(4096)
         form.addRow("points_per_side", self.sp_pps)
-        form.addRow("points_per_batch (mem)", self.sp_ppb)
         form.addRow("pred_iou_thresh", self.sp_iou)
-        form.addRow("min_mask_region_area", self.sp_minarea)
+        form.addRow("min section area (px)", self.sp_minarea)
         form.addRow("overview long side (px)", self.sp_target)
         layout.addLayout(form)
+        # points_per_batch is the GPU-memory knob only (no effect on results);
+        # auto-capped per image size, so it's not exposed.
+        self._ppb = 64
 
         self.chk_filter = QCheckBox("Filter for sections (area DBSCAN)")
         self.chk_filter.setChecked(True)
         layout.addWidget(self.chk_filter)
-        self.chk_tiled = QCheckBox("Tiled detector (advanced: tiny-section wafers)")
+        self.chk_tiled = QCheckBox("Tiled detection (Calibrate enables this for tiny sections)")
         layout.addWidget(self.chk_tiled)
 
         cal_row = QHBoxLayout()
@@ -199,7 +200,14 @@ class SectionIdentificationGUI(QWidget):
             self.log_msg("❌ load failed:\n" + traceback.format_exc()); return
 
         self._reset_layers()
-        self.image_layer = self.viewer.add_image(self.overview, name="Overview")
+        # Multiscale display for large overviews so zoom/pan stays smooth at the
+        # higher resolutions used for inspection (level 0 = the working overview,
+        # so all shape coordinates stay in overview pixels).
+        if max(self.overview.shape[:2]) > 4096:
+            pyr = [self.overview, self.overview[::2, ::2], self.overview[::4, ::4]]
+            self.image_layer = self.viewer.add_image(pyr, name="Overview", multiscale=True)
+        else:
+            self.image_layer = self.viewer.add_image(self.overview, name="Overview")
         polys_xy, fids_xy = self._restore_session()
         try:
             self._ensure_edit_layers(polys_xy)
@@ -398,7 +406,7 @@ class SectionIdentificationGUI(QWidget):
                   "--image", self.image_path, "--checkpoint", self.checkpoint,
                   "--target-long-side", str(self.sp_target.value()),
                   "--points-per-side", str(self.sp_pps.value()),
-                  "--points-per-batch", str(self.sp_ppb.value()),
+                  "--points-per-batch", str(self._ppb),
                   "--pred-iou-thresh", str(self.sp_iou.value())]
         self._stream_mode = self.chk_tiled.isChecked()
         if self._stream_mode:
@@ -415,7 +423,7 @@ class SectionIdentificationGUI(QWidget):
                          f"area {min_area:.0f}-{max_area:.0f}.")
         else:
             self._det_params = dict(
-                points_per_side=self.sp_pps.value(), points_per_batch=self.sp_ppb.value(),
+                points_per_side=self.sp_pps.value(), points_per_batch=self._ppb,
                 pred_iou_thresh=self.sp_iou.value(), crop_n_layers=0,
                 min_mask_region_area=self.sp_minarea.value())
             args = common + ["--mode", "whole", "--crop-n-layers", "0",
@@ -590,16 +598,24 @@ class SectionIdentificationGUI(QWidget):
             self.sp_pps.setValue(int(self.calibration["points_per_side"]))
         self.lbl_calib.setText(summary(self.calibration))
         self.log_msg("✔️ " + summary(self.calibration))
+        # Auto-decide whole-image vs tiled: whole-image resizes the input to 1024,
+        # so if a section would be tiny to SAM, tiling is required.
+        tiled = bool(self.calibration.get("tiling_recommended"))
+        self.chk_tiled.setChecked(tiled)
+        wsam = self.calibration.get("whole_image_section_px", 0)
+        if tiled:
+            self.log_msg(f"→ Tiling ENABLED: a section is only ~{wsam:.0f}px to "
+                         "whole-image SAM (too small); tiling magnifies it.")
+        else:
+            self.log_msg(f"→ Whole-image is fine (~{wsam:.0f}px to SAM); tiling off.")
         # SAM runs on the downsampled overview; recommend a finer one if needed.
         rec = self.calibration.get("recommended_overview_long_side")
         cur = max(self.overview.shape[:2])
         if rec and rec > cur * 1.3:
             self.sp_target.setValue(int(rec))
             self.log_msg(f"⚠️ Sections are only ~{self.calibration['section_px']:.0f}px in "
-                         f"this {cur}px overview. Set overview long side to {rec} and "
-                         "RELOAD the image for real detail, then re-calibrate.")
-        else:
-            self.log_msg("(tick 'Tiled detector' to use these tiles, or run whole-image.)")
+                         f"this {cur}px overview. Overview long side set to {rec}; "
+                         "RELOAD the image for real detail, then re-calibrate before running.")
 
     def preview_tiling(self):
         if self.overview is None:
