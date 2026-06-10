@@ -122,17 +122,24 @@ def run_sam_interactive(image_path, checkpoint, stored_masks, model_type="vit_h"
     # Step 1: Export and quantize the ONNX model for this image.
     image_path = Path(image_path)
 
-    # Try to load prior interactive state
+    # Try to load prior interactive state. Discard it if it was saved for a
+    # different-size image (its cached overlays won't match -> cv2 size error).
+    cache_loaded = False
+    new_masks = []
+    markers = []
     state = load_interactive_state(image_path)
     if state is not None:
-        stored_masks = state["stored_masks"]
-        new_masks = state["new_masks"]
-        markers = state["fiducials"]
-        # Since overlays were cached, recreate base_overlay from those overlays
-        base_overlay = recompose_overlay(load_image(image_path), stored_masks + new_masks, alpha=0.5)
-        cache_loaded = True
-    else:
-        cache_loaded = False
+        try:
+            cand = state["stored_masks"] + state["new_masks"]
+            base_overlay = recompose_overlay(load_image(image_path), cand, alpha=0.5)
+            stored_masks = state["stored_masks"]
+            new_masks = state["new_masks"]
+            markers = state["fiducials"]
+            cache_loaded = True
+        except Exception as e:
+            print(f"[warn] ignoring stale interactive cache ({e}); starting fresh.")
+            cache_loaded = False
+            new_masks, markers = [], []
 
     final_model_path = install_and_export_sam_onnx(
         image_path=image_path,

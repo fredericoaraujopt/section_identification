@@ -22,3 +22,4 @@ checkpoint/
 .claude/
 section_examples/
 *_stim_project.json
+STIM_SESSION_STATE.md
