@@ -118,11 +118,11 @@ class SectionIdentificationGUI(QWidget):
         self.lbl_elapsed = QLabel(""); layout.addWidget(self.lbl_elapsed)
 
         layout.addWidget(QLabel("<b>Manual Detector</b>"))
-        self.btn_manual = QPushButton("Launch Manual Detector (scroll = zoom)")
+        self.btn_manual = QPushButton("Launch Manual Detector")
         layout.addWidget(self.btn_manual)
         layout.addWidget(QLabel(
-            "<i>Separate window: scroll to zoom, hover to preview, click to add, "
-            "'r' remove, 'm' fiducials, Esc finish.</i>"))
+            "<i>Separate SAM editor window: hover to preview, click to add, "
+            "'r' remove, 'm' fiducials, Esc finish. (zoom support: in progress)</i>"))
 
         self.btn_export = QPushButton("Export (CSV + GeoJSON + annotated CZI)")
         layout.addWidget(self.btn_export)

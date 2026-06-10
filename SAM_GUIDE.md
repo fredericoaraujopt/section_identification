@@ -45,6 +45,55 @@ by about 2.25× (because it scales with the *square* of points-per-side).
 
 ---
 
+## 0b. Resolution — the thing that actually decides whether tiny sections are found
+
+**SAM runs on the downsampled *overview*, not the full 76k-px image.** napari loads
+and SAM processes an overview whose long side = the **`overview long side`** slider
+(default 3072). The full file is only read at that reduced resolution.
+
+Two facts verified against the SAM 2 source that you must internalize:
+
+1. **SAM resizes every input (and every crop/tile) to a fixed 1024 px internally.**
+   An object's effective size to the network ≈ `object_px / max(W,H) × 1024`. In a
+   3072-px overview, a 350-px-full-res section is ~14 px and lands at ~4.7 px to
+   SAM — too small to segment reliably.
+2. **Crops / tiles add NO real detail.** Internally a crop is just a NumPy slice of
+   the same pixels, resized up to 1024. It *magnifies* a small object (more of the
+   1024 budget) but cannot recover detail that isn't in the overview. So tiling
+   helps SAM "see" small objects bigger, but the information ceiling is the
+   overview resolution.
+
+**Therefore the real resolution knob is `overview long side`.** Raising it reads a
+*finer* level of the CZI pyramid = genuinely more pixels. It is bounded by memory
+(the overview is held in RAM: ~3072 ≈ 27 MB, ~8000 ≈ 190 MB, ~12000 ≈ 430 MB —
+all fine; the full 76k would be ~12 GB and is never loaded). For tiny-section
+wafers, **raise it to ~6000–12000 so a section is ~50–80 real px**, then optionally
+tile.
+
+### Calibrate from examples — let the drawn section set everything
+
+Draw 2–5 example sections in the **"Calibration examples"** layer → **Calibrate**.
+From the median example it sets, all at once:
+- `min_mask_region_area` ≈ **½ the median section area** (your spec),
+- the DBSCAN keep-band (≈ 0.5–2× median → rejects dust *and* clumps),
+- `points_per_side` (so ≥ ~2 grid points span a section),
+- `tile_px` + `overlap` (so a section is ~100 px to SAM and fits fully inside one tile),
+- and a **recommended `overview long side`** (so a section is ~64 *real* px) — if the
+  current overview is too coarse it bumps the slider and asks you to **reload**.
+
+This is the robust path for a new/odd wafer: calibrate → (reload if prompted) →
+run. Easy wafers (big, clean sections) usually need no calibration and no tiling —
+just **Run Automatic Detection** (whole-image).
+
+### Official "more/smaller objects" recipe (from the SAM 2 docs)
+`points_per_side=128, crop_n_layers=1, crop_n_points_downscale_factor=2,
+min_mask_region_area≈100, use_m2m=True, pred_iou_thresh≈0.88`. On Apple **MPS**,
+results can be "numerically different / degraded" (official note), so **loosen**
+quality thresholds (`pred_iou_thresh≈0.7–0.8`, `stability≈0.9`) if real sections
+get dropped.
+
+---
+
 ## 1. What "SAM automatic detection" actually does
 
 SAM (Segment Anything Model) is a neural network that, given an image and a
