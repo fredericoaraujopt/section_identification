@@ -137,19 +137,26 @@ def install_and_export_sam_onnx(
         warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
         warnings.filterwarnings("ignore", category=UserWarning)
 
-        with open(output_onnx, "wb") as f:
-            torch.onnx.export(
-                onnx_model,
-                tuple(dummy_inputs.values()),
-                f,
-                export_params=True,
-                verbose=False,
-                opset_version=opset,
-                do_constant_folding=True,
-                input_names=list(dummy_inputs.keys()),
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-            )
+        export_kwargs = dict(
+            export_params=True,
+            verbose=False,
+            opset_version=opset,
+            do_constant_folding=True,
+            input_names=list(dummy_inputs.keys()),
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+        )
+        # PyTorch >= 2.x defaults to the new "dynamo" ONNX exporter, which fails
+        # on SAM's dynamic mask post-processing. Force the legacy TorchScript
+        # exporter (this code was written for it) when the option exists.
+        try:
+            torch.onnx.export(onnx_model, tuple(dummy_inputs.values()),
+                              output_onnx.as_posix(), dynamo=False, **export_kwargs)
+        except TypeError:
+            # Older torch without the `dynamo` kwarg.
+            with open(output_onnx, "wb") as f:
+                torch.onnx.export(onnx_model, tuple(dummy_inputs.values()), f,
+                                  **export_kwargs)
     print(f"[Info] ONNX export completed: {output_onnx}")
 
     final_onnx_path = output_onnx
