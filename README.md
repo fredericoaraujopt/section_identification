@@ -2,7 +2,7 @@
 
 STiM is a napari-based interface for targeting sections on silicon wafers imaged under a microscope, developed to support large-scale connectomics workflows. The tool enables precise targeting of tissue sections for electron microscopy by retrieving their coordinates.
 
-The interface integrates the Segment Anything Model (SAM 2.1) for automated section segmentation and includes manual-correction editors for refining results. It reads ordinary images (PNG/JPG/TIFF) and Zeiss whole-slide **CZI** files (via a downscaled pyramid overview, so a multi-GB montage is never decoded at full resolution), and exports section polygons + fiducials as CSV, GeoJSON, a high-resolution overlay PNG, and a ZEN-readable annotated CZI for the Shuttle & Find correlative workflow.
+The interface integrates the Segment Anything Model (SAM 2.1) for automated section segmentation and an in-viewer manual-correction editor (also SAM 2.1) for refining results. It reads ordinary images (PNG/JPG/TIFF) and Zeiss whole-slide **CZI** files (via a downscaled pyramid overview, so a multi-GB montage is never decoded at full resolution), and exports section polygons + fiducials as CSV, GeoJSON, a high-resolution overlay PNG, and a ZEN-readable annotated CZI for the Shuttle & Find correlative workflow.
 
 📺 **Video demo**: [STiM 🔬](https://www.loom.com/share/48c99d4387db4497963017c24cff7c3b?sid=436aefad-03f1-412b-8d9b-fa19b2b49c7f)
 
@@ -68,7 +68,7 @@ SAM2_BUILD_CUDA=0 pip install -e ./sam2
 pip install -e .
 ```
 
-This pulls napari, pylibCZIrw, opencv, scikit-learn, pycocotools, segment-anything (SAM 1 fallback for the manual editor), etc., and installs a `stim` command.
+This pulls napari, pylibCZIrw, opencv, scikit-learn, pycocotools, segment-anything (optional SAM 1 fallback for legacy `.pth` detection checkpoints), etc., and installs a `stim` command.
 
 ### 6. Download the SAM checkpoints
 
@@ -77,13 +77,9 @@ Checkpoints are large and **not** tracked in git. Put them in a `checkpoint/` fo
 ```bash
 mkdir -p checkpoint
 
-# SAM 2.1 — automatic detection (default model)
+# SAM 2.1 — used for automatic detection AND the in-viewer manual editor (default model)
 curl -L -o checkpoint/sam2.1_hiera_base_plus.pt \
   https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
-
-# SAM 1 (ViT-B) — used by the manual editor
-curl -L -o checkpoint/sam_vit_b_01ec64.pth \
-  https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth
 ```
 
 For lighter/faster models on weak machines, also grab the smaller SAM 2.1 variants
@@ -123,6 +119,6 @@ Prefer code/notebooks? See `demo.ipynb` for the `automatic_identification()` →
 ## Notes & troubleshooting
 
 - **Apple Silicon / MPS:** STiM sets `PYTORCH_ENABLE_MPS_FALLBACK=1` for the detection worker so unsupported ops fall back to CPU. Metal uses *unified* memory shared with the OS and the napari display — if the machine is under memory pressure, close other apps or tick **low-memory (1 mask/pt)** in *Advanced*, which makes SAM emit one mask per point (~3× less peak memory) at a small recall cost. `points_per_batch` is also auto-capped to a memory-safe value per host.
-- **CZI fiducials:** ZEN's "Shuttle & Find" correlative calibration markers live in the CZI metadata (stage micrometers), not as pixel annotations; read them with `section_identification.czi_io.read_shuttle_and_find_markers(path)`.
+- **CZI fiducials (Shuttle & Find):** ZEN's correlative calibration markers live in the CZI metadata (stage micrometers), not as pixel annotations. STiM handles them automatically: **on loading a CZI** it scans for them and places any it finds on the Fiducials layer (logging the coordinates, or that none were found); **on exporting an annotated CZI** with fiducials present, it writes the Fiducials layer back into the CZI copy's Shuttle & Find markers (the source is never modified). The stage↔pixel mapping uses the scene `CenterPosition` + `Scaling` + `StageOrientation`; if imported markers look mirrored on the wafer, the orientation sign needs flipping. Read them programmatically with `section_identification.czi_io.read_shuttle_and_find_markers(path)`.
 - **`cannot import name '_C' from 'sam2'`** — expected when SAM 2 is installed without the CUDA extension; results are unaffected.
 - **Large local artifacts** (`*_files/`, `*.pkl`, `checkpoint/`, `images_local/`, exported CZIs/PNGs/GeoJSON) are gitignored by design.

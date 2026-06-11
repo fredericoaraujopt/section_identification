@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import struct
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 import numpy as np
@@ -67,15 +68,59 @@ def parse_czi_metadata_raw(path: str) -> dict:
         except (TypeError, ValueError, AttributeError):
             return None
 
+    # Stage<->pixel anchor for the Shuttle & Find correlative frame, parsed with
+    # SCOPED ElementTree (a document-wide regex would happily match an unrelated
+    # <Shape>/<TileRegion> <CenterPosition>, or miss a Y-before-X attribute order):
+    #  * the scene's <CenterPosition>x,y</CenterPosition> is the stage position
+    #    (µm) at the image centre,
+    #  * <StageOrientation X= Y=> (in the S&F calibration) is the sign relating
+    #    stage axes to pixel axes (commonly -1,-1).
+    def _scene_anchor():
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError:
+            return None, None
+        # explicit is-None: a <CenterPosition> has text but no children, so it is
+        # falsy — `find() or find()` would fall through to the TileRegion one.
+        cp = root.find(".//Scenes/Scene/CenterPosition")
+        if cp is None:
+            cp = root.find(".//TileRegions/TileRegion/CenterPosition")
+        center = None
+        if cp is not None and cp.text and "," in cp.text:
+            try:
+                a, b = cp.text.split(",")[:2]
+                center = (float(a), float(b))
+            except ValueError:
+                center = None
+        so = root.find(".//StageOrientation")
+        orient = None
+        if so is not None:
+            try:
+                orient = (int(float(so.get("X", "1"))), int(float(so.get("Y", "1"))))
+            except (TypeError, ValueError):
+                orient = None
+        return center, orient
+
+    size_s = _int("SizeS")
+    scene_center, stage_orient = _scene_anchor()
+    # The stage anchor maps the scene centre to the TOTAL bounding-rectangle
+    # centre downstream; that identity only holds for a single scene. Don't
+    # expose an anchor for multi-scene montages (callers then degrade to "no
+    # stage anchor" rather than silently applying a constant offset).
+    if size_s not in (None, 1):
+        scene_center = None
+
     return {
         "size_x": _int("SizeX"),
         "size_y": _int("SizeY"),
         "size_c": _int("SizeC"),
-        "size_s": _int("SizeS"),
+        "size_s": size_s,
         "size_m": _int("SizeM"),
         "scale_x": _scaling("X"),
         "scale_y": _scaling("Y"),
         "pixel_type": _first("PixelType"),
+        "scene_center_um": scene_center,
+        "stage_orientation": stage_orient,
         "xml": xml,
     }
 
@@ -101,7 +146,9 @@ class CziGeometry:
     scale_y: float | None = None
     stage_center_um: tuple[float, float] | None = None
     center_px_full: tuple[float, float] | None = None
-    y_direction: int = 1  # CZI Distance Id="Y" Direction (often -1)
+    x_direction: int = 1   # sign relating a stage axis to a pixel axis (±1)
+    y_direction: int = 1
+    swap_xy: bool = False  # image axes transposed vs stage (camera rotated 90°)
 
     def ds_to_full(self, x_ds, y_ds):
         """Overview-pixel -> full-resolution-pixel (ZEN annotation frame)."""
@@ -116,27 +163,70 @@ class CziGeometry:
         return x, y
 
     def full_to_stage_um(self, x_full, y_full):
-        """Full-res-pixel -> stage microns. Best-effort; needs-verification.
+        """Full-res-pixel -> stage microns (ZEN Shuttle & Find frame).
 
-        Requires ``scale_*`` and a stage anchor; otherwise returns ``None``.
+        Anchors the scene centre (``stage_center_um``) to the image centre
+        (``center_px_full``), then applies the scale, axis signs, and (if
+        ``swap_xy``) a 90° transpose between image and stage axes. Requires the
+        stage anchor + scale; returns ``None`` otherwise so callers degrade
+        gracefully. Inverse of :meth:`stage_um_to_full`.
         """
-        if self.scale_x is None or self.scale_y is None:
+        if (self.scale_x is None or self.scale_y is None
+                or self.stage_center_um is None or self.center_px_full is None):
             return None
-        sx_um = self.scale_x * 1e6
-        sy_um = self.scale_y * 1e6
-        if self.stage_center_um and self.center_px_full:
-            cx_um, cy_um = self.stage_center_um
-            cx_px, cy_px = self.center_px_full
+        sx_um, sy_um = self.scale_x * 1e6, self.scale_y * 1e6
+        cx_um, cy_um = self.stage_center_um
+        cx_px, cy_px = self.center_px_full
+        fx = np.asarray(x_full, dtype=float) - cx_px
+        fy = np.asarray(y_full, dtype=float) - cy_px
+        if self.swap_xy:                       # pixel-x ↔ stage-y, pixel-y ↔ stage-x
+            x_um = cx_um + fy * sy_um * self.y_direction
+            y_um = cy_um + fx * sx_um * self.x_direction
         else:
-            cx_um = cy_um = cx_px = cy_px = 0.0
-        x_um = cx_um + (np.asarray(x_full, dtype=float) - cx_px) * sx_um
-        y_um = cy_um + (np.asarray(y_full, dtype=float) - cy_px) * sy_um * self.y_direction
+            x_um = cx_um + fx * sx_um * self.x_direction
+            y_um = cy_um + fy * sy_um * self.y_direction
         return x_um, y_um
+
+    def stage_um_to_full(self, x_um, y_um):
+        """Stage microns -> full-res pixel (inverse of :meth:`full_to_stage_um`).
+
+        Returns ``None`` when the stage anchor / scale are unknown.
+        """
+        if (self.scale_x is None or self.scale_y is None
+                or self.stage_center_um is None or self.center_px_full is None):
+            return None
+        sx_um, sy_um = self.scale_x * 1e6, self.scale_y * 1e6
+        cx_um, cy_um = self.stage_center_um
+        cx_px, cy_px = self.center_px_full
+        dx = np.asarray(x_um, dtype=float) - cx_um
+        dy = np.asarray(y_um, dtype=float) - cy_um
+        if self.swap_xy:                       # stage-y -> pixel-x, stage-x -> pixel-y
+            x_full = cx_px + (dy / sx_um) * self.x_direction
+            y_full = cy_px + (dx / sy_um) * self.y_direction
+        else:
+            x_full = cx_px + (dx / sx_um) * self.x_direction
+            y_full = cy_px + (dy / sy_um) * self.y_direction
+        return x_full, y_full
 
 
 # --------------------------------------------------------------------------- #
 # Reading + 16-bit -> 8-bit RGB
 # --------------------------------------------------------------------------- #
+def _stage_pixel_transform(stage_orientation) -> tuple[bool, int, int]:
+    """How the CZI's stage axes map to image pixel axes — ``(swap_xy, x_dir, y_dir)``.
+
+    Determined empirically against a real wafer (M411 'Axio ImagerVario', whose 3
+    Shuttle & Find marks sit at the top-right / bottom-right / bottom-left wafer
+    corners): the camera image is **transposed** relative to the stage (rotated
+    90°) — image-x tracks stage-y and image-y tracks stage-x — with positive
+    signs. ZEN's ``<StageOrientation>`` (here -1,-1) does NOT predict this on its
+    own, so the transform is fixed here rather than derived. This single helper is
+    the one place to revisit if a different instrument's imported fiducials land
+    on the wrong corners.
+    """
+    return True, 1, 1
+
+
 def _pick_zoom(width: int, height: int, target_long_side: int) -> float:
     long_side = max(width, height)
     if long_side <= target_long_side:
@@ -166,13 +256,16 @@ def read_czi_overview(path: str, target_long_side: int = 4096, channel: int = 0,
         arr = cz.read(**kwargs)
 
     arr = np.squeeze(arr)
+    swap, xd, yd = _stage_pixel_transform(raw_meta.get("stage_orientation"))
     geom = CziGeometry(
         zoom=zoom,
         origin_x=float(x0),
         origin_y=float(y0),
         scale_x=raw_meta.get("scale_x"),
         scale_y=raw_meta.get("scale_y"),
+        stage_center_um=raw_meta.get("scene_center_um"),
         center_px_full=(x0 + w / 2.0, y0 + h / 2.0),
+        x_direction=xd, y_direction=yd, swap_xy=swap,
     )
     meta = {**raw_meta, "zoom": zoom, "read_width": w, "read_height": h,
             "origin": (x0, y0)}
@@ -300,9 +393,12 @@ def build_czi_dask_pyramid(path: str, channel: int = 0, max_levels: int = 7,
                                      channel=channel)
     lo, hi = percentile_lo_hi(ov_arr)
 
+    swap, xd, yd = _stage_pixel_transform(raw_meta.get("stage_orientation"))
     geom = CziGeometry(zoom=1.0, origin_x=float(bx), origin_y=float(by),
                        scale_x=raw_meta.get("scale_x"), scale_y=raw_meta.get("scale_y"),
-                       center_px_full=(bx + bw / 2.0, by + bh / 2.0))
+                       stage_center_um=raw_meta.get("scene_center_um"),
+                       center_px_full=(bx + bw / 2.0, by + bh / 2.0),
+                       x_direction=xd, y_direction=yd, swap_xy=swap)
 
     def _read_block(fx, fy, fw, fh, z, out_h, out_w):
         raw = read_czi_region(path, fx, fy, fw, fh, channel=channel,

@@ -78,6 +78,8 @@ class NapariSamEditor:
         self._cam_connected = False
         self._sel_connected = False
         self._reasserting = False    # guard against re-entrant active-layer resets
+        self._dragging = False       # mouse held (panning) → defer embedding
+        self._drag_cb = None
 
     # ---------------- helpers ----------------
     def _log(self, msg):
@@ -223,12 +225,31 @@ class NapariSamEditor:
         self._do_hover()
 
     def _schedule_autoembed(self, *a):
-        if self._active and self._cam_timer is not None:
+        # While the mouse is held (panning) we never embed — restarting the timer
+        # would just thrash. The drag-release handler restarts it once settled.
+        if self._active and self._cam_timer is not None and not self._dragging:
             self._cam_timer.start(CAMERA_DEBOUNCE_MS)
 
     def _autoembed(self):
-        if self._active and not self._embedding:
+        # Skip if a drag is still in progress (the user is still moving); the
+        # release handler will reschedule once they've actually stopped.
+        if self._active and not self._embedding and not self._dragging:
             self._embed_view(force=False)
+
+    def _on_drag(self, viewer, event):
+        """Track left-drag (pan) so the encoder doesn't fire mid-move. Generator:
+        runs at press, yields through the drag, resumes on release."""
+        if not self._active:
+            return
+        self._dragging = True
+        if self._cam_timer is not None:
+            self._cam_timer.stop()                 # cancel any pending embed
+        yield
+        while event.type == "mouse_move":
+            yield
+        self._dragging = False                     # released → embed once settled
+        if self._active and self._cam_timer is not None:
+            self._cam_timer.start(CAMERA_DEBOUNCE_MS)
 
     # ---------------- prediction ----------------
     def _predict_overview_polygon(self, world_x, world_y):
@@ -419,6 +440,8 @@ class NapariSamEditor:
         self._cam_timer.timeout.connect(self._autoembed)
 
         self.viewer.mouse_move_callbacks.append(self._on_move)
+        self._drag_cb = self._on_drag
+        self.viewer.mouse_drag_callbacks.append(self._drag_cb)   # defer embed while panning
         # No click handler: left-drag pans the image (napari default). The user
         # adds the previewed mask with Space instead, so panning is safe.
         try:
@@ -514,6 +537,13 @@ class NapariSamEditor:
             self.viewer.mouse_move_callbacks.remove(self._on_move)
         except Exception:
             pass
+        if self._drag_cb is not None:
+            try:
+                self.viewer.mouse_drag_callbacks.remove(self._drag_cb)
+            except Exception:
+                pass
+            self._drag_cb = None
+        self._dragging = False
         for tgt, k in self._keybinds:
             try:
                 tgt.bind_key(k, None, overwrite=True)

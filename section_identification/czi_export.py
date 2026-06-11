@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import xml.etree.ElementTree as ET
 
@@ -127,6 +128,115 @@ def inject_layers(xml_str: str, polygons, fiducials,
 
 
 # --------------------------------------------------------------------------- #
+# Shuttle & Find correlative markers (stage µm, in the calibration node)
+# --------------------------------------------------------------------------- #
+def _find_child(parent, *paths):
+    """First node matching any path, using explicit ``is not None`` (an
+    ElementTree element with no children is falsy, so a ``find() or find()``
+    chain would skip a present-but-empty element)."""
+    for p in paths:
+        el = parent.find(p)
+        if el is not None:
+            return el
+    return None
+
+
+def _max_marker_index(markers) -> int:
+    """Largest trailing integer across existing ``Marker`` ``Id``s (0 if none)."""
+    mx = 0
+    for m in markers:
+        mm = re.search(r"(\d+)\s*$", m.get("Id") or "")
+        if mm:
+            mx = max(mx, int(mm.group(1)))
+    return mx
+
+
+def inject_shuttle_and_find(xml_str: str, markers_stage_um,
+                            orientation: tuple | None = None,
+                            holder: str | None = None,
+                            microscope: str | None = None,
+                            session_id: str | None = None,
+                            replace: bool = True) -> str:
+    """Return CZI metadata XML with the S&F correlative ``<Markers>`` set.
+
+    ``markers_stage_um`` is a list of ``(stage_x_um, stage_y_um)`` or
+    ``(x, y, focus_um)`` tuples — the frame ZEN's Shuttle & Find calibration
+    uses (see :func:`czi_io.read_shuttle_and_find_markers`). If a
+    ``ShuttleAndFindData/Calibration`` node already exists its ``<Markers>`` are
+    replaced (``replace=True``) while ``CorrelativeSession``/``Holder``/
+    ``MicroscopeType``/``StageOrientation`` are preserved (any passed explicitly
+    are overwritten); otherwise the node is created under ``<Image>``. New markers
+    without a focus inherit the mean focus of the markers being replaced (keeping
+    the calibration Z-plane) when one is available. With ``replace=False`` new
+    ``Id``s continue past the largest existing index (no duplicate ``Id``s).
+    """
+    root = ET.fromstring(xml_str)
+    cal = root.find(".//ShuttleAndFindData/Calibration")
+    if cal is None:
+        parent = _find_child(root, ".//Metadata/Information/Image",
+                             ".//Information/Image", ".//Image", "Metadata")
+        if parent is None:           # NB: `_find_child(...) or root` would re-trip
+            parent = root            # the falsy-empty-element trap _find_child avoids
+        saf = ET.SubElement(parent, "ShuttleAndFindData")
+        cal = ET.SubElement(saf, "Calibration")
+        ET.SubElement(cal, "CorrelativeSession",
+                      {"CorrelativeSessionId": session_id or "STiM"})
+        ET.SubElement(cal, "Holder").text = holder or "STiM"
+        ET.SubElement(cal, "Markers")
+        ET.SubElement(cal, "MicroscopeType").text = microscope or "LM"
+        ox, oy = orientation or (1, 1)
+        ET.SubElement(cal, "StageOrientation",
+                      {"X": str(int(ox)), "Y": str(int(oy))})
+
+    # Update preserved fields only when explicitly overridden (explicit is-None
+    # checks — a childless element is falsy, so `find() or SubElement()` dupes).
+    if orientation is not None:
+        so = cal.find("StageOrientation")
+        if so is None:
+            so = ET.SubElement(cal, "StageOrientation")
+        so.set("X", str(int(orientation[0]))); so.set("Y", str(int(orientation[1])))
+    if holder is not None:
+        h = cal.find("Holder")
+        if h is None:
+            h = ET.SubElement(cal, "Holder")
+        h.text = holder
+    if microscope is not None:
+        mt = cal.find("MicroscopeType")
+        if mt is None:
+            mt = ET.SubElement(cal, "MicroscopeType")
+        mt.text = microscope
+
+    # Find the markers container with the DESCENDANT axis (ZEN may nest it under
+    # CorrelativeSession; our parser reads it with `.//Markers/Marker`).
+    markers_el = cal.find(".//Markers")
+    if markers_el is None:
+        markers_el = ET.SubElement(cal, "Markers")
+
+    # Capture the existing markers' focus so replacements keep the Z-plane.
+    prev_focus = []
+    for m in markers_el.findall("Marker"):
+        try:
+            prev_focus.append(float(m.get("FocusPosition")))
+        except (TypeError, ValueError):
+            pass
+    default_focus = sum(prev_focus) / len(prev_focus) if prev_focus else None
+
+    if replace:
+        for m in list(markers_el.findall("Marker")):
+            markers_el.remove(m)
+    start = _max_marker_index(markers_el.findall("Marker"))
+    for i, mk in enumerate(markers_stage_um, start=start + 1):
+        sx, sy = float(mk[0]), float(mk[1])
+        attrib = {"Id": f"Marker:{i}",
+                  "StageXPosition": f"{sx:.6f}", "StageYPosition": f"{sy:.6f}"}
+        focus = mk[2] if (len(mk) >= 3 and mk[2] is not None) else default_focus
+        if focus is not None:
+            attrib["FocusPosition"] = f"{float(focus):.6f}"
+        ET.SubElement(markers_el, "Marker", attrib)
+    return ET.tostring(root, encoding="unicode")
+
+
+# --------------------------------------------------------------------------- #
 # GeoJSON sidecar (pixel + optional stage microns)
 # --------------------------------------------------------------------------- #
 def write_geojson(path: str, polygons, fiducials, geom=None) -> str:
@@ -185,15 +295,22 @@ def _read_metadata_xml(path: str) -> str:
 
 def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
                         copy: bool = True, fiducial_radius_px: float = 50.0,
-                        section_ids: list | None = None) -> dict:
+                        section_ids: list | None = None,
+                        sf_markers_stage_um=None, sf_orientation=None) -> dict:
     """Produce a new CZI carrying STiM section polygons + fiducial markers.
 
     Copies ``src_czi`` -> ``dst_czi`` (preserving full-res pixels), injects a
     ``<Layers>`` block into the metadata via ``pylibCZIrw.edit_czi``, then
     re-reads the result to confirm the polygons survived (round-trip).
 
+    When ``sf_markers_stage_um`` is given (a list of ``(x_um, y_um[, focus])``),
+    those are ALSO written into the ZEN Shuttle & Find calibration ``<Markers>``
+    node — i.e. the fiducials become correlative POIs ZEN can use. This edits
+    only the destination COPY, never ``src_czi``, so the source's calibration is
+    untouched. ``sf_orientation`` overrides the ``StageOrientation`` sign.
+
     Returns a report dict (``dst``, ``n_polygons``, ``n_fiducials``,
-    ``roundtrip_ok``).
+    ``n_sf_markers``, ``roundtrip_ok``).
     """
     if copy:
         if os.path.abspath(src_czi) != os.path.abspath(dst_czi):
@@ -206,6 +323,9 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
     new_xml = inject_layers(old_xml, polygons, fiducials,
                             fiducial_radius_px=fiducial_radius_px,
                             section_ids=section_ids)
+    if sf_markers_stage_um:
+        new_xml = inject_shuttle_and_find(new_xml, sf_markers_stage_um,
+                                          orientation=sf_orientation)
 
     # Commit metadata-only via the CziEditor (pylibCZIrw >= 6.0.0).
     _commit_metadata(dst_czi, new_xml)
@@ -214,6 +334,7 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
         "dst": dst_czi,
         "n_polygons": len(polygons),
         "n_fiducials": len(fiducials or []),
+        "n_sf_markers": len(sf_markers_stage_um or []),
         "roundtrip_ok": roundtrip_check(dst_czi, expect_polygons=len(polygons)),
     }
     return report
