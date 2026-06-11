@@ -98,6 +98,12 @@ def inject_layers(xml_str: str, polygons, fiducials,
             metadata = root
         layers = ET.SubElement(metadata, "Layers")
 
+    # Idempotent re-export: drop any STiM layers a previous run wrote so we
+    # don't accumulate stale duplicates (e.g. an old, smaller section count).
+    for layer in list(layers.findall("Layer")):
+        if layer.get("Name") in (SECTIONS_LAYER, FIDUCIALS_LAYER):
+            layers.remove(layer)
+
     if polygons:
         poly_elems = []
         for i, poly in enumerate(polygons, start=1):

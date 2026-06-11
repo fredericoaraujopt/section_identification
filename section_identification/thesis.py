@@ -168,3 +168,81 @@ def create_composite_image(folder_before: str, folder_after: str, output_filenam
     # Save the composite image
     composite.save(output_filename)
     print(f"Composite image saved as {output_filename}")
+
+import pickle
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.cluster import DBSCAN
+from section_identification.filtering import filtering
+
+def plot_mask_area_histogram(
+    mask_pkl_path: str,
+    eps_values: np.ndarray = None,
+    min_samples_values: range = None,
+    bins: int = 30
+) -> None:
+    """
+    Load masks from a pickle file, find the best DBSCAN params via your filtering()
+    function, re-cluster all mask areas with those params, and plot a stacked histogram
+    of area distributions colored by cluster label.
+
+    Parameters
+    ----------
+    mask_pkl_path : str
+        Path to the .pkl file containing the list of masks (each with mask['area']).
+    eps_values : array-like, optional
+        Grid of eps values to try in filtering(); defaults to np.linspace(100,1200,11).
+    min_samples_values : iterable of int, optional
+        Grid of min_samples values to try in filtering(); defaults to range(1,5).
+    bins : int, optional
+        Number of histogram bins.
+    """
+    # 1. Load masks
+    with open(mask_pkl_path, 'rb') as f:
+        masks = pickle.load(f)
+
+    # 2. Set up parameter grids if none provided
+    if eps_values is None:
+        eps_values = np.linspace(100, 1200, 11)
+    if min_samples_values is None:
+        min_samples_values = range(1, 5)
+
+    # 3. Run your filtering() to pick the “best” (eps, min_samples)
+    _, (eps_chosen, min_samples_chosen) = filtering(masks, eps_values, min_samples_values)
+
+    # 4. Extract all mask areas
+    areas = np.array([m['area'] for m in masks])
+
+    # 5. Re-cluster with chosen params so every mask gets a label
+    db = DBSCAN(eps=eps_chosen, min_samples=min_samples_chosen)
+    labels = db.fit_predict(areas.reshape(-1, 1))
+
+    # 6. Identify the largest non-noise cluster
+    unique_labels = np.unique(labels)
+    cluster_sizes = {lab: np.sum(labels == lab) for lab in unique_labels if lab != -1}
+    if cluster_sizes:
+        largest_label = max(cluster_sizes, key=cluster_sizes.get)
+    else:
+        largest_label = -1
+
+    # Prepare indices and areas
+    all_ids = np.arange(len(areas))
+    all_areas = areas
+    mask_idx = labels == largest_label
+    mask_ids = all_ids[mask_idx]
+    cluster_areas = areas[mask_idx]
+
+    # 7. Plot all masks with main cluster highlighted on log scale
+    plt.figure(figsize=(10, 6))
+    plt.scatter(all_ids, all_areas, s=10, alpha=0.3, color='gray', label='Other masks')
+    plt.scatter(mask_ids, cluster_areas, s=20, alpha=0.7, color='C0', label=f'Cluster {largest_label}')
+    plt.yscale('log')
+    plt.xlabel('Mask ID')
+    plt.ylabel('Area (pixels, log scale)')
+    plt.title(
+        f'All masks by area with main cluster highlighted '
+        f'(eps={eps_chosen:.1f}, min_samples={min_samples_chosen})'
+    )
+    plt.legend(loc='upper left')
+    plt.tight_layout()
+    plt.show()

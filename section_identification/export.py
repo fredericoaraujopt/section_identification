@@ -13,9 +13,67 @@ downscaled detection overview back to full-resolution pixels via the
 """
 
 import csv
+import hashlib
 import os
+import tempfile
 
 import numpy as np
+
+
+# --------------------------------------------------------------------------- #
+# Output directory (read-only-drive safe)
+# --------------------------------------------------------------------------- #
+def resolve_export_dir(image_path, out_dir=None):
+    """Return a WRITABLE directory for the run's outputs.
+
+    Preference order:
+      1. an explicit ``out_dir`` (the GUI may pass one),
+      2. ``<image>_files`` next to the source (the historical location),
+      3. ``~/STiM_exports/<image-stem>`` — used when the source sits on a
+         read-only volume (macOS mounts NTFS drives read-only, which is exactly
+         what killed the M411 export), so a long run's results are never lost,
+      4. a temp dir, as a last resort.
+
+    Each candidate is probed by actually writing a tiny file (``os.access`` lies
+    on some network/NTFS mounts), and the first that succeeds is returned. The
+    chosen dir is created.
+    """
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    # The fallback dirs are keyed on the basename only, so two sources with the
+    # same name in different folders (or two drives) would resolve to the SAME
+    # fallback and silently overwrite each other — and on a read-only source the
+    # fallback is the only place results land. Disambiguate with a short, stable
+    # hash of the absolute source path (same source → same dir, so re-exports are
+    # still idempotent).
+    tag = hashlib.sha1(os.path.abspath(image_path).encode("utf-8", "replace")).hexdigest()[:8]
+    base_tagged = f"{base}_{tag}"
+    candidates = []
+    if out_dir:
+        candidates.append(out_dir)
+    candidates.append(f"{os.path.splitext(image_path)[0]}_files")
+    candidates.append(os.path.join(os.path.expanduser("~"), "STiM_exports", base_tagged))
+    candidates.append(os.path.join(tempfile.gettempdir(), "STiM_exports", base_tagged))
+
+    last_err = None
+    for d in candidates:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".stim_write_test")
+            with open(probe, "w"):
+                pass
+        except OSError as e:
+            last_err = e
+            continue
+        # The write succeeded → this dir is usable for the real outputs. Removing
+        # the probe is best-effort: a mount that allows create but denies unlink
+        # must not make us abandon a perfectly writable folder.
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+        return d
+    # Every candidate failed (extremely unlikely); surface the real reason.
+    raise OSError(f"No writable export directory found for {image_path!r}: {last_err}")
 
 
 # --------------------------------------------------------------------------- #
@@ -118,7 +176,8 @@ def compute_pairwise_distances(fiducials):
 # --------------------------------------------------------------------------- #
 def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials,
                             geom=None, visualize=False, sample_points=None,
-                            simplify_eps=1.5, write_czi=True, section_ids=None):
+                            simplify_eps=1.5, write_czi=True, section_ids=None,
+                            out_dir=None):
     """Export polygons + fiducials (from masks) to CSV + GeoJSON (+ annotated CZI).
 
     Coordinates are written in full-resolution pixels when ``geom`` is provided.
@@ -130,65 +189,89 @@ def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials,
     fiducials_full = scale_points(fiducials, geom)
     return _write_outputs(image_path, polygons, fiducials_full,
                           section_ids=section_ids, visualize=visualize,
-                          write_czi=write_czi, geom=geom)
+                          write_czi=write_czi, geom=geom, out_dir=out_dir)
 
 
 def export_polygons(image_path, polygons, fiducials, geom=None, visualize=False,
-                    write_czi=True, section_ids=None):
+                    write_czi=True, section_ids=None, write_csv=True,
+                    write_geojson=True, write_png=True, out_dir=None):
     """Export already-extracted polygons (e.g. user-edited in the GUI).
 
     ``polygons`` / ``fiducials`` are in overview-pixel coords; they are scaled to
-    full-resolution via ``geom`` before writing.
+    full-resolution via ``geom`` before writing. Each ``write_*`` flag selects
+    which outputs to produce. ``out_dir`` overrides where files land (falls back
+    to a writable location automatically — see :func:`resolve_export_dir`).
     """
     polys_full = [scale_polygon(p, geom) for p in polygons if p is not None
                   and len(np.asarray(p).reshape(-1, 2)) >= 3]
     fiducials_full = scale_points(fiducials, geom)
     return _write_outputs(image_path, polys_full, fiducials_full,
                           section_ids=section_ids, visualize=visualize,
-                          write_czi=write_czi, geom=geom)
+                          write_czi=write_czi, geom=geom, write_csv=write_csv,
+                          write_geojson=write_geojson, write_png=write_png,
+                          out_dir=out_dir)
 
 
 def _write_outputs(image_path, polygons, fiducials_full, section_ids=None,
-                   visualize=False, write_czi=True, geom=None):
-    """Shared writer: polygons + fiducials already in full-res pixels -> files."""
+                   visualize=False, write_czi=True, geom=None,
+                   write_png=True, png_long_side=16384,
+                   write_csv=True, write_geojson=True, out_dir=None):
+    """Shared writer: polygons + fiducials already in full-res pixels -> files.
+    Each output is gated by its ``write_*`` flag (customizable export)."""
     base_name = os.path.splitext(os.path.basename(image_path))[0]
-    file_directory = f"{os.path.splitext(image_path)[0]}_files"
-    os.makedirs(file_directory, exist_ok=True)
+    file_directory = resolve_export_dir(image_path, out_dir)
 
     polygons = [np.asarray(p, dtype=float) for p in polygons]
     if section_ids is None:
         section_ids = [f"section_{i}" for i in range(1, len(polygons) + 1)]
+    outputs = {"dir": file_directory}
 
-    # ---- CSV (kept for backward compatibility) ----
-    csv_path = os.path.join(file_directory, f"{base_name}_mask_coordinates.csv")
-    rows = []
-    for sid, poly in zip(section_ids, polygons):
-        rows.append({"id": sid, "type": "section",
-                     "contour_coordinates": str([poly.tolist()]), "distance": ""})
-    fid_row = {"id": "fiducials", "type": "fiducials",
-               "contour_coordinates": str([list(p) for p in fiducials_full])}
-    fid_row["distance"] = (str(compute_pairwise_distances(fiducials_full))
-                           if len(fiducials_full) >= 2 else "")
-    rows.append(fid_row)
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "type",
-                                               "contour_coordinates", "distance"])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"Wrote CSV: {csv_path}")
+    # ---- CSV ----
+    if write_csv:
+        csv_path = os.path.join(file_directory, f"{base_name}_mask_coordinates.csv")
+        rows = []
+        for sid, poly in zip(section_ids, polygons):
+            rows.append({"id": sid, "type": "section",
+                         "contour_coordinates": str([poly.tolist()]), "distance": ""})
+        fid_row = {"id": "fiducials", "type": "fiducials",
+                   "contour_coordinates": str([list(p) for p in fiducials_full])}
+        fid_row["distance"] = (str(compute_pairwise_distances(fiducials_full))
+                               if len(fiducials_full) >= 2 else "")
+        rows.append(fid_row)
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["id", "type",
+                                                   "contour_coordinates", "distance"])
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"Wrote CSV: {csv_path}")
+        outputs["csv"] = csv_path
 
     # ---- GeoJSON ----
-    from section_identification import czi_export
-    geojson_path = os.path.join(file_directory, f"{base_name}_sections.geojson")
-    czi_export.write_geojson(geojson_path, polygons, fiducials_full, geom=geom)
-    print(f"Wrote GeoJSON: {geojson_path}")
+    if write_geojson:
+        from section_identification import czi_export
+        geojson_path = os.path.join(file_directory, f"{base_name}_sections.geojson")
+        czi_export.write_geojson(geojson_path, polygons, fiducials_full, geom=geom)
+        print(f"Wrote GeoJSON: {geojson_path}")
+        outputs["geojson"] = geojson_path
 
-    outputs = {"csv": csv_path, "geojson": geojson_path}
+    # ---- High-resolution overlay PNG (polygons + fiducial crosses) ----
+    if write_png:
+        png_path = os.path.join(file_directory, f"{base_name}_overlay.png")
+        try:
+            render_overlay_png(image_path, polygons, fiducials_full, png_path,
+                               target_long_side=png_long_side)
+            outputs["png"] = png_path
+            print(f"Wrote overlay PNG: {png_path}")
+        except Exception as e:  # don't lose other outputs if the PNG fails
+            print(f"[warn] overlay PNG failed: {e}")
 
     # ---- Annotated CZI ----
     from section_identification import czi_io
     if write_czi and czi_io.is_czi(image_path):
-        dst = os.path.join(os.path.dirname(image_path), f"{base_name}_STiM.czi")
+        # Write the (full-size) annotated copy into the resolved output dir, not
+        # next to the source — the source may be on a read-only drive, and that
+        # is also where a 16 GB copy would otherwise land.
+        dst = os.path.join(file_directory, f"{base_name}_STiM.czi")
         try:
             report = czi_export.write_annotated_czi(
                 image_path, dst, [p.tolist() for p in polygons], fiducials_full,
@@ -203,6 +286,53 @@ def _write_outputs(image_path, polygons, fiducials_full, section_ids=None,
         _visualize(image_path, polygons, fiducials_full)
 
     return outputs
+
+
+def render_overlay_png(image_path, polygons_full, fiducials_full, out_path,
+                       target_long_side=16384, section_color=(0, 0, 255),
+                       fiducial_color=(0, 255, 255)):
+    """Render a high-resolution RGB PNG of the wafer with section polygons and
+    fiducial CROSS markers overlaid.
+
+    ``polygons_full`` / ``fiducials_full`` are FULL-resolution pixel coords. The
+    wafer is read at ``target_long_side`` (a true-native 76k-px PNG would be
+    ~18 GB in RAM, so we render at a high but memory-safe size; the annotated CZI
+    carries the genuine full-resolution geometry). Colors are BGR (cv2).
+    Returns ``out_path``.
+    """
+    import cv2
+    from section_identification import czi_io
+
+    if czi_io.is_czi(image_path):
+        arr, geom_r, _ = czi_io.read_czi_overview(image_path, target_long_side=target_long_side)
+        img = czi_io.to_rgb8(arr)              # HxWx3 uint8 (gray replicated)
+        to_render = geom_r.full_to_ds          # full-res px -> this render's px
+    else:
+        from PIL import Image
+        img = np.array(Image.open(image_path).convert("RGB"))
+        to_render = lambda xs, ys: (np.asarray(xs, float), np.asarray(ys, float))
+
+    img = np.ascontiguousarray(img)
+    H, W = img.shape[:2]
+    th = max(1, int(round(max(H, W) / 9000)))           # fine polygon line thickness
+    arm = max(18, int(round(max(H, W) / 110)))          # fiducial cross half-length
+
+    for poly in polygons_full:
+        p = np.asarray(poly, dtype=float).reshape(-1, 2)
+        xr, yr = to_render(p[:, 0], p[:, 1])
+        pts = np.column_stack([xr, yr]).round().astype(np.int32)
+        if len(pts) >= 2:
+            cv2.polylines(img, [pts], True, section_color, th, lineType=cv2.LINE_AA)
+
+    for (fx, fy) in (fiducials_full or []):
+        xr, yr = to_render(fx, fy)
+        cx, cy = int(round(float(np.asarray(xr)))), int(round(float(np.asarray(yr))))
+        cv2.line(img, (cx - arm, cy), (cx + arm, cy), fiducial_color, th + 2, cv2.LINE_AA)
+        cv2.line(img, (cx, cy - arm), (cx, cy + arm), fiducial_color, th + 2, cv2.LINE_AA)
+        cv2.circle(img, (cx, cy), arm, fiducial_color, max(2, th), cv2.LINE_AA)
+
+    cv2.imwrite(out_path, img)
+    return out_path
 
 
 def _visualize(image_path, polygons, fiducials):

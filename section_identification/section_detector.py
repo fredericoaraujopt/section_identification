@@ -56,18 +56,30 @@ def build_mask_generator(checkpoint, model_cfg, device, params):
         from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
         cfg = model_cfg or _infer_sam2_cfg(checkpoint)
-        print(f"Building SAM 2.1 model: cfg={cfg} on {device}")
+        print(f"STIM_PROGRESS: loading SAM model (cfg={os.path.basename(cfg)}) on {device}…", flush=True)
         sam2 = build_sam2(cfg, str(checkpoint), device=str(device),
                           apply_postprocessing=False)
+        # Full AMG breadth; params.get keeps callers that pass only the basics
+        # working (defaults match SAM2's own).
         return SAM2AutomaticMaskGenerator(
             sam2,
             points_per_side=params["points_per_side"],
             points_per_batch=params["points_per_batch"],
             pred_iou_thresh=params["pred_iou_thresh"],
             stability_score_thresh=params["stability_score_thresh"],
+            stability_score_offset=params.get("stability_score_offset", 1.0),
+            mask_threshold=params.get("mask_threshold", 0.0),
             box_nms_thresh=params["box_nms_thresh"],
             crop_n_layers=params["crop_n_layers"],
+            crop_nms_thresh=params.get("crop_nms_thresh", 0.7),
+            crop_overlap_ratio=params.get("crop_overlap_ratio", 512 / 1500),
+            crop_n_points_downscale_factor=params.get("crop_n_points_downscale_factor", 1),
             min_mask_region_area=params["min_mask_region_area"],
+            use_m2m=params.get("use_m2m", False),
+            # multimask_output=True (SAM default) emits 3 candidate masks per
+            # prompt point and keeps the best — better recall, but 3× the
+            # per-batch upsample memory. False is the low-memory path.
+            multimask_output=params.get("multimask_output", True),
             output_mode=params["output_mode"],
         )
 
@@ -75,7 +87,7 @@ def build_mask_generator(checkpoint, model_cfg, device, params):
     from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 
     model_type = params.get("model_type", "vit_h")
-    print(f"Building original SAM ({model_type}) on {device}")
+    print(f"STIM_PROGRESS: loading original SAM ({model_type}) on {device}…", flush=True)
     sam = sam_model_registry[model_type](str(checkpoint))
     sam.to(device=str(device))
     return SamAutomaticMaskGenerator(
@@ -171,11 +183,12 @@ def automatic_identification(image_path, checkpoint, image=None, model_cfg=None,
     # (points_per_batch x 3 x H x W x 4B) can blow past GPU memory. Cap
     # points_per_batch to keep it under a safe budget (no effect on results).
     H, W = image.shape[:2]
-    mem_budget_bytes = 2.5e9
-    safe_ppb = max(1, int(mem_budget_bytes / (H * W * 4 * 3.5)))
+    from section_identification import host_profile
+    budget = host_profile.detect_profile(params["device"]).mem_budget_bytes
+    safe_ppb = host_profile.safe_points_per_batch(budget, H, W, params["points_per_batch"])
     if safe_ppb < params["points_per_batch"]:
         print(f"[mem] capping points_per_batch "
-              f"{params['points_per_batch']} -> {safe_ppb} for {W}x{H} image")
+              f"{params['points_per_batch']} -> {safe_ppb} for {W}x{H} image", flush=True)
         params["points_per_batch"] = safe_ppb
 
     if eps_values is None:
@@ -198,10 +211,10 @@ def automatic_identification(image_path, checkpoint, image=None, model_cfg=None,
         print(f"Loaded {len(sorted_masks)} cached masks.")
     else:
         mask_generator = build_mask_generator(checkpoint, model_cfg, device, params)
-        print("Generating masks…")
+        print("STIM_PROGRESS: generating masks…", flush=True)
         with autocast_ctx(device):
             generated_masks = mask_generator.generate(image)
-        print(f"Generated {len(generated_masks)} masks.")
+        print(f"Generated {len(generated_masks)} masks.", flush=True)
         sorted_masks = sorted(generated_masks, key=lambda x: x["area"], reverse=True)
         try:
             with open(cache_file, "wb") as f:

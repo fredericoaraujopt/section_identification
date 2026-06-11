@@ -30,8 +30,12 @@ def recompose_overlay(image, masks, alpha=0.5):
     """
     overlay = image.copy()
     for mask in masks:
-        if "overlay" in mask:
-            overlay = cv2.addWeighted(overlay, 1, mask["overlay"], alpha, 0)
+        ov = mask.get("overlay") if isinstance(mask, dict) else None
+        # Skip masks whose cached overlay was built for a different-size image
+        # (e.g. a full-res crop from another region): blending them would raise
+        # a cv2 size-mismatch and tear down the editor.
+        if ov is not None and ov.shape == overlay.shape:
+            overlay = cv2.addWeighted(overlay, 1, ov, alpha, 0)
     return overlay
 
 
