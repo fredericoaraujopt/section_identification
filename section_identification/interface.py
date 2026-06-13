@@ -29,10 +29,10 @@ from qtpy.QtWidgets import (
 import napari
 
 from section_identification.section_detector import automatic_identification
-from section_identification.export import export_polygons, mask_to_polygon
+from section_identification.export import export_polygons
 from section_identification import czi_io
 from section_identification import host_profile
-from section_identification.device import describe as describe_device, device_str
+from section_identification.device import describe as describe_device
 
 
 def xy_to_napari(poly_xy):
@@ -76,11 +76,10 @@ class SectionIdentificationGUI(QWidget):
         layout = QVBoxLayout(); layout.setContentsMargins(6, 6, 6, 6); layout.setSpacing(4)
         self.setLayout(layout)
 
-        # checkpoint paths (set before the Advanced section uses them)
+        # checkpoint path (set before the Advanced section uses it). SAM 2.1 is
+        # used everywhere now — automatic detection AND the in-viewer editor.
         pkg = Path(os.path.abspath(__file__)); ckpt_dir = pkg.parents[1] / "checkpoint"
         self.checkpoint = str(ckpt_dir / "sam2.1_hiera_base_plus.pt")
-        self.sam1_checkpoint = str(ckpt_dir / "sam_vit_b_01ec64.pth")
-        self.sam1_model_type = "vit_b"
 
         # collapsible section helper → returns the section's body layout
         def section(title, open=True):
@@ -95,18 +94,21 @@ class SectionIdentificationGUI(QWidget):
             layout.addWidget(btn); layout.addWidget(body)
             return bl
 
-        # ---- top (always visible): image picker ----
+        # ---- top (always visible): image picker + a single Help toggle ----
+        top_row = QHBoxLayout()
         self.btn_select = QPushButton("Select Image / CZI…")
+        self.btn_help = QPushButton("❔ Help"); self.btn_help.setFixedWidth(64)
+        self.btn_help.setToolTip("How to use STiM — step-by-step guide.")
+        top_row.addWidget(self.btn_select, 1); top_row.addWidget(self.btn_help)
+        layout.addLayout(top_row)
         self.lbl_path = QLabel("No image selected"); self.lbl_path.setWordWrap(True)
-        layout.addWidget(self.btn_select); layout.addWidget(self.lbl_path)
+        layout.addWidget(self.lbl_path)
 
         # ===== 1 · Calibrate (optional, recommended) =====
         cal = section("1 · Calibrate  (optional, recommended)", open=True)
         self.btn_calibrate = QPushButton("Calibrate from examples")
         cal.addWidget(self.btn_calibrate)
-        self.lbl_calib = QLabel("Draw 1–3 example sections in the 'Calibration examples' "
-                                "layer, then Calibrate — it sets every SAM parameter from "
-                                "the section size.")
+        self.lbl_calib = QLabel("Draw 1–3 example sections, then Calibrate. (See Help.)")
         self.lbl_calib.setWordWrap(True); cal.addWidget(self.lbl_calib)
         self.lbl_plan = QLabel("Detection plan: calibrate to compute it.")
         self.lbl_plan.setWordWrap(True)
@@ -130,7 +132,9 @@ class SectionIdentificationGUI(QWidget):
         self.btn_adv = QPushButton("▸ Advanced parameters"); self.btn_adv.setCheckable(True)
         det.addWidget(self.btn_adv)
         adv = QWidget(); adv.setVisible(False)
-        advcol = QVBoxLayout(adv); advcol.setContentsMargins(8, 4, 4, 4)
+        # left=0 aligns the Advanced content (incl. the checkpoint button) with the
+        # section's other buttons; right=10 leaves room so the "?" isn't clipped.
+        advcol = QVBoxLayout(adv); advcol.setContentsMargins(0, 4, 10, 4)
         self.btn_guide = QPushButton("📖 Open parameter guide")
         advcol.addWidget(self.btn_guide)
         self.chk_viz = QCheckBox("👁 Preview parameters on the image (live)")
@@ -138,94 +142,109 @@ class SectionIdentificationGUI(QWidget):
                                 "sub-crops and a min-area disc — they update as you "
                                 "change the values, so you see how SAM will behave.")
         advcol.addWidget(self.chk_viz)
-        advf = QFormLayout(); advf.setContentsMargins(0, 0, 0, 0)
-        advf.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        advf.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        advcol.addLayout(advf)
         self.btn_adv.toggled.connect(
             lambda on: (adv.setVisible(on),
                         self.btn_adv.setText(("▾ " if on else "▸ ") + "Advanced parameters")))
 
-        def _row(widget, label, anchor, tip):
+        def _group(title):
+            gb = QGroupBox(title)
+            f = QFormLayout(gb); f.setContentsMargins(8, 6, 10, 6); f.setSpacing(4)
+            f.setRowWrapPolicy(QFormLayout.WrapLongRows)
+            f.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+            advcol.addWidget(gb)
+            return f
+
+        def _row(widget, label, anchor, tip, form):
             widget.setToolTip(tip)
             q = QPushButton("?"); q.setFixedWidth(22)
             q.setToolTip("What does this do? (opens the guide)")
             q.clicked.connect(lambda _=False, a=anchor: self._open_guide(a))
             cont = QWidget(); h = QHBoxLayout(cont); h.setContentsMargins(0, 0, 0, 0)
             h.addWidget(widget, 1); h.addWidget(q)
-            advf.addRow(label, cont)
+            form.addRow(label, cont)
             return widget
 
-        self.sp_pps = _row(QSpinBox(), "points / side", "points_per_side",
-            "Density of SAM's query-point grid per tile. ~2–3 points across a section. "
-            "More = finds smaller/closer objects, slower.")
-        self.sp_pps.setRange(4, 192); self.sp_pps.setValue(32)
-        self.sp_iou = _row(QDoubleSpinBox(), "pred IoU", "pred_iou_thresh",
-            "SAM's confidence floor. Lower to recover faint sections; raise to drop weak ones.")
-        self.sp_iou.setRange(0.0, 1.0); self.sp_iou.setSingleStep(0.05); self.sp_iou.setValue(0.80)
-        self.sp_stab = _row(QDoubleSpinBox(), "stability", "stability_score_thresh",
-            "Mask edge-stability floor. Lower for noisy/small sections; raise for clean ones.")
-        self.sp_stab.setRange(0.0, 1.0); self.sp_stab.setSingleStep(0.01); self.sp_stab.setValue(0.92)
-        self.sp_staboff = _row(QDoubleSpinBox(), "stability offset", "stability_score_offset",
-            "Nudge used to measure stability. Usually leave at 1.0.")
-        self.sp_staboff.setRange(0.1, 5.0); self.sp_staboff.setSingleStep(0.1); self.sp_staboff.setValue(1.0)
-        self.sp_boxnms = _row(QDoubleSpinBox(), "box NMS", "box_nms_thresh",
-            "Merge masks overlapping more than this. Lower = more dedup; raise to keep "
-            "touching sections separate.")
-        self.sp_boxnms.setRange(0.1, 1.0); self.sp_boxnms.setSingleStep(0.05); self.sp_boxnms.setValue(0.70)
-        self.sp_crop = _row(QSpinBox(), "crop layers", "crop_n_layers",
-            "SAM's built-in re-cropping for tiny objects. 0=off, 1=2×2 sub-crops (~5× slower). "
-            "Calibrate sets it from section size.")
-        self.sp_crop.setRange(0, 3); self.sp_crop.setValue(0)
-        self.sp_cropov = _row(QDoubleSpinBox(), "crop overlap", "crop_overlap_ratio",
-            "Overlap between SAM's sub-crops so edge sections aren't split.")
-        self.sp_cropov.setRange(0.0, 0.8); self.sp_cropov.setSingleStep(0.02); self.sp_cropov.setValue(512 / 1500)
-        self.sp_cropds = _row(QSpinBox(), "crop grid ÷", "crop_n_points_downscale_factor",
-            "Thins the point grid on deeper crop layers. 2 is typical when crop layers ≥ 1.")
-        self.sp_cropds.setRange(1, 4); self.sp_cropds.setValue(1)
-        self.sp_minmask = _row(QSpinBox(), "min mask area", "min_mask_region_area",
-            "SAM drops regions/holes smaller than this (specks filter inside SAM). "
-            "~5% of a section's area.")
-        self.sp_minmask.setRange(0, 10_000_000); self.sp_minmask.setValue(100)
-        self.sp_minarea = _row(QSpinBox(), "min section area", "min_section_area",
-            "Detections smaller than this are dropped + anchors the area-DBSCAN band. "
-            "Calibrate sets it to ~½ the median section.")
-        self.sp_minarea.setRange(0, 10_000_000); self.sp_minarea.setValue(50)
-        self.chk_m2m = _row(QCheckBox(), "refine (use_m2m)", "use_m2m",
-            "Extra mask-to-mask refinement: cleaner edges, ~2× slower.")
-        self.chk_lowmem = _row(QCheckBox(), "low-memory (1 mask/pt)", "low_memory",
-            "Memory-saver: SAM emits 1 mask per point instead of 3 → ~3× less "
-            "peak mask memory (eases pressure on Macs / weak machines, lets the "
-            "batch run bigger). May slightly lower recall on ambiguous sections. "
-            "Off = SAM default (3 masks/point, best recall).")
-        self.sp_tile = _row(QSpinBox(), "tile px (0=whole)", "tile_px",
-            "Tile size; SAM upscales each tile to 1024 (smaller tile → bigger section to "
-            "SAM). 0 = whole image. Calibrate sets it; host cap may shrink it.")
-        self.sp_tile.setRange(0, 16384); self.sp_tile.setSingleStep(128); self.sp_tile.setValue(0)
-        self.sp_overlap = _row(QDoubleSpinBox(), "tile overlap", "overlap",
-            "Overlap between tiles so each section fits whole in ≥1 tile.")
-        self.sp_overlap.setRange(0.0, 0.6); self.sp_overlap.setSingleStep(0.05); self.sp_overlap.setValue(0.2)
+        # -- Model & resolution: the dials you actually reach for --
+        gres = _group("Model & resolution")
+        self.cb_model = _row(QComboBox(), "model", "model",
+            "Heavier = better but slower/more memory. Auto picks by host (tiny/small on "
+            "CPU/weak, base_plus/large on GPU).", gres)
+        self.cb_model.addItems(["Auto", "tiny", "small", "base_plus", "large"])
         self.sp_targetsam = _row(QSpinBox(), "target → SAM", "target_sam_px",
             "How big a section should look to SAM. The main quality↔speed dial; "
-            "higher = sharper but more tiles. ~64 typical, ~40 on slow machines.")
+            "higher = sharper but more tiles. ~64 typical, ~40 on slow machines.", gres)
         self.sp_targetsam.setRange(24, 256); self.sp_targetsam.setValue(64)
         self.sp_target = _row(QSpinBox(), "overview px", "overview_long_side",
             "Read resolution (real detail). Bigger = sharper, more memory/time; host-capped. "
-            "Needs an image reload to take effect.")
+            "Needs an image reload to take effect.", gres)
         self.sp_target.setRange(1024, 16384); self.sp_target.setSingleStep(512); self.sp_target.setValue(8192)
         self.sp_ppb = _row(QSpinBox(), "points / batch", "points_per_batch",
             "Query points SAM runs at once. Memory/speed only — NO effect on results. "
-            "Lower to avoid crashing/thrashing; raise with spare GPU. Auto-capped to host.")
+            "Lower to avoid crashing/thrashing; raise with spare GPU. Auto-capped to host.", gres)
         self.sp_ppb.setRange(1, 256); self.sp_ppb.setValue(16)
-        self.cb_model = _row(QComboBox(), "model", "model",
-            "Heavier = better but slower/more memory. Auto picks by host (tiny/small on "
-            "CPU/weak, base_plus/large on GPU).")
-        self.cb_model.addItems(["Auto", "tiny", "small", "base_plus", "large"])
+        self.chk_lowmem = _row(QCheckBox(), "low-memory (1 mask/pt)", "memory",
+            "Memory-saver: SAM emits 1 mask per point instead of 3 → ~3× less peak mask "
+            "memory (eases pressure on Macs / weak machines). May slightly lower recall on "
+            "ambiguous sections. Off = SAM default (3 masks/point, best recall).", gres)
+
+        # -- Tiling --
+        gtile = _group("Tiling")
+        self.sp_tile = _row(QSpinBox(), "tile px (0=whole)", "tile_px",
+            "Tile size; SAM upscales each tile to 1024 (smaller tile → bigger section to "
+            "SAM). 0 = whole image. Calibrate sets it; host cap may shrink it.", gtile)
+        self.sp_tile.setRange(0, 16384); self.sp_tile.setSingleStep(128); self.sp_tile.setValue(0)
+        self.sp_overlap = _row(QDoubleSpinBox(), "tile overlap", "overlap",
+            "Overlap between tiles so each section fits whole in ≥1 tile.", gtile)
+        self.sp_overlap.setRange(0.0, 0.6); self.sp_overlap.setSingleStep(0.05); self.sp_overlap.setValue(0.2)
+
+        # -- SAM detection: Calibrate sets these from the section size --
+        gsam = _group("SAM detection  (Calibrate sets these)")
+        self.sp_pps = _row(QSpinBox(), "points / side", "points_per_side",
+            "Density of SAM's query-point grid per tile. ~2–3 points across a section. "
+            "More = finds smaller/closer objects, slower.", gsam)
+        self.sp_pps.setRange(4, 192); self.sp_pps.setValue(32)
+        self.sp_iou = _row(QDoubleSpinBox(), "pred IoU", "pred_iou_thresh",
+            "SAM's confidence floor. Lower to recover faint sections; raise to drop weak ones.", gsam)
+        self.sp_iou.setRange(0.0, 1.0); self.sp_iou.setSingleStep(0.05); self.sp_iou.setValue(0.80)
+        self.sp_stab = _row(QDoubleSpinBox(), "stability", "stability_score_thresh",
+            "Mask edge-stability floor. Lower for noisy/small sections; raise for clean ones.", gsam)
+        self.sp_stab.setRange(0.0, 1.0); self.sp_stab.setSingleStep(0.01); self.sp_stab.setValue(0.92)
+        self.sp_staboff = _row(QDoubleSpinBox(), "stability offset", "stability_score_offset",
+            "Nudge used to measure stability. Usually leave at 1.0.", gsam)
+        self.sp_staboff.setRange(0.1, 5.0); self.sp_staboff.setSingleStep(0.1); self.sp_staboff.setValue(1.0)
+        self.sp_boxnms = _row(QDoubleSpinBox(), "box NMS", "box_nms_thresh",
+            "Merge masks overlapping more than this. Lower = more dedup; raise to keep "
+            "touching sections separate.", gsam)
+        self.sp_boxnms.setRange(0.1, 1.0); self.sp_boxnms.setSingleStep(0.05); self.sp_boxnms.setValue(0.70)
+        self.sp_crop = _row(QSpinBox(), "crop layers", "crop_n_layers",
+            "SAM's built-in re-cropping for tiny objects. 0=off, 1=2×2 sub-crops (~5× slower). "
+            "Calibrate sets it from section size.", gsam)
+        self.sp_crop.setRange(0, 3); self.sp_crop.setValue(0)
+        self.sp_cropov = _row(QDoubleSpinBox(), "crop overlap", "crop_overlap_ratio",
+            "Overlap between SAM's sub-crops so edge sections aren't split.", gsam)
+        self.sp_cropov.setRange(0.0, 0.8); self.sp_cropov.setSingleStep(0.02); self.sp_cropov.setValue(512 / 1500)
+        self.sp_cropds = _row(QSpinBox(), "crop grid ÷", "crop_n_points_downscale_factor",
+            "Thins the point grid on deeper crop layers. 2 is typical when crop layers ≥ 1.", gsam)
+        self.sp_cropds.setRange(1, 4); self.sp_cropds.setValue(1)
+        self.sp_minmask = _row(QSpinBox(), "min mask area", "min_mask_region_area",
+            "SAM drops regions/holes smaller than this (specks filter inside SAM). "
+            "~5% of a section's area.", gsam)
+        self.sp_minmask.setRange(0, 10_000_000); self.sp_minmask.setValue(100)
+        self.chk_m2m = _row(QCheckBox(), "refine (use_m2m)", "use_m2m",
+            "Extra mask-to-mask refinement: cleaner edges, ~2× slower.", gsam)
+
+        # -- Filtering AFTER SAM (post-processing, not SAM params) --
+        gfilt = _group("Filtering  (after SAM)")
+        self.sp_minarea = _row(QSpinBox(), "min section area", "min_section_area",
+            "Detections smaller than this are dropped + anchors the area-DBSCAN band. "
+            "Calibrate sets it to ~½ the median section.", gfilt)
+        self.sp_minarea.setRange(0, 10_000_000); self.sp_minarea.setValue(50)
         self.chk_filter = _row(QCheckBox(), "area DBSCAN", "dbscan",
             "Keep the dominant section-sized area cluster (drops debris/clumps). "
-            "Leave on for wafers.")
+            "Leave on for wafers.", gfilt)
         self.chk_filter.setChecked(True)
-        # checkpoint selector lives inside Advanced (rarely changed; Auto model picks it)
+
+        # checkpoint selector (rarely changed; Auto model picks it) — bottom of Advanced
         self.lbl_ckpt = QLabel(f"Checkpoint: …/{os.path.basename(self.checkpoint)}")
         self.lbl_ckpt.setWordWrap(True); advcol.addWidget(self.lbl_ckpt)
         self.btn_ckpt = QPushButton("Select checkpoint (.pt)")
@@ -239,22 +258,14 @@ class SectionIdentificationGUI(QWidget):
         det.addLayout(det_row)
         self.lbl_elapsed = QLabel(""); det.addWidget(self.lbl_elapsed)
 
-        # ===== 3 · Manual detector =====
-        man = section("3 · Manual detector", open=False)
-        self.btn_manual = QPushButton("Manual detector (OpenCV)")
-        man.addWidget(self.btn_manual)
-        self.btn_manual_napari = QPushButton("Manual editor (napari)")
+        # ===== 3 · Manual editor =====
+        man = section("3 · Manual editor", open=False)
+        self.btn_manual_napari = QPushButton("Manual editor (napari): OFF")
         self.btn_manual_napari.setCheckable(True)
         man.addWidget(self.btn_manual_napari)
-        _ml = QLabel("<i>OpenCV: separate window (hover preview, click add, 'r' remove, "
-                     "'m' fiducials, Esc finish). napari: in-viewer — zoom in, 'e' to "
-                     "embed the view at full-res, hover/click to add, 'r' remove, "
-                     "'m' fiducial.</i>")
+        _ml = QLabel("<i>Toggle on to correct results in-place: hover + <b>Space</b> to add a "
+                     "section, <b>r</b> to remove, <b>m</b> for a fiducial. See Help for all keys.</i>")
         _ml.setWordWrap(True); man.addWidget(_ml)
-        _edit = QLabel("<i>Edit results directly: select the 'Sections' layer, then use "
-                       "napari's polygon tool to add a section or the select tool to "
-                       "delete one — changes auto-save and export.</i>")
-        _edit.setWordWrap(True); man.addWidget(_edit)
 
         # ===== 4 · Export =====
         ex = section("4 · Export", open=False)
@@ -264,7 +275,10 @@ class SectionIdentificationGUI(QWidget):
         self.chk_exp_png = QCheckBox("PNG"); self.chk_exp_png.setChecked(True)
         self.chk_exp_czi = QCheckBox("CZI"); self.chk_exp_czi.setChecked(False)
         self.chk_exp_czi.setToolTip("Annotated CZI for ZEN — copies the whole file "
-                                    "(can be many GB); off by default.")
+                                    "(can be many GB); off by default. If the Fiducials "
+                                    "layer has points, they are also written into the "
+                                    "CZI's ZEN Shuttle & Find calibration markers (the "
+                                    "copy only; the source is never modified).")
         for c in (self.chk_exp_csv, self.chk_exp_geojson, self.chk_exp_png, self.chk_exp_czi):
             exp_row.addWidget(c)
         ex.addLayout(exp_row)
@@ -282,11 +296,11 @@ class SectionIdentificationGUI(QWidget):
         sys.stdout = self
 
         self.btn_select.clicked.connect(self.select_image)
+        self.btn_help.clicked.connect(self._open_help)
         self.btn_auto.clicked.connect(self.run_auto)
         self.btn_stop.clicked.connect(self.stop_detection)
         self.btn_export.clicked.connect(self.export_coordinates)
         self.btn_ckpt.clicked.connect(self.select_checkpoint)
-        self.btn_manual.clicked.connect(self.run_manual)
         self.btn_manual_napari.clicked.connect(self.toggle_manual_napari)
         self.btn_calibrate.clicked.connect(self.calibrate_from_examples)
         self.btn_guide.clicked.connect(lambda: self._open_guide())
@@ -310,6 +324,56 @@ class SectionIdentificationGUI(QWidget):
             open_param_guide(self, anchor)
         except Exception:
             self.log_msg("parameter guide unavailable:\n" + traceback.format_exc())
+
+    _HELP_HTML = """
+    <h2>STiM — how to use</h2>
+    <ol>
+      <li><b>Select Image / CZI</b> — load a wafer image or <code>.czi</code>.
+          For a CZI, any existing ZEN <i>Shuttle &amp; Find</i> fiducials are
+          imported onto the Fiducials layer automatically.</li>
+      <li><b>Calibrate</b> (recommended) — select the <i>Calibration examples</i>
+          layer, draw 1–3 example sections with napari's polygon tool, then click
+          <b>Calibrate from examples</b>. STiM sizes every SAM parameter from your
+          sections and picks a model that fits your machine.</li>
+      <li><b>Run Automatic Detection</b> — runs SAM in the background (the window
+          stays responsive; <b>Stop</b> cancels). Sections stream into the
+          <i>Sections</i> layer; the parameter preview turns on so you can see the
+          tiling/grid.</li>
+      <li><b>Manual editor (napari)</b> — toggle <b>ON</b> (the button turns red) to
+          correct results directly in the viewer:
+        <ul>
+          <li><b>hover</b> a section → yellow preview; <b>Space</b> adds it</li>
+          <li><b>r</b> = select the section under the cursor; <b>r</b> again removes it</li>
+          <li><b>m</b> = drop a fiducial; <b>d</b> = toggle the preview;
+              <b>e</b> = re-embed the current view</li>
+          <li>click/drag pans; works at any zoom. Toggle the button <b>OFF</b> when done.</li>
+        </ul></li>
+      <li><b>Fiducials</b> — CZI markers are imported as crosses. Add your own with the
+          editor's <b>m</b>, or by selecting the <i>Fiducials</i> layer and using
+          napari's add-point tool.</li>
+      <li><b>Export</b> — tick the formats (CSV / GeoJSON / PNG / CZI) and click
+          <b>Export selected</b>. Exporting a CZI with fiducials present also writes
+          them into the CZI copy's ZEN Shuttle &amp; Find markers (the source is never
+          modified). If the source drive is read-only, outputs go to
+          <code>~/STiM_exports/</code>.</li>
+    </ol>
+    <p><b>Advanced parameters</b> sit under the detector, grouped by topic; each row
+       has a tooltip and a <b>?</b> that opens a deeper guide. Calibrate sets the SAM
+       ones for you, so you rarely need to touch them.</p>
+    """
+
+    def _open_help(self):
+        """Show the step-by-step usage guide in a single reusable, non-modal dialog."""
+        dlg = getattr(self, "_help_dlg", None)
+        if dlg is not None:                       # reuse the existing window (don't stack)
+            dlg.show(); dlg.raise_(); dlg.activateWindow(); return
+        from qtpy.QtWidgets import QDialog, QTextBrowser
+        dlg = QDialog(self); dlg.setWindowTitle("STiM — how to use"); dlg.resize(560, 660)
+        v = QVBoxLayout(dlg)
+        tb = QTextBrowser(); tb.setOpenExternalLinks(True); tb.setHtml(self._HELP_HTML)
+        v.addWidget(tb)
+        self._help_dlg = dlg
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
 
     def _toggle_param_viz(self, on):
         try:
@@ -460,6 +524,10 @@ class SectionIdentificationGUI(QWidget):
             self._ensure_edit_layers([])
         self._raw_sections = []
         self._ensure_calib_layer()
+        # For a CZI, auto-scan its ZEN Shuttle & Find calibration markers and place
+        # them on the Fiducials layer (idempotent across reloads via dedup).
+        if czi_io.is_czi(self.image_path):
+            self.import_czi_fiducials(auto=True)
 
     def _restore_session(self):
         """Return (polys_overview, fids_overview) from project JSON, else CZI
@@ -517,10 +585,11 @@ class SectionIdentificationGUI(QWidget):
             pass
         if self.fid_layer is None or self.fid_layer not in self.viewer.layers:
             self.fid_layer = self.viewer.add_points(np.empty((0, 2)),
-                                                    name="Fiducials", size=24,
+                                                    name="Fiducials", size=28,
+                                                    symbol="cross",
                                                     scale=self._layer_scale())
-            for attr, val in (("face_color", "cyan"), ("border_color", "blue"),
-                              ("edge_color", "blue")):
+            for attr, val in (("symbol", "cross"), ("face_color", "cyan"),
+                              ("border_color", "cyan"), ("edge_color", "cyan")):
                 try:
                     setattr(self.fid_layer, attr, val)
                 except Exception:
@@ -708,6 +777,9 @@ class SectionIdentificationGUI(QWidget):
                 "--min-area", str(min_area), "--max-area", str(max_area)]
         self._stream_mode = True
         self._reset_stream_layers(); self._raw_sections = []; self._det_params = None
+        # Show the parameter preview (tile grid / point grid) while detecting.
+        if not self.chk_viz.isChecked():
+            self.chk_viz.setChecked(True)
         whole = tile_px >= max(self.overview.shape[:2])
         self.log_msg(f"▶ Detection on {prof.device} ({os.path.basename(ckpt)}): "
                      f"{'whole image' if whole else 'tiles'}, tile_px={tile_px}, grid "
@@ -970,86 +1042,33 @@ class SectionIdentificationGUI(QWidget):
         self.log_msg(f"Preview: {len(boxes)} tiles of {tile_px}px (overlap {overlap}); "
                      f"SAM upscale ×{1024.0 / tile_px:.1f}.")
 
-    # ----- manual cv2 editor -----
-    def _image_file_for_interactive(self):
-        if not czi_io.is_czi(self.image_path):
-            return self.image_path
-        import cv2
-        base = os.path.splitext(self.image_path)[0]
-        out_dir = f"{base}_files"; os.makedirs(out_dir, exist_ok=True)
-        png = os.path.join(out_dir, os.path.basename(base) + "_overview.png")
-        cv2.imwrite(png, cv2.cvtColor(self.overview, cv2.COLOR_RGB2BGR))
-        return png
-
-    def run_manual(self):
-        if self.overview is None:
-            self.log_msg("⚠️ Load an image first."); return
-        if not os.path.isfile(self.sam1_checkpoint):
-            QMessageBox.information(self, "Missing SAM 1 checkpoint",
-                                    f"Manual editor needs:\n{self.sam1_checkpoint}")
-            p, _ = QFileDialog.getOpenFileName(self, "Select SAM 1 checkpoint", "",
-                                               "Checkpoints (*.pth *.pt)")
-            if not p:
-                return
-            self.sam1_checkpoint = p
-            self.sam1_model_type = ("vit_h" if "vit_h" in p else
-                                    "vit_l" if "vit_l" in p else "vit_b")
-        try:
-            from section_identification.interactive import run_sam_interactive
-            from section_identification.interactive_helpers import display_help
-        except Exception:
-            QMessageBox.warning(self, "Manual editor unavailable",
-                                "Needs onnxruntime + segment-anything installed.")
-            return
-        img_path = self._image_file_for_interactive()
-        self.progress.setRange(0, 0); self.progress.setVisible(True); QApplication.processEvents()
-        try:
-            display_help()
-            self.log_msg("▶ Launching manual editor (separate window; Esc to finish)…")
-            # For a CZI, hand the editor the source path + geometry so its 'e'
-            # key can read the current view at full resolution, and the existing
-            # sections as reference outlines.
-            czi_p = self.image_path if czi_io.is_czi(self.image_path) else None
-            ref = self.current_polygons_xy() if czi_p else None
-            new_masks, stored_masks, fiducials = run_sam_interactive(
-                img_path, checkpoint=self.sam1_checkpoint, stored_masks=[],
-                model_type=self.sam1_model_type, device=device_str(),
-                czi_path=czi_p, geom=self.geom, ref_polygons=ref)
-            self.log_msg(f"✔️ Manual: {len(new_masks)} new, {len(fiducials)} fiducials.")
-            new_polys = []
-            for m in list(stored_masks) + list(new_masks):
-                # Full-res masks carry their polygon already in overview coords.
-                po = m.get("poly_overview") if isinstance(m, dict) else None
-                p = np.asarray(po, dtype=float) if po is not None \
-                    else mask_to_polygon(m["segmentation"])
-                if p is not None and len(p) >= 3:
-                    new_polys.append(p)
-            # `ref` was mutated in place by the editor: detections the user
-            # deleted with 'r' are gone, so rebuild from the survivors (+ new).
-            survivors = ref if ref is not None else self.current_polygons_xy()
-            self._ensure_edit_layers(list(survivors) + new_polys)
-            if fiducials and self.fid_layer is not None:
-                self.fid_layer.data = np.asarray(fiducials, dtype=float)[:, ::-1]
-            self.save_project()
-        except Exception:
-            self.log_msg("❌ manual editor error:\n" + traceback.format_exc())
-        finally:
-            self.progress.setVisible(False)
+    # ----- manual (napari in-viewer) editor -----
+    def _style_manual_btn(self, active):
+        """Unmistakable ON/OFF state for the manual-editor toggle (text + colour)."""
+        self.btn_manual_napari.setChecked(bool(active))
+        if active:
+            self.btn_manual_napari.setText("● Manual editor: ON — click to stop")
+            self.btn_manual_napari.setStyleSheet(
+                "QPushButton{background:#b23b3b;color:white;font-weight:bold;padding:6px;"
+                "border-radius:4px;}")
+        else:
+            self.btn_manual_napari.setText("Manual editor (napari): OFF")
+            self.btn_manual_napari.setStyleSheet("")
 
     def toggle_manual_napari(self):
         """Activate/deactivate the in-viewer (napari) SAM editor."""
         if self.overview is None:
             self.log_msg("⚠️ Load an image first.")
-            self.btn_manual_napari.setChecked(False)
+            self._style_manual_btn(False)
             return
         try:
             if getattr(self, "_napari_editor", None) is None:
                 from section_identification.napari_sam_editor import NapariSamEditor
                 self._napari_editor = NapariSamEditor(self)
             active = self._napari_editor.toggle()
-            self.btn_manual_napari.setChecked(bool(active))
+            self._style_manual_btn(active)
         except Exception:
-            self.btn_manual_napari.setChecked(False)
+            self._style_manual_btn(False)
             self.log_msg("❌ napari editor error:\n" + traceback.format_exc())
 
     # ----- export -----
@@ -1067,7 +1086,12 @@ class SectionIdentificationGUI(QWidget):
                     write_czi=self.chk_exp_czi.isChecked())
         if not any(fmts.values()):
             self.log_msg("⚠️ Select at least one export format (CSV/GeoJSON/PNG/CZI)."); return
-        chosen = ", ".join(k[6:].upper() for k, v in fmts.items() if v)
+        # Auto: writing an annotated CZI + having fiducials => also write them into
+        # the CZI's ZEN Shuttle & Find calibration markers (no separate toggle).
+        fmts["write_sf"] = bool(fmts["write_czi"] and czi_io.is_czi(self.image_path) and fids)
+        chosen = ", ".join({"write_csv": "CSV", "write_geojson": "GeoJSON",
+                            "write_png": "PNG", "write_czi": "CZI",
+                            "write_sf": "S&F markers"}[k] for k, v in fmts.items() if v)
         self.log_msg(f"▶ Exporting {len(polys)} sections, {len(fids)} fiducials → {chosen}…")
         try:
             outputs = export_polygons(self.image_path, polys, fids, geom=self.geom,
@@ -1081,6 +1105,73 @@ class SectionIdentificationGUI(QWidget):
             self.log_msg("✔️ Exported: " + ", ".join(f"{k}={v}" for k, v in files.items()))
         except Exception:
             self.log_msg("❌ export error:\n" + traceback.format_exc())
+
+    def import_czi_fiducials(self, auto=False):
+        """Scan a CZI's ZEN Shuttle & Find calibration markers (stage µm) and place
+        them on the Fiducials layer. Called automatically on CZI load; appends to
+        any current fiducials (4 px dedup) so it's idempotent across reloads.
+        ``auto=True`` suppresses the not-a-CZI / read-error chatter."""
+        if self.image_path is None or not czi_io.is_czi(self.image_path):
+            if not auto:
+                self.log_msg("⚠️ Import works on a CZI source (Shuttle & Find markers).")
+            return
+        try:
+            markers = (czi_io.read_shuttle_and_find_markers(self.image_path)
+                       .get("markers") or [])
+        except Exception:
+            if not auto:
+                self.log_msg("❌ couldn't read CZI metadata:\n" + traceback.format_exc())
+            return
+        if not markers:
+            self.log_msg("ℹ️ No ZEN Shuttle & Find fiducials found in this CZI.")
+            return
+        coords = ", ".join(f"({m['stage_x_um']:.1f}, {m['stage_y_um']:.1f})µm"
+                           for m in markers)
+        if self.geom is None or self.geom.stage_center_um is None:
+            self.log_msg(f"⚠️ Found {len(markers)} Shuttle & Find fiducial(s) [{coords}] "
+                         f"but this CZI has no stage anchor (scene CenterPosition / "
+                         f"multi-scene) — can't place them on the image.")
+            return
+        # markers (stage µm) -> full-res px -> overview px (fid layer stores y,x)
+        new_yx = []
+        for m in markers:
+            f = self.geom.stage_um_to_full(m["stage_x_um"], m["stage_y_um"])
+            if f is None:
+                continue
+            ox, oy = self.geom.full_to_ds(float(f[0]), float(f[1]))
+            new_yx.append((float(oy), float(ox)))
+        if not new_yx:
+            self.log_msg(f"⚠️ Found {len(markers)} Shuttle & Find fiducial(s) but "
+                         f"couldn't map them to pixels."); return
+        if self.fid_layer is None or self.fid_layer not in self.viewer.layers:
+            self._ensure_edit_layers(self.current_polygons_xy())
+        existing = (np.asarray(self.fid_layer.data, dtype=float).reshape(-1, 2)
+                    if len(self.fid_layer.data) else np.empty((0, 2)))
+        tol = 4.0  # overview px — re-import is idempotent
+        added = []
+        for (oy, ox) in new_yx:
+            # compare against pre-existing fiducials AND ones added this batch
+            pool = (np.vstack([existing, np.asarray(added, dtype=float)])
+                    if added else existing)
+            if pool.size and np.any(np.hypot(pool[:, 0] - oy, pool[:, 1] - ox) < tol):
+                continue
+            added.append((oy, ox))
+        if not added:
+            self.log_msg(f"ℹ️ Found {len(markers)} ZEN Shuttle & Find fiducial(s) "
+                         f"[{coords}] — already present in the Fiducials layer.")
+            return
+        self.fid_layer.data = (np.vstack([existing, np.asarray(added, dtype=float)])
+                               if existing.size else np.asarray(added, dtype=float))
+        try:
+            self.save_project()
+        except Exception:
+            pass
+        xform = ("transposed axes" if self.geom.swap_xy else "direct axes")
+        self.log_msg(f"✅ Found {len(markers)} ZEN Shuttle & Find fiducial(s) and "
+                     f"imported {len(added)} into the Fiducials layer [{coords}] "
+                     f"(stage→pixel via scene CenterPosition, {xform}). "
+                     f"If they land on the wrong corners, tell me and I'll adjust the "
+                     f"stage↔pixel transform.")
 
 
 def main():

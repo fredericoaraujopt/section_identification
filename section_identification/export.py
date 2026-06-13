@@ -194,13 +194,16 @@ def export_mask_coordinates(image_path, new_masks, stored_masks, fiducials,
 
 def export_polygons(image_path, polygons, fiducials, geom=None, visualize=False,
                     write_czi=True, section_ids=None, write_csv=True,
-                    write_geojson=True, write_png=True, out_dir=None):
+                    write_geojson=True, write_png=True, out_dir=None,
+                    write_sf=False):
     """Export already-extracted polygons (e.g. user-edited in the GUI).
 
     ``polygons`` / ``fiducials`` are in overview-pixel coords; they are scaled to
     full-resolution via ``geom`` before writing. Each ``write_*`` flag selects
     which outputs to produce. ``out_dir`` overrides where files land (falls back
     to a writable location automatically — see :func:`resolve_export_dir`).
+    ``write_sf`` also writes the fiducials into the annotated CZI's ZEN Shuttle &
+    Find calibration markers (implies ``write_czi``; needs a CZI source + ``geom``).
     """
     polys_full = [scale_polygon(p, geom) for p in polygons if p is not None
                   and len(np.asarray(p).reshape(-1, 2)) >= 3]
@@ -209,13 +212,14 @@ def export_polygons(image_path, polygons, fiducials, geom=None, visualize=False,
                           section_ids=section_ids, visualize=visualize,
                           write_czi=write_czi, geom=geom, write_csv=write_csv,
                           write_geojson=write_geojson, write_png=write_png,
-                          out_dir=out_dir)
+                          out_dir=out_dir, write_sf=write_sf)
 
 
 def _write_outputs(image_path, polygons, fiducials_full, section_ids=None,
                    visualize=False, write_czi=True, geom=None,
                    write_png=True, png_long_side=16384,
-                   write_csv=True, write_geojson=True, out_dir=None):
+                   write_csv=True, write_geojson=True, out_dir=None,
+                   write_sf=False):
     """Shared writer: polygons + fiducials already in full-res pixels -> files.
     Each output is gated by its ``write_*`` flag (customizable export)."""
     base_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -267,18 +271,43 @@ def _write_outputs(image_path, polygons, fiducials_full, section_ids=None,
 
     # ---- Annotated CZI ----
     from section_identification import czi_io
-    if write_czi and czi_io.is_czi(image_path):
+    if (write_czi or write_sf) and czi_io.is_czi(image_path):
         # Write the (full-size) annotated copy into the resolved output dir, not
         # next to the source — the source may be on a read-only drive, and that
         # is also where a 16 GB copy would otherwise land.
         dst = os.path.join(file_directory, f"{base_name}_STiM.czi")
+        # When requested, also map the fiducials into stage µm for the ZEN
+        # Shuttle & Find calibration markers (only the COPY is edited).
+        sf_markers = sf_orient = None
+        if write_sf:
+            if geom is None or not fiducials_full:
+                print("[warn] S&F markers requested but there are no fiducials / no "
+                      "geometry; CZI written without S&F markers.")
+            else:
+                sm = geom.full_to_stage_um(
+                    np.asarray([p[0] for p in fiducials_full], dtype=float),
+                    np.asarray([p[1] for p in fiducials_full], dtype=float))
+                if sm is not None:
+                    sf_markers = list(zip(np.atleast_1d(sm[0]).tolist(),
+                                          np.atleast_1d(sm[1]).tolist()))
+                    # Markers are absolute stage µm (physically correct via the
+                    # verified transform); leave the CZI's own <StageOrientation>
+                    # untouched (sf_orient=None) rather than writing STiM's
+                    # internal corrected signs into ZEN's calibration metadata.
+                    sf_orient = None
+                else:
+                    print("[warn] S&F markers requested but the CZI lacks a stage "
+                          "anchor (scene CenterPosition / multi-scene); skipping S&F write.")
         try:
             report = czi_export.write_annotated_czi(
                 image_path, dst, [p.tolist() for p in polygons], fiducials_full,
-                section_ids=section_ids)
+                section_ids=section_ids, sf_markers_stage_um=sf_markers,
+                sf_orientation=sf_orient)
             outputs["czi"] = report["dst"]
             print(f"Wrote annotated CZI: {report['dst']} "
-                  f"(round-trip ok: {report['roundtrip_ok']})")
+                  f"(round-trip ok: {report['roundtrip_ok']}"
+                  + (f", S&F markers: {report['n_sf_markers']}" if sf_markers else "")
+                  + ")")
         except Exception as e:  # don't lose CSV/GeoJSON if CZI write fails
             print(f"[warn] annotated-CZI write failed: {e}")
 
