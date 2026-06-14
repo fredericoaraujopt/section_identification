@@ -553,11 +553,24 @@ class StageReorder(_StageBase):
         self.btn_inspect = QPushButton("Inspect match: pick 2 sections")
         self.btn_inspect.setToolTip("Then click two rows in the table — the SIFT "
                                     "inlier correspondences are drawn between them.")
-        self.btn_inspect.clicked.connect(self._arm_inspect)
+        self.btn_inspect.clicked.connect(lambda: self._arm("inspect"))
         self.col.addWidget(self.btn_inspect)
-        self._inspect_armed = False
-        self._inspect_pick = []
-        self.table.add_select_listener(self._on_pair_pick)
+        self.btn_swap = QPushButton("Swap serial order: pick 2 sections")
+        self.btn_swap.setToolTip("Click two rows to swap their position in the "
+                                 "recovered serial order.")
+        self.btn_swap.clicked.connect(lambda: self._arm("swap"))
+        self.col.addWidget(self.btn_swap)
+        rrow = QHBoxLayout()
+        rrow.addWidget(QLabel("route:"))
+        for label, op in (("◀ earlier", "earlier"), ("later ▶", "later"),
+                          ("drop", "drop"), ("reverse", "reverse")):
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, o=op: self._route_op(o))
+            rrow.addWidget(b)
+        self.col.addLayout(rrow)
+        self._pick_mode = None
+        self._picks = []
+        self.table.add_select_listener(self._on_pick)
         self.btn_heat = QPushButton("Show similarity heatmap")
         self.btn_heat.setToolTip("The SIFT inlier matrix, permuted by the recovered "
                                  "serial order — a correct ordering looks banded.")
@@ -645,22 +658,48 @@ class StageReorder(_StageBase):
         self.app.log(self.STAGE, f"TSP route computed: {total:,.0f} {unit} travel.")
         self.app.save_workflow()
 
-    def _arm_inspect(self):
+    def _arm(self, mode):
         if not self._need_image():
             return
-        self._inspect_armed = True
-        self._inspect_pick = []
-        self.app.log(self.STAGE, "match-inspect armed — click two sections in the table.")
+        self._pick_mode = mode
+        self._picks = []
+        self.app.log(self.STAGE, f"{mode}: click two sections in the table.")
 
-    def _on_pair_pick(self, section):
-        if not self._inspect_armed or section is None:
+    def _on_pick(self, section):
+        if self._pick_mode is None or section is None:
             return
-        self._inspect_pick.append(section)
-        if len(self._inspect_pick) >= 2:
-            a, b = self._inspect_pick[0], self._inspect_pick[1]
-            self._inspect_armed = False
-            self._inspect_pick = []
+        self._picks.append(section)
+        if len(self._picks) < 2:
+            return
+        a, b = self._picks[0], self._picks[1]
+        mode = self._pick_mode
+        self._pick_mode = None
+        self._picks = []
+        if mode == "inspect":
             layer_sync.show_pair_matches(self.app, a, b)
+        elif mode == "swap":
+            if self.app.project.swap_serial(a.id, b.id):
+                layer_sync.show_serial_chain(self.app)
+                self.table.refresh()
+                self.app.save_workflow()
+                self.app.log(self.STAGE, f"swapped serial order: {a.id} ↔ {b.id}.")
+
+    def _route_op(self, op):
+        sel = getattr(self.table, "selected_section", None)
+        if op == "reverse":
+            self.app.project.reverse_imaging()
+        elif sel is None:
+            self.app.log(self.STAGE, "select a section row in the table first.")
+            return
+        elif op == "earlier":
+            self.app.project.move_imaging(sel.id, -1)
+        elif op == "later":
+            self.app.project.move_imaging(sel.id, +1)
+        elif op == "drop":
+            self.app.project.drop_from_imaging(sel.id)
+        layer_sync.show_route(self.app)
+        self.table.refresh()
+        self.app.save_workflow()
 
     def _show_heatmap(self):
         from . import reorder as reorder_mod

@@ -374,6 +374,55 @@ class WaferProject:
         keyed = [s for s in self.sections if s.imaging_index is not None]
         return sorted(keyed, key=lambda s: s.imaging_index) or list(self.sections)
 
+    # -- manual order / route editing (pure; the GUI calls these) --
+    def swap_serial(self, id_a: str, id_b: str) -> bool:
+        """Swap two sections' serial order (their serial_index and their slots in
+        the recovered match-graph order). Returns True on success."""
+        sa, sb = self.get(id_a), self.get(id_b)
+        if sa is None or sb is None or sa is sb:
+            return False
+        sa.serial_index, sb.serial_index = sb.serial_index, sa.serial_index
+        o = self.match_graph.order
+        if id_a in o and id_b in o:
+            ia, ib = o.index(id_a), o.index(id_b)
+            o[ia], o[ib] = o[ib], o[ia]
+        return True
+
+    def drop_from_imaging(self, sid: str) -> bool:
+        """Remove a section from the imaging route and compact the rest 0..n-1."""
+        s = self.get(sid)
+        if s is None or s.imaging_index is None:
+            return False
+        s.imaging_index = None
+        remaining = sorted((x for x in self.sections if x.imaging_index is not None),
+                           key=lambda x: x.imaging_index)
+        for i, x in enumerate(remaining):
+            x.imaging_index = i
+        return True
+
+    def move_imaging(self, sid: str, delta: int) -> bool:
+        """Move a section earlier/later in the imaging route by ``delta`` steps."""
+        ordered = [x for x in self.sections if x.imaging_index is not None]
+        ordered.sort(key=lambda x: x.imaging_index)
+        ids = [x.id for x in ordered]
+        if sid not in ids:
+            return False
+        i = ids.index(sid)
+        j = i + delta
+        if not (0 <= j < len(ordered)):
+            return False
+        a, b = ordered[i], ordered[j]
+        a.imaging_index, b.imaging_index = b.imaging_index, a.imaging_index
+        return True
+
+    def reverse_imaging(self) -> None:
+        """Reverse the imaging route order."""
+        ordered = sorted((x for x in self.sections if x.imaging_index is not None),
+                         key=lambda x: x.imaging_index)
+        n = len(ordered)
+        for i, x in enumerate(ordered):
+            x.imaging_index = n - 1 - i
+
     # -- serialisation (frame-agnostic: serialises whatever is in the fields) --
     def to_dict(self) -> dict:
         return {

@@ -80,6 +80,33 @@ def test_project_ids_and_ordering():
     assert [s.id for s in p.in_imaging_order()] == ["section_3", "section_1"]
 
 
+def test_manual_order_editing():
+    p = WaferProject()
+    p.set_sections_from_polygons([SQUARE, SQUARE, SQUARE])
+    ids = [s.id for s in p.sections]                       # section_1,2,3
+    # serial order + match-graph order
+    for k, s in enumerate(p.sections):
+        s.serial_index = k
+    p.match_graph.order = list(ids)
+    assert p.swap_serial("section_1", "section_3")
+    assert p.get("section_1").serial_index == 2 and p.get("section_3").serial_index == 0
+    assert p.match_graph.order == ["section_3", "section_2", "section_1"]
+
+    # imaging route
+    for k, s in enumerate(p.sections):
+        s.imaging_index = k                                # 0,1,2
+    assert p.move_imaging("section_1", +1)                 # 0 -> swap with idx1
+    assert p.get("section_1").imaging_index == 1 and p.get("section_2").imaging_index == 0
+    p.reverse_imaging()
+    order = [s.id for s in p.in_imaging_order()]
+    assert order[0] == "section_3"                          # was last -> now first
+    assert p.drop_from_imaging("section_3")
+    assert p.get("section_3").imaging_index is None
+    # remaining compacted to 0..1
+    idxs = sorted(s.imaging_index for s in p.sections if s.imaging_index is not None)
+    assert idxs == [0, 1]
+
+
 def test_project_roundtrip():
     p = WaferProject(image_path="/tmp/wafer.czi")
     p.set_sections_from_polygons([SQUARE, SQUARE])
