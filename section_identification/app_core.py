@@ -121,3 +121,27 @@ class StimApp:
 
     def has_image(self) -> bool:
         return self.image_path is not None and self.overview is not None
+
+    # -- workflow-result persistence (sidecar, separate from the GUI autosave) --
+    def save_workflow(self):
+        """Persist QC/order/ROI/pose/match-graph to the workflow sidecar."""
+        if not self.has_image():
+            return
+        from . import project_io
+        self.sync_sections()
+        project_io.save(self.project, self.geom,
+                        path=project_io.workflow_path(self.image_path))
+
+    def load_workflow(self) -> bool:
+        """Restore saved workflow results onto the current sections (matched by
+        id). Returns True if a sidecar was found and merged."""
+        if not self.has_image():
+            return False
+        from . import project_io
+        src = project_io.load(self.image_path, self.geom,
+                              path=project_io.workflow_path(self.image_path))
+        if src is None:
+            return False
+        self.sync_sections()
+        self.project.apply_results(src)
+        return True

@@ -401,6 +401,28 @@ class WaferProject:
             qc_summary=dict(d.get("qc_summary", {})),
         )
 
+    def apply_results(self, source: "WaferProject") -> "WaferProject":
+        """Merge per-stage results from ``source`` into this project, matching
+        sections by ``id`` (geometry stays this project's — from the live layer).
+        Used to restore saved QC/order/ROI/pose state after a reload."""
+        by_id = {s.id: s for s in source.sections}
+        for t in self.sections:
+            s = by_id.get(t.id)
+            if s is None:
+                continue
+            t.qc = s.qc
+            t.serial_index = s.serial_index
+            t.imaging_index = s.imaging_index
+            t.roi = s.roi
+            t.focus_points = s.focus_points
+            t.accepted = s.accepted
+            if s.pose.center is not None:
+                t.pose = s.pose
+        self.match_graph = source.match_graph
+        self.roi_templates = source.roi_templates
+        self.qc_summary = source.qc_summary
+        return self
+
     @classmethod
     def from_legacy(cls, d: dict, to_overview) -> "WaferProject":
         """Build a project from a legacy (pre-wafer-model) project dict.

@@ -186,6 +186,7 @@ class StageQC(_StageBase):
         self.app.log(self.STAGE, f"done — {flagged} section(s) flagged.")
         self._recolor()
         self.table.refresh()
+        self.app.save_workflow()
 
     def _recolor(self):
         by = "qc_status" if self.cb_color.currentIndex() == 1 else "qc_score"
@@ -424,6 +425,7 @@ class StageROIs(_StageBase):
         layer_sync.show_rois(self.app)
         self.app.log(self.STAGE, f"propagated ROI (ref {ref.id}, fit={fit}) to "
                                  f"{sum(1 for s in self.app.project.sections if s.roi)} sections.")
+        self.app.save_workflow()
 
     # ---- CZI write ----
     def _tile_region_specs(self):
@@ -531,6 +533,7 @@ class StageReorder(_StageBase):
         layer_sync.show_serial_chain(self.app)
         self.table.refresh()
         self.app.log(self.STAGE, f"serial order recovered ({len(order)} sections).")
+        self.app.save_workflow()
 
     def run_tsp(self):
         if not self._need_image():
@@ -554,6 +557,7 @@ class StageReorder(_StageBase):
         self.lbl_travel.setText(f"Route: {len(order)} stops, total travel "
                                 f"{total:,.0f} {unit}")
         self.app.log(self.STAGE, f"TSP route computed: {total:,.0f} {unit} travel.")
+        self.app.save_workflow()
 
     def export_wafer(self):
         if not self._need_image():
@@ -598,9 +602,15 @@ def attach_workflow(viewer, gui):
     tabs.addTab(_wrap(qc), "③ QC")
     tabs.addTab(_wrap(reorder), "④ Reorder")
 
+    loaded = {"for": None}
+
     def _on_tab(_i):
         try:
             app.sync_sections()
+            if app.has_image() and loaded["for"] != app.image_path:
+                if app.load_workflow():
+                    app.log("io", "restored saved workflow results.")
+                loaded["for"] = app.image_path
             table.refresh()
             rois.refresh_fiducials()
         except Exception:

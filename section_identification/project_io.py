@@ -35,6 +35,17 @@ def project_path(image_path: str) -> str:
                         f"{base}_stim_project.json")
 
 
+def workflow_path(image_path: str) -> str:
+    """Sidecar for the new wafer-workflow results (QC/order/ROI/match graph).
+
+    Separate from the legacy ``_stim_project.json`` the GUI autosaves, so the two
+    never clobber each other; section geometry comes from the legacy file / live
+    layer, and these results are merged back by section id on load."""
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    return os.path.join(f"{os.path.splitext(image_path)[0]}_files",
+                        f"{base}_stim_workflow.json")
+
+
 # --------------------------------------------------------------------------- #
 # overview <-> full-res converters (identity when geom is None)
 # --------------------------------------------------------------------------- #
@@ -110,13 +121,14 @@ def save(project: WaferProject, geom, path: str | None = None) -> str | None:
         return None
 
 
-def load(image_path: str, geom) -> WaferProject | None:
+def load(image_path: str, geom, path: str | None = None) -> WaferProject | None:
     """Load a project for ``image_path``. Returns a :class:`WaferProject` (with
     overview-px geometry) or None if no project file exists / parse fails.
-    Legacy files (no ``schema_version``) are migrated via ``from_legacy``."""
+    Legacy files (no ``schema_version``) are migrated via ``from_legacy``.
+    ``path`` overrides the default (e.g. the workflow sidecar)."""
     if image_path is None:
         return None
-    path = project_path(image_path)
+    path = path or project_path(image_path)
     if not os.path.isfile(path):
         return None
     try:

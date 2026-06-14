@@ -12,7 +12,8 @@ import tempfile
 import numpy as np
 
 from section_identification import project_io
-from section_identification.wafer_model import Roi, RoiTemplate, WaferProject
+from section_identification.wafer_model import (QCResult, Roi, RoiTemplate,
+                                                WaferProject)
 
 
 class _FakeGeom:
@@ -110,6 +111,42 @@ def _project_with_image(img):
     p = _project()
     p.image_path = img
     return p
+
+
+def test_apply_results_merge():
+    src = WaferProject()
+    src.set_sections_from_polygons([SQUARE, SQUARE])
+    src.sections[0].qc = QCResult(scores={"overall": 0.9}, flags={"any": True})
+    src.sections[0].serial_index = 0
+    src.sections[1].serial_index = 1
+    src.sections[0].imaging_index = 1
+    src.sections[1].imaging_index = 0
+    src.match_graph.order = ["section_1", "section_2"]
+
+    tgt = WaferProject()
+    tgt.set_sections_from_polygons([SQUARE, SQUARE])   # same ids, no results
+    tgt.apply_results(src)
+    assert tgt.sections[0].qc.flags["any"] is True
+    assert tgt.sections[0].serial_index == 0 and tgt.sections[1].imaging_index == 0
+    assert tgt.match_graph.order == ["section_1", "section_2"]
+
+
+def test_workflow_sidecar_roundtrip():
+    g = _FakeGeom()
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "wafer.czi")
+        p = _project_with_image(img)                    # has roi + serial_index=1
+        p.sections[0].qc = QCResult(scores={"overall": 0.7}, flags={"fold": True, "any": True})
+        project_io.save(p, g, path=project_io.workflow_path(img))
+        assert os.path.isfile(project_io.workflow_path(img))
+
+        fresh = WaferProject(image_path=img)
+        fresh.set_sections_from_polygons([SQUARE])      # same single section, no results
+        src = project_io.load(img, g, path=project_io.workflow_path(img))
+        fresh.apply_results(src)
+        assert fresh.sections[0].qc.flags["any"] is True
+        assert fresh.sections[0].serial_index == 1
+        assert fresh.sections[0].roi is not None
 
 
 def _run_all():
