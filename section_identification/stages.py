@@ -550,6 +550,14 @@ class StageReorder(_StageBase):
         self.btn_tsp = QPushButton("② Compute imaging route (TSP, min travel)")
         self.btn_tsp.clicked.connect(self.run_tsp)
         self.col.addWidget(self.btn_tsp)
+        self.btn_inspect = QPushButton("Inspect match: pick 2 sections")
+        self.btn_inspect.setToolTip("Then click two rows in the table — the SIFT "
+                                    "inlier correspondences are drawn between them.")
+        self.btn_inspect.clicked.connect(self._arm_inspect)
+        self.col.addWidget(self.btn_inspect)
+        self._inspect_armed = False
+        self._inspect_pick = []
+        self.table.add_select_listener(self._on_pair_pick)
         self.btn_heat = QPushButton("Show similarity heatmap")
         self.btn_heat.setToolTip("The SIFT inlier matrix, permuted by the recovered "
                                  "serial order — a correct ordering looks banded.")
@@ -636,6 +644,23 @@ class StageReorder(_StageBase):
                                 f"{total:,.0f} {unit}")
         self.app.log(self.STAGE, f"TSP route computed: {total:,.0f} {unit} travel.")
         self.app.save_workflow()
+
+    def _arm_inspect(self):
+        if not self._need_image():
+            return
+        self._inspect_armed = True
+        self._inspect_pick = []
+        self.app.log(self.STAGE, "match-inspect armed — click two sections in the table.")
+
+    def _on_pair_pick(self, section):
+        if not self._inspect_armed or section is None:
+            return
+        self._inspect_pick.append(section)
+        if len(self._inspect_pick) >= 2:
+            a, b = self._inspect_pick[0], self._inspect_pick[1]
+            self._inspect_armed = False
+            self._inspect_pick = []
+            layer_sync.show_pair_matches(self.app, a, b)
 
     def _show_heatmap(self):
         from . import reorder as reorder_mod

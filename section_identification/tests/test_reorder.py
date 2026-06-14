@@ -77,6 +77,24 @@ def test_sift_matches_rotated_copy_not_unrelated():
     assert same >= 8, same
 
 
+def test_matched_points_pairs():
+    if cv2 is None:
+        print("    (skip: cv2 missing)")
+        return
+    a = _texture(1)
+    M = cv2.getRotationMatrix2D((100, 100), 25.0, 1.0)
+    a_rot = cv2.warpAffine(a, M, (200, 200))
+    fa = reorder.sift_features(a)
+    fb = reorder.sift_features(a_rot)
+    ptsA, ptsB = reorder.matched_points(*fa, *fb)
+    assert len(ptsA) == len(ptsB) and len(ptsA) >= 6
+    assert ptsA.shape[1] == 2 and ptsB.shape[1] == 2
+    # an unrelated pair yields few/no inliers
+    pc = reorder.sift_features(_texture(77))
+    pA, pB = reorder.matched_points(*fa, *pc)
+    assert len(pA) < len(ptsA)
+
+
 def test_heatmap_image():
     sim = np.array([[0, 5, 1], [5, 0, 2], [1, 2, 0]], float)
     img = reorder.heatmap_image(sim)

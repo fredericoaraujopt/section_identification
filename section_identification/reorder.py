@@ -86,6 +86,35 @@ def pairwise_inliers(kp_a, desc_a, kp_b, desc_b, ratio: float = 0.75,
     return int(inliers.sum()) if inliers is not None else 0
 
 
+def matched_points(kp_a, desc_a, kp_b, desc_b, ratio: float = 0.75,
+                   min_matches: int = 4):
+    """Return ``(ptsA, ptsB)`` — the RANSAC-verified inlier keypoint pairs (crop
+    coords) between two sections, for drawing correspondences. Empty arrays if
+    too few matches."""
+    empty = (np.empty((0, 2), np.float32), np.empty((0, 2), np.float32))
+    if cv2 is None or desc_a is None or desc_b is None:
+        return empty
+    if len(desc_a) < 2 or len(desc_b) < 2:
+        return empty
+    good = []
+    for pair in _matcher().knnMatch(desc_a, desc_b, k=2):
+        if len(pair) < 2:
+            continue
+        m, n = pair
+        if m.distance < ratio * n.distance:
+            good.append(m)
+    if len(good) < min_matches:
+        return empty
+    pa = np.float32([kp_a[m.queryIdx] for m in good])
+    pb = np.float32([kp_b[m.trainIdx] for m in good])
+    _, inliers = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC,
+                                             ransacReprojThreshold=5.0)
+    if inliers is None:
+        return empty
+    mask = inliers.ravel().astype(bool)
+    return pa[mask], pb[mask]
+
+
 def similarity_matrix(features, ratio: float = 0.75, progress=None) -> np.ndarray:
     """Full symmetric inlier-count matrix for ``features`` (list of
     ``(kp_xy, desc)``). ``progress(done, total)`` is called per pair if given."""

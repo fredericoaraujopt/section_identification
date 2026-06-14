@@ -197,6 +197,50 @@ def show_matches(app):
         app.log("reorder", f"match overlay error: {e}")
 
 
+MATCH_INSPECT_LAYER = "③ Match inspect"
+
+
+def show_pair_matches(app, sec_a, sec_b, ratio: float = 0.75):
+    """Draw the SIFT inlier correspondences between two sections as lines on the
+    wafer (full-res crops, recomputed for just this pair). The richest reorder
+    diagnostic: see exactly which features tie two sections together."""
+    viewer = app.viewer
+    _remove(viewer, MATCH_INSPECT_LAYER)
+    if sec_a is None or sec_b is None or sec_a is sec_b or not app.has_image():
+        return
+    try:
+        from . import crops, reorder
+        geom = app.geom
+        ga, _, (ax0, ay0, asc) = crops.read_section_crop(
+            app.image_path, geom, sec_a.polygon, overview=app.overview, full_res=True)
+        gb, _, (bx0, by0, bsc) = crops.read_section_crop(
+            app.image_path, geom, sec_b.polygon, overview=app.overview, full_res=True)
+        kpa, da = reorder.sift_features(ga)
+        kpb, db = reorder.sift_features(gb)
+        pa, pb = reorder.matched_points(kpa, da, kpb, db, ratio)
+        if len(pa) == 0:
+            app.log("reorder", f"no inlier matches between {sec_a.id} and {sec_b.id}.")
+            return
+
+        def _to_overview(pts, x0, y0, sc):
+            fx = x0 + pts[:, 0] / sc
+            fy = y0 + pts[:, 1] / sc
+            if geom is not None:
+                ox, oy = geom.full_to_ds(fx, fy)
+                return np.column_stack([np.ravel(ox), np.ravel(oy)])
+            return np.column_stack([fx, fy])
+
+        a_ov = _to_overview(pa, ax0, ay0, asc)
+        b_ov = _to_overview(pb, bx0, by0, bsc)
+        lines = [np.array([[a_ov[i, 1], a_ov[i, 0]], [b_ov[i, 1], b_ov[i, 0]]])
+                 for i in range(len(a_ov))]
+        viewer.add_shapes(lines, shape_type="line", name=MATCH_INSPECT_LAYER,
+                          edge_color="magenta", edge_width=1.0, scale=app.layer_scale())
+        app.log("reorder", f"{len(lines)} inlier matches: {sec_a.id} ↔ {sec_b.id}.")
+    except Exception as e:
+        app.log("reorder", f"match-inspect error: {e}")
+
+
 def show_serial_chain(app):
     viewer = app.viewer
     _remove(viewer, CHAIN_LAYER)
