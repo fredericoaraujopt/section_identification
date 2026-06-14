@@ -361,6 +361,44 @@ def read_tile_regions(xml_str: str) -> list[dict]:
     return out
 
 
+def read_acquisition_overview(image_path: str, geom) -> dict:
+    """Read existing ZEN TileRegions + focus SupportPoints from a CZI and convert
+    them to **overview pixels** (via ``geom``) for display on load. Returns
+    ``{"focus_points": [(x_ov, y_ov, z_um), ...], "regions": [{name, polygon_overview,
+    cols, rows}, ...]}``. Stage-µm points without a geom anchor are skipped.
+    """
+    if geom is None:
+        return {"focus_points": [], "regions": []}
+    regions = read_tile_regions(_read_metadata_xml(image_path))
+
+    def _um_to_overview(x_um, y_um):
+        f = geom.stage_um_to_full(np.asarray([x_um]), np.asarray([y_um]))
+        if f is None:
+            return None
+        ox, oy = geom.full_to_ds(np.ravel(f[0]), np.ravel(f[1]))
+        return float(np.ravel(ox)[0]), float(np.ravel(oy)[0])
+
+    focus, out_regions = [], []
+    for r in regions:
+        for (xu, yu, zu) in r.get("support_points", []):
+            ov = _um_to_overview(xu, yu)
+            if ov is not None:
+                focus.append((ov[0], ov[1], float(zu)))
+        c, sz = r.get("center_um"), r.get("contour_um")
+        if c and sz:
+            (cx, cy), (w, h) = c, sz
+            poly = []
+            for (xu, yu) in [(cx - w / 2, cy - h / 2), (cx + w / 2, cy - h / 2),
+                             (cx + w / 2, cy + h / 2), (cx - w / 2, cy + h / 2)]:
+                ov = _um_to_overview(xu, yu)
+                if ov is not None:
+                    poly.append([ov[0], ov[1]])
+            if len(poly) == 4:
+                out_regions.append({"name": r.get("name"), "polygon_overview": poly,
+                                    "cols": r.get("columns"), "rows": r.get("rows")})
+    return {"focus_points": focus, "regions": out_regions}
+
+
 # --------------------------------------------------------------------------- #
 # GeoJSON sidecar (pixel + optional stage microns)
 # --------------------------------------------------------------------------- #

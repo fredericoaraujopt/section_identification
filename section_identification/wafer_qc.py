@@ -220,6 +220,58 @@ def detect_chatter(gray, mask):
 # --------------------------------------------------------------------------- #
 # combined per-section scoring
 # --------------------------------------------------------------------------- #
+def feature_maps(gray, mask) -> dict:
+    """Return the intermediate maps each detector produces, for on-wafer
+    visualisation (the visually-guided principle): the Frangi ridge map (folds),
+    the bright-outlier mask + LoG blobs (debris), the connected-component label
+    map (shred), and the windowed log power spectrum (chatter). All crop-sized
+    except ``spectrum`` (bbox-sized) and ``blobs`` (``Nx3`` y,x,r). Pure arrays —
+    the GUI overlays them; this is unit-testable on a synthetic crop.
+    """
+    g = _as_gray_float(gray)
+    m = np.asarray(mask, bool)
+    gn = (g - g.min()) / (np.ptp(g) or 1.0)
+
+    ridges = frangi(gn, black_ridges=True) * m
+
+    if m.sum() >= 16:
+        inside = g[m]
+        med = np.median(inside)
+        mad = np.median(np.abs(inside - med)) or 1.0
+        bright = (g > med + qc_defaults()["mad_k"] * mad) & m
+    else:
+        bright = np.zeros_like(m)
+    try:
+        blobs = blob_log(gn * m, max_sigma=8, num_sigma=5, threshold=0.12)
+    except Exception:
+        blobs = np.empty((0, 3))
+
+    labels = label((m).astype(np.uint8))
+
+    spectrum = np.zeros((1, 1))
+    if m.sum() >= 256:
+        ys, xs = np.where(m)
+        crop = g[ys.min():ys.max() + 1, xs.min():xs.max() + 1].astype(float)
+        if min(crop.shape) >= 16:
+            crop = crop - crop.mean()
+            P = np.abs(np.fft.fftshift(np.fft.fft2(crop * window("hann", crop.shape)))) ** 2
+            spectrum = np.log1p(P)
+
+    return {"ridges": ridges, "bright": bright, "blobs": blobs,
+            "labels": labels, "spectrum": spectrum}
+
+
+def dominant_flag(qc_result: dict) -> str | None:
+    """The flag with the highest score (for choosing which diagnostic to show)."""
+    if not qc_result:
+        return None
+    scores = {k: v for k, v in qc_result.get("scores", {}).items() if k != "overall"}
+    flags = qc_result.get("flags", {})
+    flagged = {k: scores.get(k, 0.0) for k, on in flags.items() if on and k != "any"}
+    pool = flagged or scores
+    return max(pool, key=pool.get) if pool else None
+
+
 def score_section(gray, mask, refs: dict | None = None) -> dict:
     """Run all detectors and return a QC result dict (scores/flags/features)
     matching :class:`wafer_model.QCResult`'s fields."""

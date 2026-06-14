@@ -17,12 +17,12 @@ import math
 import os
 
 import numpy as np
-from qtpy.QtWidgets import (QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
-                            QProgressBar, QPushButton, QScrollArea, QSpinBox,
-                            QTabWidget, QVBoxLayout, QWidget)
+from qtpy.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout,
+                            QLabel, QProgressBar, QPushButton, QScrollArea,
+                            QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
-from . import (compute_broker, czi_export, imaging_path, layer_sync, roi as roi_mod,
-               wafer_export)
+from . import (compute_broker, czi_export, export as legacy_export, imaging_path,
+               layer_sync, roi as roi_mod, wafer_export)
 from .app_core import StimApp
 from .nav import FovNavigator
 from .section_table import SectionTableDock
@@ -33,6 +33,38 @@ from .worker_harness import StreamWorker
 def _napari_to_xy(poly_yx):
     p = np.asarray(poly_yx, float).reshape(-1, 2)
     return p[:, ::-1]
+
+
+def build_tile_region_specs(project, geom, tile_um, fc, fr, z):
+    """ZEN TileRegion specs (stage µm) for every section's ROI, ORDERED BY
+    imaging (TSP) order so the region Id sequence == the acquisition route (ZEN
+    images by Id). Returns ``(specs, mfov_counts_by_id)``. Empty without geom."""
+    if geom is None:
+        return [], {}
+    tile = float(tile_um) or 50.0
+    specs, counts = [], {}
+    for i, s in enumerate(project.in_imaging_order(), start=1):
+        if not s.roi or len(s.roi.polygon) < 3:
+            continue
+        ra = np.asarray(s.roi.polygon, float).reshape(-1, 2)
+        fx, fy = geom.ds_to_full(ra[:, 0], ra[:, 1])
+        su = geom.full_to_stage_um(np.ravel(fx), np.ravel(fy))
+        if su is None:
+            continue
+        sx, sy = np.ravel(su[0]), np.ravel(su[1])
+        x0, y0, x1, y1 = sx.min(), sy.min(), sx.max(), sy.max()
+        w, h = max(x1 - x0, tile), max(y1 - y0, tile)
+        cols, rows = max(1, math.ceil(w / tile)), max(1, math.ceil(h / tile))
+        sps = [(x0 + (a + 0.5) / fc * w, y0 + (b + 0.5) / fr * h, z)
+               for b in range(fr) for a in range(fc)]
+        specs.append({
+            "center_um": ((x0 + x1) / 2, (y0 + y1) / 2), "contour_um": (w, h),
+            "columns": cols, "rows": rows, "z_um": z, "support_points": sps,
+            "id": i,
+            "name": f"{czi_export.TILE_REGION_PREFIX}{i:03d}_{wafer_export.serial_name(s)}",
+        })
+        counts[s.id] = cols * rows
+    return specs, counts
 
 
 class _StageBase(QWidget):
@@ -80,6 +112,13 @@ class StageQC(_StageBase):
         self.cb_color.currentIndexChanged.connect(self._recolor)
         row.addWidget(self.cb_color)
         self.col.addLayout(row)
+        self.chk_diag = QCheckBox("Show diagnostic overlay for the selected section")
+        self.chk_diag.setToolTip("On click in the section table, overlay the feature "
+                                 "map that produced its dominant flag (ridges/blobs/"
+                                 "components) so you see WHY it was flagged.")
+        self.chk_diag.toggled.connect(self._toggle_diag)
+        self.col.addWidget(self.chk_diag)
+        self.table.add_select_listener(self._on_select)
         self.lbl = QLabel("Scores each detected section on a downscaled crop and "
                           "colours the wafer by severity. Tune thresholds, then "
                           "re-colour instantly (raw features are cached).")
@@ -87,6 +126,14 @@ class StageQC(_StageBase):
         self.col.addWidget(self.lbl)
         self.col.addWidget(self.progress)
         self.col.addStretch(1)
+
+    def _on_select(self, section):
+        if self.chk_diag.isChecked():
+            layer_sync.show_qc_diagnostic(self.app, section)
+
+    def _toggle_diag(self, on):
+        if not on:
+            layer_sync.clear_qc_diagnostic(self.app)
 
     def run_qc(self):
         if not self._need_image() or self.worker.is_running():
@@ -141,6 +188,13 @@ class StageROIs(_StageBase):
         super().__init__(app, nav, table)
         self.col.addWidget(QLabel("<b>ROIs</b> — define once, propagate to every "
                                   "section, write mFOVs for ZEN"))
+        self.lbl_fid = QLabel("")
+        self.lbl_fid.setWordWrap(True)
+        self.col.addWidget(self.lbl_fid)
+        b0 = QPushButton("Read existing mFOVs + focus points from CZI")
+        b0.clicked.connect(self._read_existing)
+        self.col.addWidget(b0)
+
         b1 = QPushButton("① New ROI draft layer (draw one polygon)")
         b1.clicked.connect(self._new_draft)
         self.col.addWidget(b1)
@@ -194,6 +248,40 @@ class StageROIs(_StageBase):
         self.lbl.setWordWrap(True)
         self.col.addWidget(self.lbl)
         self.col.addStretch(1)
+        self.refresh_fiducials()
+
+    def refresh_fiducials(self):
+        """Recommend marking fiducials when none are on file (anchors stage-µm
+        export). Reads the existing GUI's Fiducials layer."""
+        n = 0
+        try:
+            fl = getattr(self.app.gui, "fid_layer", None)
+            n = 0 if fl is None else len(fl.data)
+        except Exception:
+            n = 0
+        if n == 0:
+            self.lbl_fid.setText("⚠ No fiducials on file — recommended before export. "
+                                 "Import them in the Sections tab (CZI Shuttle & Find) "
+                                 "or place with the 'm' key in the manual editor.")
+            self.lbl_fid.setStyleSheet("QLabel{background:#3a2a16;padding:6px;border-radius:4px;}")
+        else:
+            self.lbl_fid.setText(f"Fiducials on file: {n}.")
+            self.lbl_fid.setStyleSheet("QLabel{background:#16241a;padding:6px;border-radius:4px;}")
+
+    def _read_existing(self):
+        from . import czi_io
+        if not self._need_image():
+            return
+        if not czi_io.is_czi(self.app.image_path) or self.app.geom is None:
+            self.app.log(self.STAGE, "existing mFOV/focus read needs a CZI with geometry.")
+            return
+        try:
+            data = czi_export.read_acquisition_overview(self.app.image_path, self.app.geom)
+            layer_sync.show_existing_acquisition(self.app, data)
+            self.app.log(self.STAGE, f"read {len(data['focus_points'])} focus points, "
+                                     f"{len(data['regions'])} mFOV region(s) from CZI.")
+        except Exception as e:
+            self.app.log(self.STAGE, f"read existing acquisition failed: {e}")
 
     def _new_draft(self):
         v = self.app.viewer
@@ -254,7 +342,8 @@ class StageROIs(_StageBase):
         tmpl = roi_mod.template_from_polygon(ref.pose, roi_xy, ref_section_id=ref.id,
                                              fit_mode=fit, fit_percent=self.sp_pct.value(),
                                              focus_cols=self.sp_fc.value(),
-                                             focus_rows=self.sp_fr.value())
+                                             focus_rows=self.sp_fr.value(),
+                                             tile_um=(self.sp_tile.value(), self.sp_tile.value()))
         self.app.project.roi_templates = [tmpl]
         roi_mod.propagate_all(tmpl, self.app.project.sections)
         layer_sync.show_rois(self.app)
@@ -267,32 +356,9 @@ class StageROIs(_StageBase):
         if geom is None:
             self.app.log(self.STAGE, "CZI geometry required to write stage-µm mFOVs.")
             return []
-        tile = float(self.sp_tile.value())
-        fc, fr, z = self.sp_fc.value(), self.sp_fr.value(), float(self.sp_z.value())
-        specs = []
-        for s in self.app.project.sections:
-            if not s.roi or len(s.roi.polygon) < 3:
-                continue
-            ra = np.asarray(s.roi.polygon, float).reshape(-1, 2)
-            fx, fy = geom.ds_to_full(ra[:, 0], ra[:, 1])
-            su = geom.full_to_stage_um(np.ravel(fx), np.ravel(fy))
-            if su is None:
-                continue
-            sx, sy = np.ravel(su[0]), np.ravel(su[1])
-            x0, y0, x1, y1 = sx.min(), sy.min(), sx.max(), sy.max()
-            w, h = max(x1 - x0, tile), max(y1 - y0, tile)
-            cols = max(1, math.ceil(w / tile))
-            rows = max(1, math.ceil(h / tile))
-            sps = []
-            for j in range(fr):
-                for i in range(fc):
-                    fxp = x0 + (i + 0.5) / fc * w
-                    fyp = y0 + (j + 0.5) / fr * h
-                    sps.append((fxp, fyp, z))
-            specs.append({"center_um": ((x0 + x1) / 2, (y0 + y1) / 2),
-                          "contour_um": (w, h), "columns": cols, "rows": rows,
-                          "z_um": z, "support_points": sps,
-                          "name": f"{czi_export.TILE_REGION_PREFIX}{s.id}"})
+        specs, _ = build_tile_region_specs(
+            self.app.project, geom, self.sp_tile.value(),
+            self.sp_fc.value(), self.sp_fr.value(), float(self.sp_z.value()))
         return specs
 
     def _write_czi(self):
@@ -336,6 +402,9 @@ class StageReorder(_StageBase):
         self.btn_tsp = QPushButton("② Compute imaging route (TSP, min travel)")
         self.btn_tsp.clicked.connect(self.run_tsp)
         self.col.addWidget(self.btn_tsp)
+        self.btn_export = QPushButton("③ Export wafer manifest + mVis (region_names.csv)")
+        self.btn_export.clicked.connect(self.export_wafer)
+        self.col.addWidget(self.btn_export)
         self.lbl = QLabel("SIFT matches every section pair (rotation-invariant) "
                           "and recovers the slice series; TSP then orders imaging "
                           "to minimise stage travel. On CZI export, IDs are "
@@ -411,6 +480,26 @@ class StageReorder(_StageBase):
                                 f"{total:,.0f} {unit}")
         self.app.log(self.STAGE, f"TSP route computed: {total:,.0f} {unit} travel.")
 
+    def export_wafer(self):
+        if not self._need_image():
+            return
+        proj = self.app.sync_sections()
+        geom = self.app.geom
+        counts = {}
+        tmpl = proj.roi_templates[0] if proj.roi_templates else None
+        if tmpl is not None and tmpl.tile_um and geom is not None:
+            _, counts = build_tile_region_specs(proj, geom, tmpl.tile_um[0],
+                                                tmpl.focus_cols, tmpl.focus_rows, 0.0)
+        manifest = wafer_export.build_manifest(proj, geom, mfov_counts=counts)
+        try:
+            out_dir = legacy_export.resolve_export_dir(self.app.image_path, None)
+        except Exception:
+            out_dir = os.path.dirname(self.app.image_path or ".")
+        paths = wafer_export.write_all(
+            manifest, out_dir, adapters=["json_manifest", "csv_table", "mvis_lmb"])
+        self.app.log(self.STAGE, f"wafer exported (IDs in imaging order): "
+                                 f"{[os.path.basename(p) for p in paths.values()]}")
+
 
 # --------------------------------------------------------------------------- #
 # tab shell
@@ -438,6 +527,7 @@ def attach_workflow(viewer, gui):
         try:
             app.sync_sections()
             table.refresh()
+            rois.refresh_fiducials()
         except Exception:
             pass
     tabs.currentChanged.connect(_on_tab)

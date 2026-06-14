@@ -72,6 +72,45 @@ def apply_qc_colors(app, by: str = "qc_score"):
         app.log("qc", f"colour error: {e}")
 
 
+QC_DIAG_LAYER = "③ QC diagnostic"
+
+
+def show_qc_diagnostic(app, section):
+    """Overlay the feature map that produced a section's dominant QC flag (Frangi
+    ridges for folds, bright-outlier mask for debris, components for shredding),
+    placed over that section so the user *sees why* it was flagged. Best-effort.
+    """
+    viewer = app.viewer
+    _remove(viewer, QC_DIAG_LAYER)
+    if section is None or section.qc is None or not app.has_image():
+        return
+    try:
+        from . import crops, wafer_qc
+        flag = wafer_qc.dominant_flag(section.qc.to_dict())
+        gray, mask, (x0, y0, cs) = crops.read_section_crop(
+            app.image_path, app.geom, section.polygon, overview=app.overview,
+            full_res=False, target_long_side=640)
+        fm = wafer_qc.feature_maps(gray, mask)
+        if flag == "debris":
+            mp, cmap = fm["bright"].astype(float), "red"
+        elif flag == "shred":
+            mp, cmap = (fm["labels"] > 0).astype(float), "cyan"
+        else:                                   # fold (default) / chatter -> ridges
+            mp, cmap = fm["ridges"].astype(float), "red"
+        if mp.max() <= 0:
+            return
+        # world == full-res px; 1 crop px = 1/cs world; crop origin at (y0, x0).
+        viewer.add_image(mp, name=QC_DIAG_LAYER, colormap=cmap, blending="additive",
+                         opacity=0.8, scale=(1.0 / cs, 1.0 / cs), translate=(y0, x0))
+        app.log("qc", f"{section.id}: dominant flag = {flag}")
+    except Exception as e:
+        app.log("qc", f"diagnostic overlay error: {e}")
+
+
+def clear_qc_diagnostic(app):
+    _remove(app.viewer, QC_DIAG_LAYER)
+
+
 def clear_qc_colors(app):
     layer = getattr(app.gui, "shapes_layer", None)
     if layer is None:
@@ -99,6 +138,38 @@ def show_rois(app):
                           edge_width=2, scale=app.layer_scale())
     except Exception as e:
         app.log("rois", f"overlay error: {e}")
+
+
+EXIST_FOCUS = "Focus support points (CZI)"
+EXIST_MFOV = "Existing mFOVs (CZI)"
+
+
+def show_existing_acquisition(app, data):
+    """Display focus support points + existing mFOV regions read from a CZI
+    (already converted to overview px by czi_export.read_acquisition_overview)."""
+    viewer = app.viewer
+    _remove(viewer, EXIST_FOCUS)
+    _remove(viewer, EXIST_MFOV)
+    fp = data.get("focus_points", [])
+    if fp:
+        pts = np.array([[y, x] for (x, y, _z) in fp])
+        zs = [round(float(z), 1) for (_x, _y, z) in fp]
+        try:
+            viewer.add_points(pts, name=EXIST_FOCUS, size=5, face_color="yellow",
+                              scale=app.layer_scale(), features={"z": zs},
+                              text={"string": "{z}", "size": 7, "color": "yellow",
+                                    "anchor": "upper_left"})
+        except Exception as e:
+            app.log("rois", f"focus-point overlay error: {e}")
+    regs = [_xy_to_yx(r["polygon_overview"]) for r in data.get("regions", [])
+            if len(r.get("polygon_overview", [])) >= 3]
+    if regs:
+        try:
+            viewer.add_shapes(regs, shape_type="polygon", name=EXIST_MFOV,
+                              edge_color="lime", face_color="transparent",
+                              edge_width=2, scale=app.layer_scale())
+        except Exception as e:
+            app.log("rois", f"mFOV overlay error: {e}")
 
 
 # --------------------------------------------------------------------------- #

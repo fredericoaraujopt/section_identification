@@ -35,12 +35,25 @@ class SectionTableDock(QWidget):
             pass
         self.table.cellClicked.connect(self._on_click)
         lay.addWidget(self.table)
+        self._listeners = []
+
+    def add_select_listener(self, fn):
+        """Register ``fn(section)`` called when a row is selected (stages use this
+        to show per-section diagnostics)."""
+        self._listeners.append(fn)
 
     def _on_click(self, row, _col):
+        secs = self.app.project.sections
+        section = secs[row] if 0 <= row < len(secs) else None
         try:
             self.nav.go_to_index(row, keep_fov=True)
         except Exception:
             pass
+        for fn in self._listeners:
+            try:
+                fn(section)
+            except Exception:
+                pass
 
     def _fmt(self, v, nd=2):
         return "" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))

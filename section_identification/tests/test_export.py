@@ -110,6 +110,22 @@ def test_manifest_and_adapters():
         assert rows[2] == "003; S1; 1", rows
 
 
+def test_read_acquisition_on_real_czi():
+    """Guarded: only runs if a local CZI with TileRegions is present."""
+    import os
+    p = "images_local/mSEM706/M411_before_HVC.czi"
+    if not os.path.exists(p):
+        print("    (skip: real CZI not present)")
+        return
+    from section_identification import czi_io
+    _, geom, _ = czi_io.read_czi_overview(p, target_long_side=2048)
+    data = czi_export.read_acquisition_overview(p, geom)
+    assert len(data["focus_points"]) >= 1
+    assert len(data["regions"]) >= 1
+    # overview coords are finite numbers
+    assert all(np.isfinite(v) for v in data["focus_points"][0])
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

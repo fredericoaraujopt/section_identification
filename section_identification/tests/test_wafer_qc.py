@@ -89,6 +89,26 @@ def test_shred_fires():
     assert res["flags"]["shred"] is True, (res["scores"], res["features"])
 
 
+def test_feature_maps_shapes_and_content():
+    gray, mask = _clean()
+    c = SIZE // 2
+    gray[c - 1:c + 2, :][mask[c - 1:c + 2, :]] = 30.0      # inject a fold
+    fm = qc.feature_maps(gray, mask)
+    assert fm["ridges"].shape == gray.shape
+    assert fm["ridges"].max() > 0                           # fold lit up the ridge map
+    assert fm["bright"].shape == mask.shape
+    assert fm["labels"].shape == mask.shape
+    assert fm["spectrum"].ndim == 2
+    assert fm["blobs"].ndim == 2 and fm["blobs"].shape[1] == 3
+
+
+def test_dominant_flag():
+    res = {"scores": {"debris": 0.1, "fold": 0.8, "shred": 0.0, "chatter": 0.2, "overall": 0.8},
+           "flags": {"debris": False, "fold": True, "shred": False, "chatter": False, "any": True}}
+    assert qc.dominant_flag(res) == "fold"
+    assert qc.dominant_flag({}) is None
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
