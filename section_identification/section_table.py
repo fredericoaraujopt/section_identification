@@ -10,7 +10,9 @@ Plain QTableWidget (robust, no model wiring) — adequate for a few hundred rows
 
 from __future__ import annotations
 
-from qtpy.QtWidgets import (QAbstractItemView, QHeaderView, QTableWidget,
+from qtpy.QtGui import QImage, QPixmap
+from qtpy.QtWidgets import (QAbstractItemView, QDialog, QHeaderView, QHBoxLayout,
+                            QLabel, QPushButton, QScrollArea, QTableWidget,
                             QTableWidgetItem, QVBoxLayout, QWidget)
 
 COLUMNS = ["#", "id", "QC", "debris", "fold", "shred", "chatter",
@@ -24,6 +26,15 @@ class SectionTableDock(QWidget):
         self.nav = nav
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
+        bar = QHBoxLayout()
+        self.btn_gallery = QPushButton("Aligned gallery")
+        self.btn_gallery.setToolTip("Montage of every section rotated to its "
+                                    "canonical pose — scan for mis-detections.")
+        self.btn_gallery.clicked.connect(self._show_gallery)
+        bar.addWidget(self.btn_gallery)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+        self._gallery_dlg = None
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -54,6 +65,35 @@ class SectionTableDock(QWidget):
                 fn(section)
             except Exception:
                 pass
+
+    def _show_gallery(self):
+        if not self.app.has_image():
+            self.app.log("gallery", "load an image and detect sections first.")
+            return
+        try:
+            self.app.sync_sections()
+            from . import gallery
+            mont, n, total = gallery.build_gallery(self.app)
+            if mont.size <= 1:
+                self.app.log("gallery", "no sections to show.")
+                return
+            h, w = mont.shape
+            mont = mont.copy()                     # contiguous for QImage
+            img = QImage(mont.data, w, h, w, QImage.Format_Grayscale8)
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"Aligned section gallery ({n} of {total})")
+            dl = QVBoxLayout(dlg)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            label = QLabel()
+            label.setPixmap(QPixmap.fromImage(img))
+            scroll.setWidget(label)
+            dl.addWidget(scroll)
+            dlg.resize(min(1000, w + 40), min(800, h + 40))
+            self._gallery_dlg = dlg                # keep a reference
+            dlg.show()
+        except Exception as e:
+            self.app.log("gallery", f"gallery error: {e}")
 
     def _fmt(self, v, nd=2):
         return "" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))

@@ -19,10 +19,10 @@ import os
 import numpy as np
 from qtpy.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout,
                             QLabel, QProgressBar, QPushButton, QScrollArea,
-                            QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+                            QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 from . import (compute_broker, czi_export, export as legacy_export, imaging_path,
-               layer_sync, roi as roi_mod, wafer_export)
+               layer_sync, roi as roi_mod, stage_help, wafer_export)
 from .app_core import StimApp
 from .nav import FovNavigator
 from .section_table import SectionTableDock
@@ -79,6 +79,22 @@ class _StageBase(QWidget):
         self.col.setSpacing(6)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
+        self._help_dlg = None
+
+    def _header(self, title_html: str):
+        """A stage title row with a '❔' help button (opens stage_help)."""
+        row = QHBoxLayout()
+        row.addWidget(QLabel(title_html))
+        row.addStretch(1)
+        btn = QPushButton("❔")
+        btn.setFixedWidth(28)
+        btn.setToolTip("What this stage does and how to use it.")
+        btn.clicked.connect(self._show_help)
+        row.addWidget(btn)
+        self.col.addLayout(row)
+
+    def _show_help(self):
+        self._help_dlg = stage_help.show_help(self, self.STAGE)
 
     def _need_image(self) -> bool:
         if not self.app.has_image():
@@ -101,8 +117,7 @@ class StageQC(_StageBase):
 
     def __init__(self, app, nav, table):
         super().__init__(app, nav, table)
-        self.col.addWidget(QLabel("<b>Quality control</b> — debris · folds · "
-                                  "shredding · chattering"))
+        self._header("<b>Quality control</b> — debris · folds · shredding · chattering")
         row = QHBoxLayout()
         self.btn_run = QPushButton("Run QC")
         self.btn_run.clicked.connect(self.run_qc)
@@ -186,8 +201,8 @@ class StageROIs(_StageBase):
 
     def __init__(self, app, nav, table):
         super().__init__(app, nav, table)
-        self.col.addWidget(QLabel("<b>ROIs</b> — define once, propagate to every "
-                                  "section, write mFOVs for ZEN"))
+        self._header("<b>ROIs</b> — define once, propagate to every section, "
+                     "write mFOVs for ZEN")
         self.lbl_fid = QLabel("")
         self.lbl_fid.setWordWrap(True)
         self.col.addWidget(self.lbl_fid)
@@ -394,8 +409,8 @@ class StageReorder(_StageBase):
 
     def __init__(self, app, nav, table):
         super().__init__(app, nav, table)
-        self.col.addWidget(QLabel("<b>Reorder</b> — recover serial order (SIFT) · "
-                                  "imaging route (TSP)"))
+        self._header("<b>Reorder</b> — recover serial order (SIFT) · "
+                     "imaging route (TSP)")
         self.btn_sift = QPushButton("① Compute serial order (full-res SIFT)")
         self.btn_sift.clicked.connect(self.run_sift)
         self.col.addWidget(self.btn_sift)
@@ -532,8 +547,15 @@ def attach_workflow(viewer, gui):
             pass
     tabs.currentChanged.connect(_on_tab)
 
+    # shared footer log so messages mirror across all tabs (not just Sections)
+    log_widget = QTextEdit()
+    log_widget.setReadOnly(True)
+    log_widget.setMinimumHeight(70)
+    app.add_log_sink(lambda line: log_widget.append(line))
+
     viewer.window.add_dock_widget(tabs, name="STiM", area="right")
     viewer.window.add_dock_widget(table, name="Sections", area="bottom")
+    viewer.window.add_dock_widget(log_widget, name="Workflow log", area="bottom")
     return app
 
 

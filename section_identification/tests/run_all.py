@@ -15,7 +15,7 @@ import warnings
 
 MODULES = [
     "wafer_model", "project_io", "fov_nav", "align", "imaging_path",
-    "roi", "wafer_qc", "reorder", "export", "worker_protocol",
+    "roi", "wafer_qc", "reorder", "export", "worker_protocol", "gallery",
 ]
 
 

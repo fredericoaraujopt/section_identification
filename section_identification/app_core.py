@@ -24,6 +24,7 @@ class StimApp:
     def __init__(self, gui):
         self.gui = gui
         self.project = WaferProject()
+        self._log_sinks = []        # extra log targets (e.g. the shared footer log)
 
     # -- passthrough state --
     @property
@@ -57,11 +58,22 @@ class StimApp:
         except Exception:
             return 4096
 
+    def add_log_sink(self, fn):
+        """Register an extra ``fn(line)`` target (the shared footer log) so log
+        messages mirror across all tabs, not just the Sections-tab log."""
+        self._log_sinks.append(fn)
+
     def log(self, stage: str, msg: str):
+        line = f"[{stage}] {msg}"
         try:
-            self.gui.log_msg(f"[{stage}] {msg}")
+            self.gui.log_msg(line)
         except Exception:
-            print(f"[{stage}] {msg}")
+            print(line)
+        for fn in self._log_sinks:
+            try:
+                fn(line)
+            except Exception:
+                pass
 
     # -- sections <-> project --
     def section_polygons(self):
