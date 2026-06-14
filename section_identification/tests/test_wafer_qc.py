@@ -102,6 +102,34 @@ def test_feature_maps_shapes_and_content():
     assert fm["blobs"].ndim == 2 and fm["blobs"].shape[1] == 3
 
 
+def test_rethreshold_uses_cached_severity():
+    gray, mask = _clean()
+    c = SIZE // 2
+    gray[c - 1:c + 2, :][mask[c - 1:c + 2, :]] = 30.0   # fold
+    res = qc.score_section(gray, mask)
+    assert "fold_severity" in res["features"]
+    sev = res["features"]["fold_severity"]
+    # tighten the fold reference -> higher score, no recompute
+    tight = qc.rethreshold(res, {"fold_ref": sev / 4.0})
+    assert tight["scores"]["fold"] >= res["scores"]["fold"]
+    assert tight["flags"]["fold"] is True
+    # loosen it -> lower score / unflag
+    loose = qc.rethreshold(res, {"fold_ref": sev * 100.0})
+    assert loose["scores"]["fold"] < tight["scores"]["fold"]
+
+
+def test_calibrate_qc_from_population():
+    # population with one clear fold outlier
+    pop = []
+    for s in (0.1, 0.1, 0.1, 0.1, 2.0):
+        pop.append({"features": {"debris_severity": 0.0, "fold_severity": s,
+                                 "shred_severity": 0.0, "chatter_severity": 0.0}})
+    refs = qc.calibrate_qc(pop, percentile=80.0)
+    assert "fold_ref" in refs
+    # 80th percentile of folds sits between the cluster (0.1) and the outlier (2.0)
+    assert 0.1 < refs["fold_ref"] < 2.0
+
+
 def test_dominant_flag():
     res = {"scores": {"debris": 0.1, "fold": 0.8, "shred": 0.0, "chatter": 0.2, "overall": 0.8},
            "flags": {"debris": False, "fold": True, "shred": False, "chatter": False, "any": True}}

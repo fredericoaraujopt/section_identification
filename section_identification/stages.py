@@ -19,9 +19,9 @@ import os
 import numpy as np
 from qtpy.QtGui import QImage, QPixmap
 from qtpy.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                            QHBoxLayout, QLabel, QProgressBar, QPushButton,
-                            QScrollArea, QSpinBox, QTabWidget, QTextEdit,
-                            QVBoxLayout, QWidget)
+                            QFormLayout, QHBoxLayout, QLabel, QProgressBar,
+                            QPushButton, QScrollArea, QSpinBox, QTabWidget,
+                            QTextEdit, QVBoxLayout, QWidget)
 
 from . import (compute_broker, czi_export, export as legacy_export, imaging_path,
                layer_sync, roi as roi_mod, stage_help, wafer_export)
@@ -129,6 +129,27 @@ class StageQC(_StageBase):
         self.cb_color.currentIndexChanged.connect(self._recolor)
         row.addWidget(self.cb_color)
         self.col.addLayout(row)
+
+        # live thresholds: re-flag instantly from cached features (no recompute)
+        self._building = True
+        from .wafer_qc import qc_defaults
+        d = qc_defaults()
+        form = QFormLayout()
+        self.sp_debris = self._ref_spin(0, 1, 0.005, 3, d["debris_ref"])
+        self.sp_fold = self._ref_spin(0, 5, 0.05, 2, d["fold_ref"])
+        self.sp_shred = self._ref_spin(0, 5, 0.05, 2, d["shred_ref"])
+        self.sp_chatter = self._ref_spin(0, 50, 0.5, 1, d["chatter_ref"])
+        self.sp_flag = self._ref_spin(0, 1, 0.05, 2, d["flag"])
+        form.addRow("debris ref", self.sp_debris)
+        form.addRow("fold ref", self.sp_fold)
+        form.addRow("shred ref", self.sp_shred)
+        form.addRow("chatter ref", self.sp_chatter)
+        form.addRow("flag ≥", self.sp_flag)
+        self.col.addLayout(form)
+        btn_cal = QPushButton("Calibrate thresholds from population")
+        btn_cal.clicked.connect(self._calibrate)
+        self.col.addWidget(btn_cal)
+        self._building = False
         self.chk_diag = QCheckBox("Show diagnostic overlay for the selected section")
         self.chk_diag.setToolTip("On click in the section table, overlay the feature "
                                  "map that produced its dominant flag (ridges/blobs/"
@@ -143,6 +164,53 @@ class StageQC(_StageBase):
         self.col.addWidget(self.lbl)
         self.col.addWidget(self.progress)
         self.col.addStretch(1)
+
+    def _ref_spin(self, lo, hi, step, dec, val):
+        sp = QDoubleSpinBox()
+        sp.setRange(lo, hi)
+        sp.setSingleStep(step)
+        sp.setDecimals(dec)
+        sp.setValue(val)
+        sp.valueChanged.connect(self._on_ref_change)
+        return sp
+
+    def _refs(self) -> dict:
+        return {"debris_ref": self.sp_debris.value(), "fold_ref": self.sp_fold.value(),
+                "shred_ref": self.sp_shred.value(), "chatter_ref": self.sp_chatter.value(),
+                "flag": self.sp_flag.value()}
+
+    def _on_ref_change(self, *_):
+        if not self._building:
+            self._rethreshold_all()
+
+    def _rethreshold_all(self):
+        from .wafer_qc import rethreshold
+        refs = self._refs()
+        n = 0
+        for s in self.app.project.sections:
+            if s.qc is not None:
+                s.qc = QCResult(**rethreshold(s.qc.to_dict(), refs))
+                n += 1
+        if n:
+            self._recolor()
+            self.table.refresh()
+            self.app.save_workflow()
+
+    def _calibrate(self):
+        from .wafer_qc import calibrate_qc
+        qcs = [s.qc.to_dict() for s in self.app.project.sections if s.qc]
+        if not qcs:
+            self.app.log(self.STAGE, "run QC first, then calibrate from the results.")
+            return
+        refs = calibrate_qc(qcs)
+        self._building = True
+        self.sp_debris.setValue(refs["debris_ref"])
+        self.sp_fold.setValue(refs["fold_ref"])
+        self.sp_shred.setValue(refs["shred_ref"])
+        self.sp_chatter.setValue(refs["chatter_ref"])
+        self._building = False
+        self._rethreshold_all()
+        self.app.log(self.STAGE, f"calibrated thresholds from {len(qcs)} sections.")
 
     def _on_select(self, section):
         if self.chk_diag.isChecked():
@@ -165,7 +233,8 @@ class StageQC(_StageBase):
         spath = self.app.write_sections_tempfile()
         args = ["--image", self.app.image_path, "--sections", spath,
                 "--target", self.app.target_long_side(),
-                "--long-side", plan["working_long_side"]]
+                "--long-side", plan["working_long_side"],
+                "--refs", json.dumps(self._refs())]
         self.worker.start("qc_worker", args, handlers={
             "PROGRESS": lambda p: self._set_progress(p.get("done", 0), p.get("total", 0)),
             "QC": self._on_qc,

@@ -293,8 +293,62 @@ def score_section(gray, mask, refs: dict | None = None) -> dict:
     scores["overall"] = float(max(scores.values()))
     flags = {k: bool(v >= r["flag"]) for k, v in scores.items() if k != "overall"}
     flags["any"] = bool(any(flags.values()))
-    features = {**deb_f, **fold_f, **shred_f, **chat_f}
+    # store the raw per-detector SEVERITY so the GUI can re-threshold instantly
+    # (re-flag against new references) without re-running any detector.
+    features = {**deb_f, **fold_f, **shred_f, **chat_f,
+                "debris_severity": float(deb_sev), "fold_severity": float(fold_sev),
+                "shred_severity": float(shred_sev), "chatter_severity": float(chat_sev)}
     return {"scores": scores, "flags": flags, "features": features,
             "params_used": {k: r[k] for k in
                             ("debris_ref", "fold_ref", "shred_ref", "chatter_ref",
                              "flag", "mad_k", "median_area")}}
+
+
+_DETECTORS = (("debris", "debris_ref"), ("fold", "fold_ref"),
+              ("shred", "shred_ref"), ("chatter", "chatter_ref"))
+
+
+def rethreshold(qc_result: dict, refs: dict | None = None) -> dict:
+    """Recompute scores/flags from the STORED raw severities and new references
+    — instant, no detector re-run. Returns a new QC dict."""
+    r = dict(qc_defaults())
+    if refs:
+        r.update(refs)
+    feats = qc_result.get("features", {})
+    scores = {}
+    for k, refk in _DETECTORS:
+        sev = feats.get(f"{k}_severity")
+        scores[k] = _norm(sev, r[refk]) if sev is not None \
+            else float(qc_result.get("scores", {}).get(k, 0.0))
+    scores["overall"] = float(max(scores.values())) if scores else 0.0
+    flags = {k: bool(v >= r["flag"]) for k, v in scores.items() if k != "overall"}
+    flags["any"] = bool(any(flags.values()))
+    out = dict(qc_result)
+    out["scores"] = scores
+    out["flags"] = flags
+    out["params_used"] = {k: r[k] for k in
+                          ("debris_ref", "fold_ref", "shred_ref", "chatter_ref", "flag")}
+    return out
+
+
+def calibrate_qc(qc_results, percentile: float = 90.0) -> dict:
+    """Derive QC references from the section population: each detector's reference
+    is a high percentile of its severity across sections (so only outliers flag),
+    floored at the static default. Mirrors calibration.py's population philosophy.
+    """
+    d = qc_defaults()
+    sev = {k: [] for k, _ in _DETECTORS}
+    for q in qc_results:
+        feats = (q or {}).get("features", {})
+        for k, _ in _DETECTORS:
+            v = feats.get(f"{k}_severity")
+            if v is not None:
+                sev[k].append(float(v))
+    refs = {}
+    for k, refk in _DETECTORS:
+        vals = sev[k]
+        if vals:
+            refs[refk] = max(float(np.percentile(vals, percentile)), d[refk] * 0.25)
+        else:
+            refs[refk] = d[refk]
+    return refs
