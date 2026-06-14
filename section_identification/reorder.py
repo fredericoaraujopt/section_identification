@@ -144,6 +144,18 @@ def order_confidence(sim: np.ndarray, order) -> list[float]:
     return conf
 
 
+def heatmap_image(sim, order_indices=None) -> np.ndarray:
+    """Normalise a similarity matrix to a uint8 image for display, optionally
+    permuted by ``order_indices`` (the recovered serial order) so the banded /
+    diagonal-dominant structure of a correct ordering becomes visible."""
+    S = np.asarray(sim, dtype=float)
+    if order_indices is not None and len(order_indices) == len(S):
+        idx = np.asarray(order_indices, dtype=int)
+        S = S[np.ix_(idx, idx)]
+    mn, mx = float(S.min()), float(S.max())
+    return ((S - mn) / ((mx - mn) or 1.0) * 255.0).astype(np.uint8)
+
+
 def reorder(features, ids=None, ratio: float = 0.75, method: str = "spectral+2opt",
             progress=None) -> dict:
     """End-to-end: features -> similarity -> order. Returns a dict with the

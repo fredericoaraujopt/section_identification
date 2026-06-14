@@ -17,9 +17,11 @@ import math
 import os
 
 import numpy as np
-from qtpy.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout,
-                            QLabel, QProgressBar, QPushButton, QScrollArea,
-                            QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+from qtpy.QtGui import QImage, QPixmap
+from qtpy.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+                            QHBoxLayout, QLabel, QProgressBar, QPushButton,
+                            QScrollArea, QSpinBox, QTabWidget, QTextEdit,
+                            QVBoxLayout, QWidget)
 
 from . import (compute_broker, czi_export, export as legacy_export, imaging_path,
                layer_sync, roi as roi_mod, stage_help, wafer_export)
@@ -479,6 +481,12 @@ class StageReorder(_StageBase):
         self.btn_tsp = QPushButton("② Compute imaging route (TSP, min travel)")
         self.btn_tsp.clicked.connect(self.run_tsp)
         self.col.addWidget(self.btn_tsp)
+        self.btn_heat = QPushButton("Show similarity heatmap")
+        self.btn_heat.setToolTip("The SIFT inlier matrix, permuted by the recovered "
+                                 "serial order — a correct ordering looks banded.")
+        self.btn_heat.clicked.connect(self._show_heatmap)
+        self.col.addWidget(self.btn_heat)
+        self._heat_dlg = None
         self.btn_export = QPushButton("③ Export wafer manifest + mVis (region_names.csv)")
         self.btn_export.clicked.connect(self.export_wafer)
         self.col.addWidget(self.btn_export)
@@ -523,6 +531,7 @@ class StageReorder(_StageBase):
         mg = self.app.project.match_graph
         mg.order = list(order)
         mg.method = payload.get("method")
+        mg.similarity_path = payload.get("similarity_path")
         from .wafer_model import MatchEdge
         mg.edges = [MatchEdge(**e) for e in payload.get("edges", [])]
         for k, sid in enumerate(order):
@@ -558,6 +567,37 @@ class StageReorder(_StageBase):
                                 f"{total:,.0f} {unit}")
         self.app.log(self.STAGE, f"TSP route computed: {total:,.0f} {unit} travel.")
         self.app.save_workflow()
+
+    def _show_heatmap(self):
+        from . import reorder as reorder_mod
+        path = self.app.project.match_graph.similarity_path
+        if not path or not os.path.isfile(path):
+            self.app.log(self.STAGE, "run SIFT first (no cached similarity matrix).")
+            return
+        try:
+            data = np.load(path, allow_pickle=True)
+            sim = data["similarity"]
+            ids = list(data["ids"])
+            order = self.app.project.match_graph.order
+            idx = [ids.index(i) for i in order if i in ids] if order else None
+            img = reorder_mod.heatmap_image(sim, idx if idx and len(idx) == len(sim) else None)
+            h, w = img.shape
+            img = np.ascontiguousarray(img)
+            qimg = QImage(img.data, w, h, w, QImage.Format_Grayscale8)
+            dlg = QDialog(self)
+            dlg.setWindowTitle("SIFT similarity (serial-ordered)")
+            lay = QVBoxLayout(dlg)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            label = QLabel()
+            label.setPixmap(QPixmap.fromImage(qimg).scaled(max(w, 400), max(h, 400)))
+            scroll.setWidget(label)
+            lay.addWidget(scroll)
+            dlg.resize(520, 540)
+            self._heat_dlg = dlg
+            dlg.show()
+        except Exception as e:
+            self.app.log(self.STAGE, f"heatmap error: {e}")
 
     def export_wafer(self):
         if not self._need_image():

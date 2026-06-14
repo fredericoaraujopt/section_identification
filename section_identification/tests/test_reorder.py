@@ -77,6 +77,17 @@ def test_sift_matches_rotated_copy_not_unrelated():
     assert same >= 8, same
 
 
+def test_heatmap_image():
+    sim = np.array([[0, 5, 1], [5, 0, 2], [1, 2, 0]], float)
+    img = reorder.heatmap_image(sim)
+    assert img.shape == (3, 3) and img.dtype == np.uint8
+    assert img.max() == 255 and img.min() == 0
+    # reordering permutes rows+cols
+    permuted = reorder.heatmap_image(sim, order_indices=[2, 0, 1])
+    expected = (sim[np.ix_([2, 0, 1], [2, 0, 1])])
+    assert np.argmax(permuted) == np.argmax((expected - expected.min()))
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
