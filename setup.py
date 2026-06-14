@@ -13,6 +13,7 @@ setup(
         "matplotlib",
         "scikit-learn",
         "scikit-image",
+        "scipy",          # QC FFT peaks, TSP/seriation distances (also a sklearn/skimage dep)
         "shapely",
         "opencv-python",
         "tifffile",

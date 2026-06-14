@@ -33,8 +33,17 @@ class SectionTableDock(QWidget):
         self.btn_gallery.clicked.connect(self._show_gallery)
         bar.addWidget(self.btn_gallery)
         bar.addStretch(1)
+        self.btn_accept = QPushButton("✓ accept")
+        self.btn_accept.setToolTip("Mark the selected section accepted (proofread).")
+        self.btn_accept.clicked.connect(lambda: self._set_accept(True))
+        self.btn_reject = QPushButton("✗ reject")
+        self.btn_reject.setToolTip("Mark the selected section rejected.")
+        self.btn_reject.clicked.connect(lambda: self._set_accept(False))
+        bar.addWidget(self.btn_accept)
+        bar.addWidget(self.btn_reject)
         lay.addLayout(bar)
         self._gallery_dlg = None
+        self.selected_section = None
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -53,9 +62,21 @@ class SectionTableDock(QWidget):
         to show per-section diagnostics)."""
         self._listeners.append(fn)
 
+    def _set_accept(self, ok):
+        if self.selected_section is None:
+            self.app.log("proofread", "select a section row first.")
+            return
+        self.selected_section.accepted = bool(ok)
+        self.refresh()
+        try:
+            self.app.save_workflow()
+        except Exception:
+            pass
+
     def _on_click(self, row, _col):
         secs = self.app.project.sections
         section = secs[row] if 0 <= row < len(secs) else None
+        self.selected_section = section
         try:
             self.nav.go_to_index(row, keep_fov=True)
         except Exception:
@@ -103,7 +124,12 @@ class SectionTableDock(QWidget):
         self.table.setRowCount(len(secs))
         for r, s in enumerate(secs):
             sc = s.qc.scores if s.qc else {}
-            status = "reject" if (s.qc and s.qc.flags.get("any")) else "accept"
+            if not s.accepted:
+                status = "rejected"
+            elif s.qc and s.qc.flags.get("any"):
+                status = "review"
+            else:
+                status = "ok"
             vals = [r + 1, s.id, self._fmt(sc.get("overall")),
                     self._fmt(sc.get("debris")), self._fmt(sc.get("fold")),
                     self._fmt(sc.get("shred")), self._fmt(sc.get("chatter")),
