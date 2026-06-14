@@ -1611,20 +1611,33 @@ def main():
         pass
     viewer = napari.Viewer()
     gui = SectionIdentificationGUI(viewer)
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    # Scroll vertically only — content reflows to the panel width instead of
-    # forcing a horizontal scrollbar (keeps the right dock narrow & readable).
-    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-    scroll.setWidget(gui)
-    scroll.setMinimumWidth(230)        # allow a narrow dock; long text wraps
-    dock = viewer.window.add_dock_widget(scroll, name="STiM", area="right")
-    # Open the dock narrow, then release the cap so the user can still drag it.
+
+    # New 4-tab workflow shell (Sections=this GUI, + ROIs/QC/Reorder + section
+    # table). Guarded: if anything in the expansion fails to construct, fall back
+    # to the original single-dock layout so the core detector always launches.
+    attached = False
     try:
-        dock.setMaximumWidth(320)
-        QTimer.singleShot(300, lambda: dock.setMaximumWidth(16777215))
+        from section_identification import stages
+        stages.attach_workflow(viewer, gui)
+        attached = True
     except Exception:
-        pass
+        traceback.print_exc()
+
+    if not attached:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        # Scroll vertically only — content reflows to the panel width instead of
+        # forcing a horizontal scrollbar (keeps the right dock narrow & readable).
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(gui)
+        scroll.setMinimumWidth(230)    # allow a narrow dock; long text wraps
+        dock = viewer.window.add_dock_widget(scroll, name="STiM", area="right")
+        # Open narrow, then release the cap so the user can still drag it.
+        try:
+            dock.setMaximumWidth(320)
+            QTimer.singleShot(300, lambda: dock.setMaximumWidth(16777215))
+        except Exception:
+            pass
     napari.run()
 
 

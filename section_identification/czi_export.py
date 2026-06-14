@@ -237,6 +237,131 @@ def inject_shuttle_and_find(xml_str: str, markers_stage_um,
 
 
 # --------------------------------------------------------------------------- #
+# Tile regions + focus support points (ZEN mFOV acquisition, stage microns)
+# --------------------------------------------------------------------------- #
+# ZEN places mFOVs from TileRegion nodes under
+#   …/Experiment/.../RegionsSetup/SampleHolder/TileRegions/TileRegion
+# CenterPosition/ContourSize/Z are stage microns; Columns/Rows are tile counts;
+# SupportPoints are the autofocus plane (stage µm X/Y/Z). Verified against real
+# CZIs. ZEN-build acceptance of externally injected regions must be confirmed
+# empirically (same caveat as the annotation Layers above).
+TILE_REGION_PREFIX = "STiM_TR_"
+
+
+def _support_point_element(idx: int, x: float, y: float, z: float) -> ET.Element:
+    sp = ET.Element("SupportPoint", attrib={"Name": "SP", "Id": f"STiM_SP_{idx}"})
+    ET.SubElement(sp, "X").text = f"{float(x):.3f}"
+    ET.SubElement(sp, "Y").text = f"{float(y):.3f}"
+    ET.SubElement(sp, "Z").text = f"{float(z):.3f}"
+    ET.SubElement(sp, "AdditionalValues")
+    return sp
+
+
+def _tile_region_element(idx: int, spec: dict) -> ET.Element:
+    """Build a <TileRegion> from a spec dict: ``center_um=(x,y)``,
+    ``contour_um=(w,h)``, ``columns``, ``rows``, ``z_um``,
+    ``support_points=[(x,y,z), ...]`` (stage µm), optional ``name``/``contour``."""
+    name = spec.get("name") or f"{TILE_REGION_PREFIX}{idx}"
+    tr = ET.Element("TileRegion", attrib={"Name": name, "Id": str(spec.get("id", idx))})
+    cx, cy = spec["center_um"]
+    cw, ch = spec.get("contour_um", (0.0, 0.0))
+    ET.SubElement(tr, "CenterPosition").text = f"{float(cx):.3f},{float(cy):.3f}"
+    ET.SubElement(tr, "ContourSize").text = f"{float(cw):.3f},{float(ch):.3f}"
+    ET.SubElement(tr, "Columns").text = str(int(spec.get("columns", 1)))
+    ET.SubElement(tr, "Rows").text = str(int(spec.get("rows", 1)))
+    ET.SubElement(tr, "Z").text = f"{float(spec.get('z_um', 0.0)):.3f}"
+    ET.SubElement(tr, "Contour", attrib={"Type": spec.get("contour", "Rectangle")})
+    sps = spec.get("support_points") or []
+    if sps:
+        container = ET.SubElement(tr, "SupportPoints")
+        for k, (sx, sy, sz) in enumerate(sps, start=1):
+            container.append(_support_point_element(idx * 100 + k, sx, sy, sz))
+    ET.SubElement(tr, "AdditionalValues")
+    return tr
+
+
+def _ensure_tile_regions(root: ET.Element) -> ET.Element:
+    """Return the <TileRegions> container, reusing an existing one or creating
+    the RegionsSetup/SampleHolder/TileRegions chain (best-effort) if absent."""
+    tr = root.find(".//TileRegions")
+    if tr is not None:
+        return tr
+    sh = root.find(".//SampleHolder")
+    if sh is None:
+        rs = root.find(".//RegionsSetup")
+        if rs is None:
+            md = root.find("Metadata")
+            if md is None:
+                md = root
+            node = md
+            for tag in ("Experiment", "ExperimentBlocks", "AcquisitionBlock",
+                        "SubDimensionSetups", "RegionsSetup", "SampleHolder"):
+                child = node.find(tag)
+                if child is None:
+                    child = ET.SubElement(node, tag)
+                node = child
+            sh = node
+        else:
+            sh = ET.SubElement(rs, "SampleHolder")
+    return ET.SubElement(sh, "TileRegions")
+
+
+def inject_tile_regions(xml_str: str, regions, replace: bool = True) -> str:
+    """Return CZI metadata XML with STiM TileRegions (one per ROI) added.
+
+    ``regions`` is a list of spec dicts (see :func:`_tile_region_element`).
+    Previous STiM TileRegions (``Name`` starting ``STiM_TR_``) are removed first
+    when ``replace`` so re-export doesn't accumulate duplicates.
+    """
+    root = ET.fromstring(xml_str)
+    container = _ensure_tile_regions(root)
+    if replace:
+        for tr in list(container.findall("TileRegion")):
+            if (tr.get("Name") or "").startswith(TILE_REGION_PREFIX):
+                container.remove(tr)
+    for i, spec in enumerate(regions, start=1):
+        container.append(_tile_region_element(i, spec))
+    return ET.tostring(root, encoding="unicode")
+
+
+def read_tile_regions(xml_str: str) -> list[dict]:
+    """Read TileRegions back from CZI metadata XML. Returns a list of dicts with
+    ``center_um``/``contour_um``/``columns``/``rows``/``z_um``/``support_points``
+    (stage µm) and ``name`` — used to display existing mFOVs/focus points on load.
+    """
+    root = ET.fromstring(xml_str)
+    out = []
+
+    def _pair(text):
+        try:
+            a, b = (float(v) for v in text.split(","))
+            return (a, b)
+        except Exception:
+            return None
+
+    for tr in root.findall(".//TileRegion"):
+        cp = tr.findtext("CenterPosition")
+        cs = tr.findtext("ContourSize")
+        sps = []
+        for sp in tr.findall(".//SupportPoint"):
+            try:
+                sps.append((float(sp.findtext("X")), float(sp.findtext("Y")),
+                            float(sp.findtext("Z"))))
+            except (TypeError, ValueError):
+                continue
+        out.append({
+            "name": tr.get("Name"),
+            "center_um": _pair(cp) if cp else None,
+            "contour_um": _pair(cs) if cs else None,
+            "columns": int(tr.findtext("Columns") or 0),
+            "rows": int(tr.findtext("Rows") or 0),
+            "z_um": float(tr.findtext("Z") or 0.0),
+            "support_points": sps,
+        })
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # GeoJSON sidecar (pixel + optional stage microns)
 # --------------------------------------------------------------------------- #
 def write_geojson(path: str, polygons, fiducials, geom=None) -> str:
@@ -296,7 +421,8 @@ def _read_metadata_xml(path: str) -> str:
 def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
                         copy: bool = True, fiducial_radius_px: float = 50.0,
                         section_ids: list | None = None,
-                        sf_markers_stage_um=None, sf_orientation=None) -> dict:
+                        sf_markers_stage_um=None, sf_orientation=None,
+                        tile_regions=None) -> dict:
     """Produce a new CZI carrying STiM section polygons + fiducial markers.
 
     Copies ``src_czi`` -> ``dst_czi`` (preserving full-res pixels), injects a
@@ -326,11 +452,14 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
     if sf_markers_stage_um:
         new_xml = inject_shuttle_and_find(new_xml, sf_markers_stage_um,
                                           orientation=sf_orientation)
+    if tile_regions:
+        new_xml = inject_tile_regions(new_xml, tile_regions)
 
     # Commit metadata-only via the CziEditor (pylibCZIrw >= 6.0.0).
     _commit_metadata(dst_czi, new_xml)
 
     report = {
+        "n_tile_regions": len(tile_regions or []),
         "dst": dst_czi,
         "n_polygons": len(polygons),
         "n_fiducials": len(fiducials or []),
