@@ -214,6 +214,18 @@ class StageROIs(_StageBase):
         b1.clicked.connect(self._new_draft)
         self.col.addWidget(b1)
 
+        sam_row = QHBoxLayout()
+        self.btn_sam = QPushButton("①ᴮ SAM-assist: trace ROI")
+        self.btn_sam.setToolTip("Use the SAM editor to one-click an ROI (e.g. a "
+                                "resin-bounded region); the mask is captured onto "
+                                "the ROI draft layer instead of Sections.")
+        self.btn_sam.clicked.connect(self._sam_assist)
+        sam_row.addWidget(self.btn_sam)
+        self.btn_sam_done = QPushButton("Finish SAM-assist")
+        self.btn_sam_done.clicked.connect(self._finish_sam)
+        sam_row.addWidget(self.btn_sam_done)
+        self.col.addLayout(sam_row)
+
         fit_row = QHBoxLayout()
         fit_row.addWidget(QLabel("fit:"))
         self.cb_fit = QComboBox()
@@ -297,6 +309,54 @@ class StageROIs(_StageBase):
                                      f"{len(data['regions'])} mFOV region(s) from CZI.")
         except Exception as e:
             self.app.log(self.STAGE, f"read existing acquisition failed: {e}")
+
+    def _editor(self):
+        gui = self.app.gui
+        ed = getattr(gui, "_napari_editor", None)
+        if ed is None:
+            try:
+                from .napari_sam_editor import NapariSamEditor
+                ed = NapariSamEditor(gui)
+                gui._napari_editor = ed
+            except Exception as e:
+                self.app.log(self.STAGE, f"SAM editor unavailable: {e}")
+                return None
+        return ed
+
+    def _sam_assist(self):
+        if not self._need_image():
+            return
+        ed = self._editor()
+        if ed is None:
+            return
+        self._new_draft()                     # ensure the ROI draft layer exists
+        try:
+            ed.deactivate()                   # clean slate, then route commits to us
+        except Exception:
+            pass
+        ed.activate(commit_target=self._capture_roi)
+        self.app.log(self.STAGE, "SAM-assist ON — hover inside the ROI, SPACE to "
+                                 "capture it onto the ROI draft, then 'Finish "
+                                 "SAM-assist' and 'Define + propagate'.")
+
+    def _finish_sam(self):
+        ed = getattr(self.app.gui, "_napari_editor", None)
+        if ed is not None:
+            try:
+                ed.deactivate()
+            except Exception:
+                pass
+        self.app.log(self.STAGE, "SAM-assist OFF.")
+
+    def _capture_roi(self, poly_yx):
+        v = self.app.viewer
+        if v is None:
+            return
+        if self.DRAFT not in v.layers:
+            self._new_draft()
+        lyr = v.layers[self.DRAFT]
+        lyr.data = list(lyr.data) + [np.asarray(poly_yx, float)]
+        self.app.log(self.STAGE, f"ROI captured ({len(lyr.data)} on draft).")
 
     def _new_draft(self):
         v = self.app.viewer

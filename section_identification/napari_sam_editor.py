@@ -80,6 +80,10 @@ class NapariSamEditor:
         self._reasserting = False    # guard against re-entrant active-layer resets
         self._dragging = False       # mouse held (panning) → defer embedding
         self._drag_cb = None
+        # When set (by the ROIs stage), a committed mask is routed here as an
+        # overview-(y,x) polygon instead of being appended to the Sections layer,
+        # so the same editor can outline ROIs. Reset on deactivate.
+        self.commit_target = None
 
     # ---------------- helpers ----------------
     def _log(self, msg):
@@ -311,9 +315,15 @@ class NapariSamEditor:
         if not data:
             self._log("napari editor: nothing to add (hover a section first).")
             return
-        poly = np.asarray(data[-1], dtype=float)
-        self.gui.shapes_layer.data = list(self.gui.shapes_layer.data) + [poly]
+        poly = np.asarray(data[-1], dtype=float)        # overview (y, x)
         self.preview_layer.data = []
+        if self.commit_target is not None:               # ROI mode: route elsewhere
+            try:
+                self.commit_target(poly)
+            except Exception as e:
+                self._log(f"napari editor: ROI capture error: {e}")
+            return
+        self.gui.shapes_layer.data = list(self.gui.shapes_layer.data) + [poly]
         try:
             self.gui.save_project()
         except Exception:
@@ -402,12 +412,13 @@ class NapariSamEditor:
         self.deactivate() if self._active else self.activate()
         return self._active
 
-    def activate(self):
+    def activate(self, commit_target=None):
         if self._active:
             return
         if self.gui.overview is None or self.gui.shapes_layer is None:
             self._log("napari editor: load an image first.")
             return
+        self.commit_target = commit_target
         sc = self.gui._layer_scale()
         # thick red border around the image → unmistakable "manual editor" mode
         H, W = self.gui.overview.shape[:2]
@@ -560,4 +571,5 @@ class NapariSamEditor:
             setattr(self, attr, None)
         self._embed_ready = False
         self._sel_idx = None
+        self.commit_target = None        # back to Sections-commit for the next activation
         self._log("napari editor OFF.")
