@@ -19,7 +19,7 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from qtpy.QtCore import Qt, QTimer, QProcess, QProcessEnvironment
+from qtpy.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QThread, Signal
 from qtpy.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QMessageBox, QProgressBar, QPushButton,
@@ -45,6 +45,79 @@ def napari_to_xy(poly_yx):
     return p[:, ::-1]
 
 
+# Canonical SAM 2.1 Hiera checkpoints. Each model variant is a DISTINCT network
+# with its OWN weights file (the architecture is inferred from the filename in
+# section_detector._infer_sam2_cfg) — "light/medium" cannot reuse the base_plus
+# file. URLs/sizes from the vendored sam2/checkpoints/download_ckpts.sh.
+_SAM21_BASE_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824"
+SAM21_CKPT_URLS = {
+    "tiny": f"{_SAM21_BASE_URL}/sam2.1_hiera_tiny.pt",
+    "small": f"{_SAM21_BASE_URL}/sam2.1_hiera_small.pt",
+    "base_plus": f"{_SAM21_BASE_URL}/sam2.1_hiera_base_plus.pt",
+    "large": f"{_SAM21_BASE_URL}/sam2.1_hiera_large.pt",
+}
+SAM21_CKPT_MB = {"tiny": 150, "small": 180, "base_plus": 320, "large": 900}
+
+
+class _CheckpointDownloader(QThread):
+    """Stream a checkpoint to ``dest`` off the UI thread, reporting % progress."""
+    progress = Signal(int)
+    done = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url, dest):
+        super().__init__()
+        self.url, self.dest = url, dest
+
+    def run(self):
+        import urllib.request
+        tmp = self.dest + ".part"
+        try:
+            req = urllib.request.Request(self.url, headers={"User-Agent": "STiM"})
+            with urllib.request.urlopen(req) as r, open(tmp, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0)
+                read = 0
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    read += len(chunk)
+                    if total:
+                        self.progress.emit(int(read * 100 / total))
+            os.replace(tmp, self.dest)
+            self.done.emit(self.dest)
+        except Exception as e:  # noqa: BLE001 — surfaced to the user via the log
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            self.failed.emit(str(e))
+
+
+class _ZarrPyramidBuilder(QThread):
+    """Build + persist a CZI display pyramid to Zarr off the UI thread."""
+    progress = Signal(int, int)     # (level_done, level_total)
+    done = Signal(str, object)      # (image_path, levels) — levels = dask-from-Zarr list
+    failed = Signal(str, str)       # (image_path, message)
+
+    def __init__(self, image_path, zpath):
+        super().__init__()
+        self.image_path, self.zpath = image_path, zpath
+
+    def run(self):
+        try:
+            levels = czi_io.write_czi_zarr_pyramid(
+                self.image_path, self.zpath,
+                progress=lambda d, t: self.progress.emit(d, t))
+            self.done.emit(self.image_path, levels)
+        except Exception as e:  # noqa: BLE001 — surfaced to the user via the log
+            # A bare KeyError repr (e.g. a dask task key) hides the real cause, so
+            # send the type + full traceback to the log.
+            self.failed.emit(self.image_path,
+                             f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
 class SectionIdentificationGUI(QWidget):
     def __init__(self, napari_viewer):
         super().__init__()
@@ -58,6 +131,7 @@ class SectionIdentificationGUI(QWidget):
         self.shapes_layer = None
         self.fid_layer = None
         self.calib_layer = None
+        self._zarr_builders = set()  # live _ZarrPyramidBuilder threads (GC guard)
         self.tiles_layer = None
         self.current_tile_layer = None
         self.raw_layer = None
@@ -72,6 +146,13 @@ class SectionIdentificationGUI(QWidget):
         self._raw_sections = []
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._tick_elapsed)
+        # Overview-px (frame) resync: the overview-px lever defines the coordinate
+        # frame the worker detects in AND the display overlays masks in. When it
+        # changes we re-read the overview and re-align every layer so those two
+        # frames can't drift apart (debounced here; also forced before each run).
+        self._frame_dirty = False
+        self._frame_timer = QTimer(self); self._frame_timer.setSingleShot(True)
+        self._frame_timer.timeout.connect(self._sync_overview_frame)
 
         layout = QVBoxLayout(); layout.setContentsMargins(6, 6, 6, 6); layout.setSpacing(4)
         self.setLayout(layout)
@@ -126,6 +207,12 @@ class SectionIdentificationGUI(QWidget):
         det.addLayout(host_row)
         self.lbl_host = QLabel(f"Host: {describe_device()}")
         self.lbl_host.setWordWrap(True); det.addWidget(self.lbl_host)
+        # Live "effect" readout: how the current knobs translate into what SAM
+        # actually does (section size to SAM, #tiles, est. time, resolved model +
+        # whether its checkpoint is on disk). Updates as coupled knobs change.
+        self.lbl_effect = QLabel("Effect: —"); self.lbl_effect.setWordWrap(True)
+        self.lbl_effect.setStyleSheet("QLabel{background:#16241a;padding:6px;border-radius:4px;}")
+        det.addWidget(self.lbl_effect)
 
         # ---- Advanced (nested fold): full SAM parameter set; each row has a
         #      tooltip + a "?" that opens that parameter's section in the guide ----
@@ -164,90 +251,114 @@ class SectionIdentificationGUI(QWidget):
             form.addRow(label, cont)
             return widget
 
-        # -- Model & resolution: the dials you actually reach for --
-        gres = _group("Model & resolution")
+        # ===================================================================
+        # Advanced parameters, grouped by EFFECT (not pipeline stage). Each
+        # cluster has ONE primary lever (★); the other knobs in it mostly move
+        # the same needle and are coupled — see the guide's "Parameter clusters".
+        # ===================================================================
+
+        # 1 · Resolution — how big a section looks to SAM (SAM resizes to 1024).
+        #     overview px is the ONLY knob that adds real detail; tile px / crop
+        #     layers only magnify it. Calibration sets tile px + points/side from
+        #     the example section, so these are normally left untouched.
+        gres = _group("1 · Resolution  (how big SAM sees a section)")
+        self.sp_target = _row(QSpinBox(), "★ overview px", "overview_long_side",
+            "Resolution the source is read at. Calibration sets it automatically to "
+            "N×1024 so SAM's tiles are 1024 px (1:1 into the encoder): 1024 = whole "
+            "image, higher = N×N tiles for sections too small to resolve whole. Bigger "
+            "= more detail, memory and time; host-capped. Reload to apply.", gres)
+        self.sp_target.setRange(1024, 16384); self.sp_target.setSingleStep(1024); self.sp_target.setValue(1024)
+        self.sp_tile = _row(QSpinBox(), "tile px  (auto · 0=whole)", "tile_px",
+            "Set by calibration: whole image unless a section is too small to resolve, "
+            "then tiled to magnify it. Smaller tile → bigger section to SAM, but it "
+            "re-slices the SAME overview pixels — no new detail. 0 = whole image; host "
+            "cap may shrink it.", gres)
+        self.sp_tile.setRange(0, 16384); self.sp_tile.setSingleStep(128); self.sp_tile.setValue(0)
+        self.sp_crop = _row(QSpinBox(), "crop layers  (magnify only)", "crop_n_layers",
+            "SAM's built-in re-cropping inside a tile. 0=off, 1=2×2 sub-crops (~5× slower). "
+            "Like tile px it only magnifies overview pixels. Calibrate sets it from section size.", gres)
+        self.sp_crop.setRange(0, 3); self.sp_crop.setValue(0)
+
+        # 2 · Coverage — how many query points land on a section.
+        gcov = _group("2 · Coverage  (query-point density)")
+        self.sp_pps = _row(QSpinBox(), "★ points / side", "points_per_side",
+            "Density of SAM's query-point grid per tile. ~2–3 points across a section. "
+            "More = finds smaller/closer objects, slower. (tile px / crop layers also "
+            "change effective density.)", gcov)
+        self.sp_pps.setRange(4, 192); self.sp_pps.setValue(32)
+        self.sp_cropds = _row(QSpinBox(), "crop grid ÷", "crop_n_points_downscale_factor",
+            "Thins the point grid on deeper crop layers. 2 is typical when crop layers ≥ 1; "
+            "inert when crop layers = 0.", gcov)
+        self.sp_cropds.setRange(1, 4); self.sp_cropds.setValue(1)
+
+        # 3 · Quality gates — drop low-quality masks (the two thresholds overlap).
+        gqual = _group("3 · Quality gates")
+        self.sp_iou = _row(QDoubleSpinBox(), "★ pred IoU", "pred_iou_thresh",
+            "SAM's confidence floor. Lower to recover faint sections; raise to drop weak ones.", gqual)
+        self.sp_iou.setRange(0.0, 1.0); self.sp_iou.setSingleStep(0.05); self.sp_iou.setValue(0.80)
+        self.sp_stab = _row(QDoubleSpinBox(), "stability", "stability_score_thresh",
+            "Mask edge-stability floor — a second quality gate that overlaps with pred IoU. "
+            "Lower for noisy/small sections; raise for clean ones.", gqual)
+        self.sp_stab.setRange(0.0, 1.0); self.sp_stab.setSingleStep(0.01); self.sp_stab.setValue(0.92)
+        self.sp_staboff = _row(QDoubleSpinBox(), "stability offset", "stability_score_offset",
+            "Sub-knob of stability: the nudge used to measure it. Usually leave at 1.0.", gqual)
+        self.sp_staboff.setRange(0.1, 5.0); self.sp_staboff.setSingleStep(0.1); self.sp_staboff.setValue(1.0)
+        self.chk_m2m = _row(QCheckBox(), "refine (use_m2m)", "use_m2m",
+            "Extra mask-to-mask refinement: cleaner edges, ~2× slower.", gqual)
+
+        # 4 · Deduplication — suppress overlapping/duplicate masks.
+        gdedup = _group("4 · Deduplication")
+        self.sp_boxnms = _row(QDoubleSpinBox(), "★ box NMS", "box_nms_thresh",
+            "Merge masks overlapping more than this. Lower = more dedup; raise to keep "
+            "touching sections separate.", gdedup)
+        self.sp_boxnms.setRange(0.1, 1.0); self.sp_boxnms.setSingleStep(0.05); self.sp_boxnms.setValue(0.70)
+        self.sp_overlap = _row(QDoubleSpinBox(), "tile overlap", "overlap",
+            "Overlap between STiM tiles so each section fits whole in ≥1 tile (edge masks "
+            "are dropped to avoid duplicates).", gdedup)
+        self.sp_overlap.setRange(0.0, 0.6); self.sp_overlap.setSingleStep(0.05); self.sp_overlap.setValue(0.2)
+        self.sp_cropov = _row(QDoubleSpinBox(), "crop overlap", "crop_overlap_ratio",
+            "Overlap between SAM's sub-crops so edge sections aren't split; inert when "
+            "crop layers = 0.", gdedup)
+        self.sp_cropov.setRange(0.0, 0.8); self.sp_cropov.setSingleStep(0.02); self.sp_cropov.setValue(512 / 1500)
+
+        # 5 · Keep / drop by size — three area filters at different stages.
+        gsize = _group("5 · Keep / drop by size  (3 overlapping filters)")
+        self.chk_filter = _row(QCheckBox(), "★ area DBSCAN", "dbscan",
+            "Keep the dominant section-sized area cluster (drops debris/clumps). "
+            "Leave on for wafers.", gsize)
+        self.chk_filter.setChecked(True)
+        self.sp_minarea = _row(QSpinBox(), "min section area", "min_section_area",
+            "Drops whole detections smaller than this + anchors the area-DBSCAN band "
+            "(overview px). Calibrate sets it to ~½ the median section.", gsize)
+        self.sp_minarea.setRange(0, 10_000_000); self.sp_minarea.setValue(50)
+        self.sp_minmask = _row(QSpinBox(), "min mask area", "min_mask_region_area",
+            "SAM-internal specks/holes filter INSIDE each mask (tile px — scales with "
+            "resolution). ~5% of a section's area.", gsize)
+        self.sp_minmask.setRange(0, 10_000_000); self.sp_minmask.setValue(100)
+
+        # 6 · Performance — these never change the masks, only speed/memory.
+        gperf = _group("6 · Performance  (no effect on the masks)")
         self.cb_model = _row(QComboBox(), "model", "model",
-            "Heavier = better but slower/more memory. Auto picks by host (tiny/small on "
-            "CPU/weak, base_plus/large on GPU).", gres)
+            "Backbone size = speed↔accuracy. Each variant is a SEPARATE checkpoint "
+            "(tiny/small/base_plus/large); a missing one silently falls back to base_plus — "
+            "see the checkpoint line below. Auto picks by host.", gperf)
         self.cb_model.addItems(["Auto", "tiny", "small", "base_plus", "large"])
-        self.sp_targetsam = _row(QSpinBox(), "target → SAM", "target_sam_px",
-            "How big a section should look to SAM. The main quality↔speed dial; "
-            "higher = sharper but more tiles. ~64 typical, ~40 on slow machines.", gres)
-        self.sp_targetsam.setRange(24, 256); self.sp_targetsam.setValue(64)
-        self.sp_target = _row(QSpinBox(), "overview px", "overview_long_side",
-            "Read resolution (real detail). Bigger = sharper, more memory/time; host-capped. "
-            "Needs an image reload to take effect.", gres)
-        self.sp_target.setRange(1024, 16384); self.sp_target.setSingleStep(512); self.sp_target.setValue(8192)
         self.sp_ppb = _row(QSpinBox(), "points / batch", "points_per_batch",
             "Query points SAM runs at once. Memory/speed only — NO effect on results. "
-            "Lower to avoid crashing/thrashing; raise with spare GPU. Auto-capped to host.", gres)
+            "Lower to avoid crashing/thrashing; raise with spare GPU. Auto-capped to host.", gperf)
         self.sp_ppb.setRange(1, 256); self.sp_ppb.setValue(16)
         self.chk_lowmem = _row(QCheckBox(), "low-memory (1 mask/pt)", "memory",
             "Memory-saver: SAM emits 1 mask per point instead of 3 → ~3× less peak mask "
             "memory (eases pressure on Macs / weak machines). May slightly lower recall on "
-            "ambiguous sections. Off = SAM default (3 masks/point, best recall).", gres)
+            "ambiguous sections. Off = SAM default (3 masks/point, best recall).", gperf)
 
-        # -- Tiling --
-        gtile = _group("Tiling")
-        self.sp_tile = _row(QSpinBox(), "tile px (0=whole)", "tile_px",
-            "Tile size; SAM upscales each tile to 1024 (smaller tile → bigger section to "
-            "SAM). 0 = whole image. Calibrate sets it; host cap may shrink it.", gtile)
-        self.sp_tile.setRange(0, 16384); self.sp_tile.setSingleStep(128); self.sp_tile.setValue(0)
-        self.sp_overlap = _row(QDoubleSpinBox(), "tile overlap", "overlap",
-            "Overlap between tiles so each section fits whole in ≥1 tile.", gtile)
-        self.sp_overlap.setRange(0.0, 0.6); self.sp_overlap.setSingleStep(0.05); self.sp_overlap.setValue(0.2)
+        # crop sub-knobs are inert until crop layers ≥ 1.
+        self.sp_cropov.setEnabled(False); self.sp_cropds.setEnabled(False)
 
-        # -- SAM detection: Calibrate sets these from the section size --
-        gsam = _group("SAM detection  (Calibrate sets these)")
-        self.sp_pps = _row(QSpinBox(), "points / side", "points_per_side",
-            "Density of SAM's query-point grid per tile. ~2–3 points across a section. "
-            "More = finds smaller/closer objects, slower.", gsam)
-        self.sp_pps.setRange(4, 192); self.sp_pps.setValue(32)
-        self.sp_iou = _row(QDoubleSpinBox(), "pred IoU", "pred_iou_thresh",
-            "SAM's confidence floor. Lower to recover faint sections; raise to drop weak ones.", gsam)
-        self.sp_iou.setRange(0.0, 1.0); self.sp_iou.setSingleStep(0.05); self.sp_iou.setValue(0.80)
-        self.sp_stab = _row(QDoubleSpinBox(), "stability", "stability_score_thresh",
-            "Mask edge-stability floor. Lower for noisy/small sections; raise for clean ones.", gsam)
-        self.sp_stab.setRange(0.0, 1.0); self.sp_stab.setSingleStep(0.01); self.sp_stab.setValue(0.92)
-        self.sp_staboff = _row(QDoubleSpinBox(), "stability offset", "stability_score_offset",
-            "Nudge used to measure stability. Usually leave at 1.0.", gsam)
-        self.sp_staboff.setRange(0.1, 5.0); self.sp_staboff.setSingleStep(0.1); self.sp_staboff.setValue(1.0)
-        self.sp_boxnms = _row(QDoubleSpinBox(), "box NMS", "box_nms_thresh",
-            "Merge masks overlapping more than this. Lower = more dedup; raise to keep "
-            "touching sections separate.", gsam)
-        self.sp_boxnms.setRange(0.1, 1.0); self.sp_boxnms.setSingleStep(0.05); self.sp_boxnms.setValue(0.70)
-        self.sp_crop = _row(QSpinBox(), "crop layers", "crop_n_layers",
-            "SAM's built-in re-cropping for tiny objects. 0=off, 1=2×2 sub-crops (~5× slower). "
-            "Calibrate sets it from section size.", gsam)
-        self.sp_crop.setRange(0, 3); self.sp_crop.setValue(0)
-        self.sp_cropov = _row(QDoubleSpinBox(), "crop overlap", "crop_overlap_ratio",
-            "Overlap between SAM's sub-crops so edge sections aren't split.", gsam)
-        self.sp_cropov.setRange(0.0, 0.8); self.sp_cropov.setSingleStep(0.02); self.sp_cropov.setValue(512 / 1500)
-        self.sp_cropds = _row(QSpinBox(), "crop grid ÷", "crop_n_points_downscale_factor",
-            "Thins the point grid on deeper crop layers. 2 is typical when crop layers ≥ 1.", gsam)
-        self.sp_cropds.setRange(1, 4); self.sp_cropds.setValue(1)
-        self.sp_minmask = _row(QSpinBox(), "min mask area", "min_mask_region_area",
-            "SAM drops regions/holes smaller than this (specks filter inside SAM). "
-            "~5% of a section's area.", gsam)
-        self.sp_minmask.setRange(0, 10_000_000); self.sp_minmask.setValue(100)
-        self.chk_m2m = _row(QCheckBox(), "refine (use_m2m)", "use_m2m",
-            "Extra mask-to-mask refinement: cleaner edges, ~2× slower.", gsam)
-
-        # -- Filtering AFTER SAM (post-processing, not SAM params) --
-        gfilt = _group("Filtering  (after SAM)")
-        self.sp_minarea = _row(QSpinBox(), "min section area", "min_section_area",
-            "Detections smaller than this are dropped + anchors the area-DBSCAN band. "
-            "Calibrate sets it to ~½ the median section.", gfilt)
-        self.sp_minarea.setRange(0, 10_000_000); self.sp_minarea.setValue(50)
-        self.chk_filter = _row(QCheckBox(), "area DBSCAN", "dbscan",
-            "Keep the dominant section-sized area cluster (drops debris/clumps). "
-            "Leave on for wafers.", gfilt)
-        self.chk_filter.setChecked(True)
-
-        # checkpoint selector (rarely changed; Auto model picks it) — bottom of Advanced
-        self.lbl_ckpt = QLabel(f"Checkpoint: …/{os.path.basename(self.checkpoint)}")
-        self.lbl_ckpt.setWordWrap(True); advcol.addWidget(self.lbl_ckpt)
-        self.btn_ckpt = QPushButton("Select checkpoint (.pt)")
+        # checkpoint line: which model file is active + on-disk status, with a
+        # download for the selected variant (each is a separate ~150–900 MB file).
+        self.lbl_ckpt = QLabel(); self.lbl_ckpt.setWordWrap(True); advcol.addWidget(self.lbl_ckpt)
+        self.btn_ckpt = QPushButton("Select checkpoint…")
         advcol.addWidget(self.btn_ckpt)
         det.addWidget(adv)                          # the Advanced fold sits in the detector section
 
@@ -311,9 +422,20 @@ class SectionIdentificationGUI(QWidget):
         # Live parameter previews: toggle + redraw whenever a geometric knob moves.
         self.chk_viz.toggled.connect(self._toggle_param_viz)
         for w in (self.sp_pps, self.sp_tile, self.sp_overlap, self.sp_crop,
-                  self.sp_cropov, self.sp_cropds, self.sp_minarea, self.sp_minmask,
-                  self.sp_targetsam):
+                  self.sp_cropov, self.sp_cropds, self.sp_minarea, self.sp_minmask):
             w.valueChanged.connect(self._param_viz_refresh)
+
+        # Coupling reflection: a lever updates the fields it derives + the live
+        # "effect" readout. blockSignals guards (in the handlers) avoid loops.
+        self._dl = None
+        self.cb_model.currentTextChanged.connect(self._on_model_changed)
+        self.sp_crop.valueChanged.connect(self._on_crop_layers_changed)
+        for w in (self.sp_target, self.sp_tile, self.sp_pps, self.sp_overlap,
+                  self.sp_minarea):
+            w.valueChanged.connect(self._refresh_effect)
+        self.sp_target.valueChanged.connect(self._on_overview_px_changed)
+        self._update_ckpt_label()
+        self._refresh_effect()
         # NB: intentionally NOT refreshing on camera move — the previews are
         # fixed in image space (a central representative tile), so they don't
         # jitter as you pan/zoom.
@@ -395,6 +517,8 @@ class SectionIdentificationGUI(QWidget):
     def _on_device_changed(self, text):
         self._device_prefer = "" if text == "Auto" else text.lower()
         self._refresh_host()
+        self._update_ckpt_label()      # Auto model variant may change with device
+        self._refresh_effect()
 
     def _refresh_host(self):
         try:
@@ -436,7 +560,177 @@ class SectionIdentificationGUI(QWidget):
                                               "Checkpoints (*.pt *.pth)")
         if path:
             self.checkpoint = path
-            self.lbl_ckpt.setText(f"Checkpoint: …/{os.path.basename(path)}")
+            self._update_ckpt_label()
+            self._refresh_effect()
+
+    # ----- model / checkpoint coupling -----
+    def _ckpt_path_for(self, variant):
+        """Path the given SAM2.1 variant's checkpoint would live at (same dir as
+        the currently-loaded one)."""
+        return os.path.join(os.path.dirname(self.checkpoint), f"sam2.1_hiera_{variant}.pt")
+
+    def _resolved_variant(self):
+        """(variant, on_disk, path) for the current model selection. 'Auto'
+        resolves through the host profile, exactly as a run would."""
+        pref = self.cb_model.currentText() if hasattr(self, "cb_model") else "Auto"
+        if pref in ("Auto", ""):
+            try:
+                variant = self._current_profile().model_variant
+            except Exception:
+                variant = "base_plus"
+        else:
+            variant = pref
+        path = self._ckpt_path_for(variant)
+        on_disk = os.path.isfile(path) or (
+            variant in os.path.basename(self.checkpoint) and os.path.isfile(self.checkpoint))
+        return variant, on_disk, path
+
+    def _update_ckpt_label(self):
+        if not hasattr(self, "lbl_ckpt"):
+            return
+        variant, on_disk, _ = self._resolved_variant()
+        status = "✓ on disk" if on_disk else "✗ NOT downloaded → will fall back to base_plus"
+        self.lbl_ckpt.setText(
+            f"Model: hiera_{variant} — {status}\nActive file: …/{os.path.basename(self.checkpoint)}")
+
+    def _refresh_effect(self, *a):
+        """Translate the current knobs into what SAM will actually do and show it
+        in the live readout: section size to SAM, #tiles, est. time, resolved
+        model + whether its checkpoint is present."""
+        if not hasattr(self, "lbl_effect"):
+            return
+        try:
+            variant, on_disk, _ = self._resolved_variant()
+        except Exception:
+            variant, on_disk = "base_plus", True
+        # effective overview long side (loaded image wins; else the configured one)
+        ov = getattr(self, "overview", None)
+        if ov is not None:
+            H, W = ov.shape[:2]
+            ov_long = max(H, W)
+        else:
+            H = W = None
+            ov_long = int(self.sp_target.value())
+        tile = int(self.sp_tile.value())
+        eff_tile = tile if tile > 0 else ov_long
+        parts = []
+        cal = getattr(self, "calibration", None)
+        sec_px = float(cal["section_px"]) if (cal and cal.get("section_px")) else None
+        if sec_px is not None:
+            to_sam = sec_px * 1024.0 / max(eff_tile, 1)
+            note = f" (+{int(self.sp_crop.value())} crop layer{'s' if self.sp_crop.value() > 1 else ''})" \
+                if self.sp_crop.value() >= 1 else ""
+            parts.append(f"section ≈ {to_sam:.0f}px → SAM{note}")
+        # number of tiles (only meaningful once an image is loaded)
+        n_tiles = None
+        if H is not None:
+            if eff_tile >= max(H, W):
+                n_tiles = 1
+            else:
+                step = max(1.0, eff_tile * (1.0 - float(self.sp_overlap.value())))
+                n_tiles = int(np.ceil(H / step) * np.ceil(W / step))
+            parts.append(f"{n_tiles} tile{'s' if n_tiles != 1 else ''}")
+            try:
+                est = host_profile.estimate_run(
+                    self._current_profile(), n_tiles, int(self.sp_pps.value()), variant)
+                s = est["seconds"]
+                parts.append(f"~{s:.0f}s" if s < 90 else f"~{s / 60:.1f} min")
+            except Exception:
+                pass
+        parts.append(f"hiera_{variant} " + ("✓" if on_disk else "✗ falls back to base_plus"))
+        self.lbl_effect.setText("Effect:  " + "  ·  ".join(parts))
+
+    def _on_crop_layers_changed(self, v):
+        """crop overlap / crop grid ÷ are inert at 0 layers — enable them only
+        when crop layers ≥ 1, and bump the grid divisor to the usual 2."""
+        on = int(v) >= 1
+        self.sp_cropov.setEnabled(on)
+        self.sp_cropds.setEnabled(on)
+        if on and self.sp_cropds.value() < 2:
+            self.sp_cropds.blockSignals(True); self.sp_cropds.setValue(2); self.sp_cropds.blockSignals(False)
+        self._refresh_effect()
+
+    def _on_model_changed(self, *a):
+        self._update_ckpt_label()
+        variant, on_disk, _ = self._resolved_variant()
+        if (not on_disk) and self.cb_model.currentText() not in ("Auto", ""):
+            self._maybe_offer_download(variant)
+        self._refresh_effect()
+
+    def _maybe_offer_download(self, variant):
+        if getattr(self, "_dl", None) is not None and self._dl.isRunning():
+            return
+        mb = SAM21_CKPT_MB.get(variant, 300)
+        r = QMessageBox.question(
+            self, "Download model checkpoint",
+            f"The hiera_{variant} checkpoint isn't on disk (~{mb} MB).\n"
+            f"Without it, '{variant}' silently runs base_plus instead — no speed/size change.\n\n"
+            "Download it now?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if r == QMessageBox.Yes:
+            self._download_checkpoint(variant)
+
+    def _download_checkpoint(self, variant):
+        url = SAM21_CKPT_URLS.get(variant)
+        if not url:
+            self.log_msg(f"No download URL for variant '{variant}'."); return
+        dest = self._ckpt_path_for(variant)
+        if os.path.isfile(dest):
+            self.checkpoint = dest; self._update_ckpt_label(); self._refresh_effect()
+            self.log_msg(f"{os.path.basename(dest)} already present."); return
+        if getattr(self, "_dl", None) is not None and self._dl.isRunning():
+            self.log_msg("A checkpoint download is already running."); return
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        self.log_msg(f"⤓ Downloading {os.path.basename(dest)} (~{SAM21_CKPT_MB.get(variant, '?')} MB)…")
+        self.progress.setVisible(True); self.progress.setValue(0)
+        self._dl = _CheckpointDownloader(url, dest)
+        self._dl.progress.connect(self.progress.setValue)
+        self._dl.done.connect(self._on_ckpt_downloaded)
+        self._dl.failed.connect(self._on_ckpt_failed)
+        self._dl.start()
+
+    def _on_ckpt_downloaded(self, path):
+        self.progress.setVisible(False)
+        self.checkpoint = path
+        self._update_ckpt_label(); self._refresh_effect()
+        self.log_msg(f"✔️ Downloaded {os.path.basename(path)} — '{self.cb_model.currentText()}' is now live.")
+
+    def _on_ckpt_failed(self, msg):
+        self.progress.setVisible(False)
+        self.log_msg(f"❌ Checkpoint download failed: {msg}")
+
+    # ----- persisted Zarr display-pyramid cache -----
+    def _start_zarr_build(self, image_path, zpath):
+        """Kick off a background build of the on-disk Zarr pyramid for next time
+        (and swap the live display to it once ready)."""
+        builder = _ZarrPyramidBuilder(image_path, zpath)
+        builder.progress.connect(self._on_zarr_progress)
+        builder.done.connect(self._on_zarr_done)
+        builder.failed.connect(self._on_zarr_failed)
+        builder.finished.connect(lambda b=builder: self._zarr_builders.discard(b))
+        self._zarr_builders.add(builder)
+        builder.start()
+
+    def _on_zarr_progress(self, done, total):
+        self.log_msg(f"Zarr cache: level {done}/{total} written.")
+
+    def _on_zarr_done(self, image_path, levels):
+        # A different image may have been loaded while the build ran — only swap
+        # the live display if it still belongs to the on-screen image.
+        if image_path != self.image_path or self.image_layer is None:
+            self.log_msg(f"Zarr cache built for {os.path.basename(image_path)} "
+                         "(ready for next load).")
+            return
+        try:
+            self.image_layer.data = levels   # same shapes → scale/translate unchanged
+            self._display_levels = levels
+            self.log_msg("✔️ Zarr cache built — display now reads the fast on-disk copy.")
+        except Exception:
+            self.log_msg("[warn] Zarr cache built but live swap failed (active next "
+                         "load):\n" + traceback.format_exc())
+
+    def _on_zarr_failed(self, image_path, msg):
+        self.log_msg(f"[warn] Zarr cache build failed: {msg}")
 
     # ----- load image + restore session -----
     def select_image(self):
@@ -465,11 +759,26 @@ class SectionIdentificationGUI(QWidget):
                 # (so detection/save/load/export are unchanged); the Shapes layers
                 # are aligned to the full-res image via a per-layer `scale`.
                 try:
-                    levels, _ = czi_io.build_czi_dask_pyramid(path)
-                    self._display_levels = levels
                     self._display_scale = 1.0 / geom.zoom  # overview px -> full-res world
-                    self.log_msg(f"Full-res lazy multiscale: {len(levels)} levels "
-                                 f"(L0 {levels[0].shape[1]}x{levels[0].shape[0]} px).")
+                    # Prefer the persisted chunked-Zarr pyramid in the image's
+                    # `_files` folder: a fast Blosc block read on every zoom/pan,
+                    # instead of re-decoding the CZI region each time. Built once
+                    # in the background on the first load (see _start_zarr_build).
+                    from section_identification.export import resolve_export_dir
+                    cache_dir = resolve_export_dir(path)
+                    zpath = czi_io.zarr_pyramid_path(cache_dir, path)
+                    if czi_io.zarr_pyramid_exists(zpath, path):
+                        levels = czi_io.open_czi_zarr_pyramid(zpath)
+                        self._display_levels = levels
+                        self.log_msg(f"Cached Zarr pyramid: {len(levels)} levels "
+                                     f"(L0 {levels[0].shape[1]}x{levels[0].shape[0]} px).")
+                    else:
+                        levels, _ = czi_io.build_czi_dask_pyramid(path)
+                        self._display_levels = levels
+                        self.log_msg(f"Full-res lazy multiscale: {len(levels)} levels "
+                                     f"(L0 {levels[0].shape[1]}x{levels[0].shape[0]} px). "
+                                     "Building on-disk Zarr cache in the background…")
+                        self._start_zarr_build(path, zpath)
                 except Exception:
                     self.log_msg("[warn] lazy multiscale unavailable; using overview:\n"
                                  + traceback.format_exc())
@@ -528,6 +837,8 @@ class SectionIdentificationGUI(QWidget):
         # them on the Fiducials layer (idempotent across reloads via dedup).
         if czi_io.is_czi(self.image_path):
             self.import_czi_fiducials(auto=True)
+        self._frame_dirty = False    # geom now matches the current overview px
+        self._refresh_effect()   # now that the overview is loaded: tiles + time estimate
 
     def _restore_session(self):
         """Return (polys_overview, fids_overview) from project JSON, else CZI
@@ -571,6 +882,98 @@ class SectionIdentificationGUI(QWidget):
         display mode, so ordinary images are unaffected."""
         s = getattr(self, "_display_scale", 1.0)
         return (s, s)
+
+    def _on_overview_px_changed(self, *a):
+        """The overview-px lever changed. Mark the frame stale and (debounced)
+        re-read the overview so the display and the detection worker can't run in
+        different coordinate frames. Inert for non-CZI (overview px is a no-op
+        there — the worker reads the file at full res)."""
+        if self.image_path and czi_io.is_czi(self.image_path) and self.geom is not None:
+            self._frame_dirty = True
+            self._frame_timer.start(500)
+
+    def _sync_overview_frame(self):
+        """Re-read the CZI overview at the CURRENT overview px and re-align every
+        layer to it, so masks/tiles/preview and the detection worker share ONE
+        coordinate frame. Existing annotations are migrated by the zoom ratio (so
+        they keep their on-screen position) and calibrated area thresholds
+        (overview px^2) are rescaled. No-op for non-CZI or when nothing changed.
+        Cheap: reads a downscaled pyramid level, never the full-res image."""
+        self._frame_dirty = False
+        if not (self.image_path and czi_io.is_czi(self.image_path)
+                and self.geom is not None):
+            return
+        # Don't reshape the frame out from under a streaming run.
+        if self.proc is not None and self.proc.state() != QProcess.NotRunning:
+            self._frame_dirty = True
+            return
+        target = int(self.sp_target.value())
+        old_zoom = float(self.geom.zoom)
+        try:
+            arr, new_geom, _ = czi_io.read_czi_overview(
+                self.image_path, target_long_side=target)
+        except Exception:
+            self.log_msg("[warn] overview re-read failed; frame unchanged:\n"
+                         + traceback.format_exc())
+            return
+        new_zoom = float(new_geom.zoom)
+        if abs(new_zoom - old_zoom) <= 1e-9 * max(1.0, old_zoom):
+            return                                  # already in this frame
+        r = new_zoom / old_zoom                     # old overview px -> new overview px
+        self.overview = czi_io.to_rgb8(arr)
+        self.geom = new_geom
+        self._display_scale = (1.0 / new_zoom) if self._display_levels is not None else 1.0
+        # The lazy full-res pyramid is frame-independent (always level0 = full res),
+        # so the image layer is untouched there; only the simple overview-as-image
+        # fallback shows self.overview directly and must be refreshed.
+        if self._display_levels is None and self.image_layer is not None:
+            try:
+                if max(self.overview.shape[:2]) > 4096:
+                    self.image_layer.data = [self.overview, self.overview[::2, ::2],
+                                             self.overview[::4, ::4]]
+                else:
+                    self.image_layer.data = self.overview
+            except Exception:
+                pass
+        # Migrate live annotation coordinates so they stay on the same features,
+        # then re-apply the per-layer scale for the new frame (world position is
+        # preserved: data*r * 1/new_zoom == data * 1/old_zoom).
+        for attr in ("shapes_layer", "raw_layer", "calib_layer", "fid_layer"):
+            lyr = getattr(self, attr, None)
+            if lyr is None or lyr not in self.viewer.layers:
+                continue
+            try:
+                d = lyr.data
+                if isinstance(d, np.ndarray):
+                    if d.size:
+                        lyr.data = d.astype(float) * r
+                elif d:
+                    lyr.data = [np.asarray(p, dtype=float) * r for p in d]
+            except Exception:
+                pass
+            try:
+                lyr.scale = self._layer_scale()
+            except Exception:
+                pass
+        # Calibrated thresholds are in overview pixels of the OLD frame.
+        cal = getattr(self, "calibration", None)
+        if cal:
+            for k in ("min_area", "max_area"):
+                if cal.get(k) is not None:
+                    try:
+                        cal[k] = float(cal[k]) * r * r
+                    except Exception:
+                        pass
+            if cal.get("section_px") is not None:
+                try:
+                    cal["section_px"] = float(cal["section_px"]) * r
+                except Exception:
+                    pass
+        self._param_viz_refresh()
+        self._refresh_effect()
+        self.log_msg(f"Overview frame re-read at {max(self.overview.shape[:2])}px "
+                     f"(zoom {new_zoom:.4g}); masks/tiles/preview now overlay the "
+                     "full-res image in one frame.")
 
     def _ensure_edit_layers(self, polygons_xy):
         if self.shapes_layer is not None and self.shapes_layer in self.viewer.layers:
@@ -744,6 +1147,12 @@ class SectionIdentificationGUI(QWidget):
         if self.proc is not None and self.proc.state() != QProcess.NotRunning:
             self.log_msg("Detection already running — press Stop first."); return
 
+        # Guarantee the display frame matches the overview px the worker is about to
+        # read, so the streamed tiles/masks overlay the full-res image instead of a
+        # stale-scale ghost (the worker re-reads the overview at this same value).
+        if self._frame_dirty:
+            self._sync_overview_frame()
+
         # One streaming engine (SAM's whole-image generator can't stream, so we
         # always tile — often a single whole-image tile). Every SAM parameter
         # comes from the (calibrated) Advanced fields; the host profile picks the
@@ -782,6 +1191,7 @@ class SectionIdentificationGUI(QWidget):
             self.chk_viz.setChecked(True)
         whole = tile_px >= max(self.overview.shape[:2])
         self.log_msg(f"▶ Detection on {prof.device} ({os.path.basename(ckpt)}): "
+                     f"overview {self.sp_target.value()}px · "
                      f"{'whole image' if whole else 'tiles'}, tile_px={tile_px}, grid "
                      f"{self.sp_pps.value()}, area {min_area:.0f}–{max_area:.0f}.")
         self._proc_buf = ""
@@ -985,22 +1395,37 @@ class SectionIdentificationGUI(QWidget):
         from section_identification.calibration import calibrate, summary
         try:
             prof = self._current_profile()
-            self.calibration = calibrate(
-                polys, geom=self.geom, overview_long_side=max(self.overview.shape[:2]),
-                target_sam_px=self.sp_targetsam.value(), profile=prof)
+            cal = calibrate(polys, geom=self.geom,
+                            overview_long_side=max(self.overview.shape[:2]), profile=prof)
         except Exception:
             self.log_msg("❌ calibration failed:\n" + traceback.format_exc()); return
-        self._apply_calibration_to_ui(self.calibration, prof)
-        self.log_msg("✔️ " + summary(self.calibration))
-        self.log_msg("→ " + self.calibration.get("plan_summary", ""))
-        # SAM runs on the overview; recommend a finer one if real detail is poor.
-        rec = self.calibration.get("recommended_overview_long_side")
+
+        # Encoder-native plan: read the overview at the recommended N·1024 so SAM's
+        # tiles are 1024 px (1:1 into the encoder). Reload there — UP when sections are
+        # too small to resolve whole, DOWN when a needlessly fine overview is just being
+        # re-tiled for memory — then re-measure the migrated examples so the plan is
+        # consistent in the frame detection will actually run in.
+        rec = cal.get("recommended_overview_long_side")
         cur = max(self.overview.shape[:2])
-        if rec and rec > cur * 1.3:
+        if rec and rec != cur and czi_io.is_czi(self.image_path) and self.geom is not None:
             self.sp_target.setValue(int(rec))
-            self.log_msg(f"⚠️ Sections are only ~{self.calibration['section_px']:.0f}px in "
-                         f"this {cur}px overview. Overview long side set to {rec}; "
-                         "RELOAD the image for real detail, then re-calibrate before running.")
+            self._sync_overview_frame()           # re-read at rec + migrate examples now
+            polys = [napari_to_xy(d) for d in self._ensure_calib_layer().data
+                     if len(np.asarray(d)) >= 3]
+            if polys:
+                try:
+                    cal = calibrate(polys, geom=self.geom,
+                                    overview_long_side=max(self.overview.shape[:2]), profile=prof)
+                except Exception:
+                    self.log_msg("❌ re-calibration failed:\n" + traceback.format_exc())
+            n = max(1, round(rec / 1024))
+            self.log_msg(f"Overview set to {rec}px so SAM tiles are 1024 px" +
+                         (" — whole image." if n <= 1 else f" — {n}×{n} tiles."))
+
+        self.calibration = cal
+        self._apply_calibration_to_ui(cal, prof)
+        self.log_msg("✔️ " + summary(cal))
+        self.log_msg("→ " + cal.get("plan_summary", ""))
 
     def _apply_calibration_to_ui(self, cal, prof=None):
         """Write the calibrated SAM parameters into the Advanced fields + plan."""
@@ -1027,6 +1452,9 @@ class SectionIdentificationGUI(QWidget):
             self.sp_ppb.setValue(int(prof.points_per_batch))
             self.lbl_host.setText("Host: " + prof.summary())
         self.lbl_plan.setText("Plan: " + cal.get("plan_summary", ""))
+        self._on_crop_layers_changed(self.sp_crop.value())   # sync crop sub-knob state
+        self._update_ckpt_label()
+        self._refresh_effect()
 
     def preview_tiling(self):
         if self.overview is None:

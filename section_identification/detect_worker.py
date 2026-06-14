@@ -32,13 +32,20 @@ def _run_stream(a):
     else:
         from PIL import Image
         work = np.array(Image.open(a.image).convert("RGB"))
+    # The working resolution (overview px) is what actually drives cost/detail —
+    # echo it so the run log reflects the knob the user changed.
+    print(f"STIM_PROGRESS: working image {work.shape[1]}x{work.shape[0]}px "
+          f"(overview long {max(work.shape[:2])}px).", flush=True)
 
     # tile_px <= 0 (or >= the image) means "one tile = whole image".
     tile_px = a.tile_px if a.tile_px and a.tile_px > 0 else max(work.shape[:2])
     boxes = plan_tiles(work.shape[1], work.shape[0], tile_px, a.overlap)
+    # A tile can't exceed the image, so report the EFFECTIVE tile size (and thus the
+    # true ×upscale SAM applies), not the requested cap.
+    eff_tile = min(int(tile_px), max(work.shape[:2]))
     print("STIM_TILES " + json.dumps([list(map(int, b)) for b in boxes]), flush=True)
-    print(f"STIM_PROGRESS: {len(boxes)} tile(s) of {tile_px}px "
-          f"(SAM sees a section ×{1024.0/tile_px:.1f}).", flush=True)
+    print(f"STIM_PROGRESS: {len(boxes)} tile(s) of {eff_tile}px "
+          f"(SAM sees a section ×{1024.0/eff_tile:.2f}).", flush=True)
 
     def on_tile_start(k, n, box):
         print("STIM_TILESTART " + json.dumps(

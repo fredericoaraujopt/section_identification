@@ -22,6 +22,8 @@ setup(
         "sam2",
         # Zeiss CZI read + in-place metadata edit (edit_czi/set_xml need >=6.0.0)
         "pylibCZIrw>=6.0.0",
+        # Persisted chunked display pyramid (smooth zoom; built once per image)
+        "zarr",
         # GUI
         "napari",
         "qtpy",

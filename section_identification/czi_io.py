@@ -15,6 +15,8 @@ provided: it follows the CZI ``FileHeader`` pointer straight to the
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import struct
 import xml.etree.ElementTree as ET
@@ -431,6 +433,120 @@ def build_czi_dask_pyramid(path: str, channel: int = 0, max_levels: int = 7,
         if max(lw, lh) <= min_level_px:
             break
     return levels, geom
+
+
+# --------------------------------------------------------------------------- #
+# Persisted (on-disk) Zarr pyramid cache
+# --------------------------------------------------------------------------- #
+# `build_czi_dask_pyramid` is instant, but every later zoom/pan re-decodes the
+# visible region straight from the CZI via pylibCZIrw -- that decode+decompress
+# on the interaction path is what makes fast zooming feel laggy. Persisting the
+# pyramid once to a chunked Zarr (Blosc) next to the image turns every later
+# session's zoom into a fast block read instead of a CZI decode. Inspired by the
+# mVis viewer, which builds its pyramid once and caches it beside the source.
+
+ZARR_CHUNK = 1024  # storage chunk (px). Smaller than the 3072 build tile so a
+                   # pan reads less per step and the block cache is finer-grained.
+
+
+def zarr_pyramid_path(out_dir: str, image_path: str) -> str:
+    """Path of the cached Zarr pyramid for ``image_path`` inside ``out_dir``."""
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    return os.path.join(out_dir, f"{stem}_display_pyramid.zarr")
+
+
+def _zarr_meta_path(zpath: str) -> str:
+    return os.path.join(zpath, "_stim_pyramid.json")
+
+
+def _read_zarr_meta(zpath: str):
+    try:
+        with open(_zarr_meta_path(zpath)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def zarr_pyramid_exists(zpath: str, image_path: str | None = None) -> bool:
+    """True only if a COMPLETE, current Zarr pyramid is present at ``zpath``.
+
+    A build that crashed mid-write leaves level dirs but no ``complete`` flag, so
+    it is treated as absent (and rebuilt). When ``image_path`` is given, a cache
+    is also invalidated if the source CZI's size/mtime no longer match.
+    """
+    meta = _read_zarr_meta(zpath)
+    if not meta or not meta.get("complete"):
+        return False
+    for i in range(meta.get("n_levels", 0)):
+        if not os.path.isdir(os.path.join(zpath, str(i))):
+            return False
+    if image_path is not None:
+        src = meta.get("source") or {}
+        try:
+            st = os.stat(image_path)
+        except OSError:
+            return False
+        if src.get("size") != st.st_size or int(src.get("mtime", -1)) != int(st.st_mtime):
+            return False
+    return True
+
+
+def open_czi_zarr_pyramid(zpath: str):
+    """Open a cached Zarr pyramid as a list of dask arrays (level 0 = full res)."""
+    import dask.array as da
+    meta = _read_zarr_meta(zpath)
+    if not meta:
+        raise FileNotFoundError(f"no Zarr pyramid metadata at {zpath!r}")
+    return [da.from_zarr(os.path.join(zpath, str(i)))
+            for i in range(meta["n_levels"])]
+
+
+def write_czi_zarr_pyramid(image_path: str, zpath: str, channel: int = 0,
+                           progress=None, **build_kwargs):
+    """Build the CZI display pyramid once and persist it to a chunked Zarr.
+
+    Decodes the whole CZI exactly once with bounded memory (Dask streams the
+    pyramid block by block). Writes to a ``.part`` dir and renames atomically so
+    a crash never leaves a half-written cache that passes :func:`zarr_pyramid_exists`.
+    Returns the freshly-written pyramid reopened as dask-from-Zarr arrays, so the
+    caller can switch the display to the fast on-disk copy immediately.
+    ``progress(level_done, level_total)`` is called per level if provided.
+    """
+    import shutil
+    import dask
+    import dask.array as da
+
+    levels, _ = build_czi_dask_pyramid(image_path, channel=channel, **build_kwargs)
+    tmp = zpath + ".part"
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    n = len(levels)
+    shapes = []
+    # Force the SINGLE-THREADED scheduler for the decode. Each block opens the CZI
+    # via pylibCZIrw, which is not safe under concurrent reads — the default threaded
+    # scheduler races (a worker dies and surfaces as ``KeyError: '_read_block-…'``)
+    # and runs many full-res blocks at once, breaking the bounded-memory guarantee.
+    # Synchronous = one block at a time; this runs in a background thread already.
+    with dask.config.set(scheduler="single-threaded"):
+        for i, lvl in enumerate(levels):
+            ch = (min(ZARR_CHUNK, lvl.shape[0]), min(ZARR_CHUNK, lvl.shape[1]), 3)
+            da.to_zarr(lvl.rechunk(ch), os.path.join(tmp, str(i)), overwrite=True)
+            shapes.append([int(s) for s in lvl.shape])
+            if progress is not None:
+                progress(i + 1, n)
+    try:
+        st = os.stat(image_path)
+        src = {"size": st.st_size, "mtime": int(st.st_mtime)}
+    except OSError:
+        src = {}
+    with open(os.path.join(tmp, "_stim_pyramid.json"), "w") as f:
+        json.dump({"complete": True, "n_levels": n, "shapes": shapes,
+                   "chunk": ZARR_CHUNK, "source": src}, f)
+    if os.path.isdir(zpath):
+        shutil.rmtree(zpath, ignore_errors=True)
+    os.replace(tmp, zpath)
+    return open_czi_zarr_pyramid(zpath)
 
 
 def is_czi(path: str) -> bool:
