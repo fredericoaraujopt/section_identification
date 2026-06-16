@@ -17,6 +17,7 @@ import math
 import os
 
 import numpy as np
+from qtpy.QtCore import Qt
 from qtpy.QtGui import QImage, QPixmap
 from qtpy.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
                             QFormLayout, QHBoxLayout, QLabel, QProgressBar,
@@ -67,6 +68,41 @@ def build_tile_region_specs(project, geom, tile_um, fc, fr, z):
         })
         counts[s.id] = cols * rows
     return specs, counts
+
+
+def run_export(app, write_contour: bool = True):
+    """File-level wafer export (manifest + CSV + mVis region_names.csv, IDs in
+    imaging/TSP order; optional ZEN .contour). Driven from the shell header so it
+    isn't tied to any single stage panel."""
+    if not app.has_image():
+        app.log("export", "load an image and detect sections first.")
+        return
+    proj = app.sync_sections()
+    geom = app.geom
+    counts = {}
+    tmpl = proj.roi_templates[0] if proj.roi_templates else None
+    if tmpl is not None and tmpl.tile_um and geom is not None:
+        _, counts = build_tile_region_specs(proj, geom, tmpl.tile_um[0],
+                                            tmpl.focus_cols, tmpl.focus_rows, 0.0)
+    manifest = wafer_export.build_manifest(proj, geom, mfov_counts=counts)
+    try:
+        out_dir = legacy_export.resolve_export_dir(app.image_path, None)
+    except Exception:
+        out_dir = os.path.dirname(app.image_path or ".")
+    paths = wafer_export.write_all(
+        manifest, out_dir, adapters=["json_manifest", "csv_table", "mvis_lmb"])
+    if write_contour:
+        try:
+            cpath = wafer_export.write_zen_contour(manifest, out_dir)
+        except Exception as e:
+            cpath = None
+            app.log("export", f"⚠️ ZEN .contour failed: {e}")
+        if cpath:
+            paths["zen_contour"] = cpath
+        elif geom is None:
+            app.log("export", "⚠️ ZEN .contour skipped — no stage-µm transform "
+                    "(CZI source, or calibrate fiducials to stage µm for a PNG/LM image).")
+    app.log("export", f"wrote to {out_dir}: {[os.path.basename(p) for p in paths.values()]}")
 
 
 class _StageBase(QWidget):
@@ -122,10 +158,15 @@ class StageQC(_StageBase):
         self._header("<b>Quality control</b> — debris · folds · shredding · chattering")
         row = QHBoxLayout()
         self.btn_run = QPushButton("Run QC")
+        self.btn_run.setToolTip("Score every detected section for debris, folds, "
+                                "shredding and chattering on a downscaled crop, then "
+                                "colour the wafer by severity.")
         self.btn_run.clicked.connect(self.run_qc)
         row.addWidget(self.btn_run)
         self.cb_color = QComboBox()
         self.cb_color.addItems(["colour by score", "colour by status"])
+        self.cb_color.setToolTip("Colour sections by aggregate QC score, or by "
+                                 "accept / review / reject status.")
         self.cb_color.currentIndexChanged.connect(self._recolor)
         row.addWidget(self.cb_color)
         self.col.addLayout(row)
@@ -147,6 +188,9 @@ class StageQC(_StageBase):
         form.addRow("flag ≥", self.sp_flag)
         self.col.addLayout(form)
         btn_cal = QPushButton("Calibrate thresholds from population")
+        btn_cal.setToolTip("Set each detector's reference from the section "
+                           "population (a high percentile) so only outliers flag. "
+                           "Run QC first.")
         btn_cal.clicked.connect(self._calibrate)
         self.col.addWidget(btn_cal)
         self._building = False
@@ -171,6 +215,7 @@ class StageQC(_StageBase):
         sp.setSingleStep(step)
         sp.setDecimals(dec)
         sp.setValue(val)
+        sp.setMaximumWidth(90)            # keep the QC form compact (no h-scroll)
         sp.valueChanged.connect(self._on_ref_change)
         return sp
 
@@ -279,24 +324,25 @@ class StageROIs(_StageBase):
         self.lbl_fid.setWordWrap(True)
         self.col.addWidget(self.lbl_fid)
         b0 = QPushButton("Read existing mFOVs + focus points from CZI")
+        b0.setToolTip("Read ZEN TileRegions + focus SupportPoints already in the CZI "
+                      "and display them on the wafer (overview pixels).")
         b0.clicked.connect(self._read_existing)
         self.col.addWidget(b0)
 
         b1 = QPushButton("① New ROI draft layer (draw one polygon)")
+        b1.setToolTip("Add an empty layer; draw ONE polygon inside a section to use "
+                      "as the ROI template.")
         b1.clicked.connect(self._new_draft)
         self.col.addWidget(b1)
 
-        sam_row = QHBoxLayout()
-        self.btn_sam = QPushButton("①ᴮ SAM-assist: trace ROI")
-        self.btn_sam.setToolTip("Use the SAM editor to one-click an ROI (e.g. a "
-                                "resin-bounded region); the mask is captured onto "
-                                "the ROI draft layer instead of Sections.")
-        self.btn_sam.clicked.connect(self._sam_assist)
-        sam_row.addWidget(self.btn_sam)
-        self.btn_sam_done = QPushButton("Finish SAM-assist")
-        self.btn_sam_done.clicked.connect(self._finish_sam)
-        sam_row.addWidget(self.btn_sam_done)
-        self.col.addLayout(sam_row)
+        self.btn_sam = QPushButton("SAM-assist: trace ROI (off)")
+        self.btn_sam.setCheckable(True)
+        self.btn_sam.setToolTip("Toggle the SAM editor to one-click an ROI inside a "
+                                "section (e.g. a resin-bounded region); the mask is "
+                                "captured onto the ROI draft, not Sections. Click "
+                                "again to stop — same as the manual detector toggle.")
+        self.btn_sam.toggled.connect(self._toggle_sam)
+        self.col.addWidget(self.btn_sam)
 
         fit_row = QHBoxLayout()
         fit_row.addWidget(QLabel("fit:"))
@@ -311,6 +357,8 @@ class StageROIs(_StageBase):
         self.col.addLayout(fit_row)
 
         b2 = QPushButton("② Define + propagate to all sections")
+        b2.setToolTip("Take the drawn/SAM ROI as a template and place it on every "
+                      "section using that section's pose, then fit per the mode above.")
         b2.clicked.connect(self._propagate)
         self.col.addWidget(b2)
 
@@ -337,6 +385,9 @@ class StageROIs(_StageBase):
         self.col.addLayout(grid)
 
         b3 = QPushButton("③ Write sections + ROI mFOVs into CZI (for ZEN)")
+        b3.setToolTip("Copy the CZI and inject section annotations + one ROI "
+                      "TileRegion (with the tile grid + focus SupportPoints) per "
+                      "section, in imaging order — ready for ZEN acquisition.")
         b3.clicked.connect(self._write_czi)
         self.col.addWidget(b3)
 
@@ -395,30 +446,31 @@ class StageROIs(_StageBase):
                 return None
         return ed
 
-    def _sam_assist(self):
-        if not self._need_image():
-            return
+    def _toggle_sam(self, on):
         ed = self._editor()
         if ed is None:
+            self.btn_sam.setChecked(False)
             return
-        self._new_draft()                     # ensure the ROI draft layer exists
-        try:
-            ed.deactivate()                   # clean slate, then route commits to us
-        except Exception:
-            pass
-        ed.activate(commit_target=self._capture_roi)
-        self.app.log(self.STAGE, "SAM-assist ON — hover inside the ROI, SPACE to "
-                                 "capture it onto the ROI draft, then 'Finish "
-                                 "SAM-assist' and 'Define + propagate'.")
-
-    def _finish_sam(self):
-        ed = getattr(self.app.gui, "_napari_editor", None)
-        if ed is not None:
+        if on:
+            if not self._need_image():
+                self.btn_sam.setChecked(False)
+                return
+            self._new_draft()                 # ensure the ROI draft layer exists
+            try:
+                ed.deactivate()               # clean slate, then route commits to us
+            except Exception:
+                pass
+            ed.activate(commit_target=self._capture_roi)
+            self.btn_sam.setText("SAM-assist: tracing… (click to stop)")
+            self.app.log(self.STAGE, "SAM-assist ON — hover inside the ROI, SPACE to "
+                                     "capture it onto the ROI draft, then 'Define + propagate'.")
+        else:
             try:
                 ed.deactivate()
             except Exception:
                 pass
-        self.app.log(self.STAGE, "SAM-assist OFF.")
+            self.btn_sam.setText("SAM-assist: trace ROI (off)")
+            self.app.log(self.STAGE, "SAM-assist OFF.")
 
     def _capture_roi(self, poly_yx):
         v = self.app.viewer
@@ -438,7 +490,7 @@ class StageROIs(_StageBase):
             v.layers.remove(self.DRAFT)
         try:
             v.add_shapes(name=self.DRAFT, shape_type="polygon", edge_color="magenta",
-                         face_color="transparent", edge_width=2,
+                         face_color="transparent", edge_width=layer_sync._overlay_width(self.app),
                          scale=self.app.layer_scale())
             self.app.log(self.STAGE, "draw one ROI polygon on the 'ROI draft' layer.")
         except Exception as e:
@@ -545,9 +597,14 @@ class StageReorder(_StageBase):
         self._header("<b>Reorder</b> — recover serial order (SIFT) · "
                      "imaging route (TSP)")
         self.btn_sift = QPushButton("① Compute serial order (full-res SIFT)")
+        self.btn_sift.setToolTip("Match every section pair with full-resolution SIFT "
+                                 "(rotation-invariant) and recover the slice series; "
+                                 "draws match lines + the recovered chain.")
         self.btn_sift.clicked.connect(self.run_sift)
         self.col.addWidget(self.btn_sift)
         self.btn_tsp = QPushButton("② Compute imaging route (TSP, min travel)")
+        self.btn_tsp.setToolTip("Order imaging to minimise total stage travel "
+                                "(open-path TSP) over section centroids; draws the route.")
         self.btn_tsp.clicked.connect(self.run_tsp)
         self.col.addWidget(self.btn_tsp)
         self.btn_inspect = QPushButton("Inspect match: pick 2 sections")
@@ -562,9 +619,16 @@ class StageReorder(_StageBase):
         self.col.addWidget(self.btn_swap)
         rrow = QHBoxLayout()
         rrow.addWidget(QLabel("route:"))
+        _route_tips = {
+            "earlier": "Move the selected section one step earlier in the imaging route.",
+            "later": "Move the selected section one step later in the imaging route.",
+            "drop": "Remove the selected section from the imaging route.",
+            "reverse": "Reverse the whole imaging route order.",
+        }
         for label, op in (("◀ earlier", "earlier"), ("later ▶", "later"),
                           ("drop", "drop"), ("reverse", "reverse")):
             b = QPushButton(label)
+            b.setToolTip(_route_tips[op])
             b.clicked.connect(lambda _=False, o=op: self._route_op(o))
             rrow.addWidget(b)
         self.col.addLayout(rrow)
@@ -577,13 +641,10 @@ class StageReorder(_StageBase):
         self.btn_heat.clicked.connect(self._show_heatmap)
         self.col.addWidget(self.btn_heat)
         self._heat_dlg = None
-        self.btn_export = QPushButton("③ Export wafer manifest + mVis (region_names.csv)")
-        self.btn_export.clicked.connect(self.export_wafer)
-        self.col.addWidget(self.btn_export)
         self.lbl = QLabel("SIFT matches every section pair (rotation-invariant) "
                           "and recovers the slice series; TSP then orders imaging "
-                          "to minimise stage travel. On CZI export, IDs are "
-                          "renumbered to the TSP order (ZEN images by ID).")
+                          "to minimise stage travel. Export (top bar) renumbers "
+                          "IDs to the TSP order (ZEN images by ID).")
         self.lbl.setWordWrap(True)
         self.col.addWidget(self.lbl)
         self.lbl_travel = QLabel("")
@@ -732,33 +793,13 @@ class StageReorder(_StageBase):
         except Exception as e:
             self.app.log(self.STAGE, f"heatmap error: {e}")
 
-    def export_wafer(self):
-        if not self._need_image():
-            return
-        proj = self.app.sync_sections()
-        geom = self.app.geom
-        counts = {}
-        tmpl = proj.roi_templates[0] if proj.roi_templates else None
-        if tmpl is not None and tmpl.tile_um and geom is not None:
-            _, counts = build_tile_region_specs(proj, geom, tmpl.tile_um[0],
-                                                tmpl.focus_cols, tmpl.focus_rows, 0.0)
-        manifest = wafer_export.build_manifest(proj, geom, mfov_counts=counts)
-        try:
-            out_dir = legacy_export.resolve_export_dir(self.app.image_path, None)
-        except Exception:
-            out_dir = os.path.dirname(self.app.image_path or ".")
-        paths = wafer_export.write_all(
-            manifest, out_dir, adapters=["json_manifest", "csv_table", "mvis_lmb"])
-        self.app.log(self.STAGE, f"wafer exported (IDs in imaging order): "
-                                 f"{[os.path.basename(p) for p in paths.values()]}")
-
-
 # --------------------------------------------------------------------------- #
 # tab shell
 # --------------------------------------------------------------------------- #
 def attach_workflow(viewer, gui):
-    """Build the 4-tab shell (Sections=existing GUI) + bottom section table and
-    dock them. Returns the StimApp. Raises on failure (caller guards)."""
+    """Build the 4-tab shell (Sections=existing GUI) + a file-level header
+    (import/export) + bottom section table + a single shared log. Returns the
+    StimApp. Raises on failure (caller guards)."""
     app = StimApp(gui)
     nav = FovNavigator(app)
     table = SectionTableDock(app, nav)
@@ -766,6 +807,7 @@ def attach_workflow(viewer, gui):
     tabs = QTabWidget()
     gui_scroll = QScrollArea()
     gui_scroll.setWidgetResizable(True)
+    gui_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
     gui_scroll.setWidget(gui)
     tabs.addTab(gui_scroll, "① Sections")
     rois = StageROIs(app, nav, table)
@@ -774,6 +816,54 @@ def attach_workflow(viewer, gui):
     tabs.addTab(_wrap(rois), "② ROIs")
     tabs.addTab(_wrap(qc), "③ QC")
     tabs.addTab(_wrap(reorder), "④ Reorder")
+
+    # ---- file-level header: import + export sit OUTSIDE the per-stage panels ----
+    header = QHBoxLayout()
+    btn_open = QPushButton("⤒ Open image…")
+    btn_open.setToolTip("Open a wafer image (CZI whole-slide, or PNG/montage).")
+    btn_open.clicked.connect(lambda: getattr(gui, "select_image", lambda: None)())
+    btn_export = QPushButton("⤓ Export wafer…")
+    btn_export.setToolTip("Write the wafer manifest + per-section CSV + mVis "
+                          "region_names.csv (IDs in imaging/TSP order), and the "
+                          "ZEN .contour if enabled. Applies to the whole wafer.")
+    chk_contour = QCheckBox("ZEN .contour")
+    chk_contour.setChecked(True)
+    chk_contour.setToolTip("Also write a ZEN .contour: one labelled stage-µm polygon "
+                           "per section in imaging order. Needs stage µm (a CZI "
+                           "source, or a PNG/LM image with fiducials calibrated to µm).")
+    btn_export.clicked.connect(lambda: run_export(app, chk_contour.isChecked()))
+    header.addWidget(btn_open)
+    header.addWidget(btn_export)
+    header.addWidget(chk_contour)
+    header.addStretch(1)
+
+    container = QWidget()
+    cl = QVBoxLayout(container)
+    cl.setContentsMargins(2, 2, 2, 2)
+    cl.setSpacing(4)
+    cl.addLayout(header)
+    cl.addWidget(tabs)
+
+    # ---- the ONE log: mirror the GUI's log (which also captures detector
+    # stdout via log_msg->print->write->append) into the footer; hide the
+    # Sections-tab copy so there's a single global log. ----
+    log_widget = QTextEdit()
+    log_widget.setReadOnly(True)
+    log_widget.setMinimumHeight(120)
+    try:
+        if getattr(gui, "log", None) is not None:
+            _orig_append = gui.log.append
+
+            def _mirror(text, _o=_orig_append):
+                _o(text)
+                try:
+                    log_widget.append(str(text).rstrip())
+                except Exception:
+                    pass
+            gui.log.append = _mirror
+            gui.log.setVisible(False)
+    except Exception:
+        pass
 
     loaded = {"for": None}
 
@@ -790,13 +880,7 @@ def attach_workflow(viewer, gui):
             pass
     tabs.currentChanged.connect(_on_tab)
 
-    # shared footer log so messages mirror across all tabs (not just Sections)
-    log_widget = QTextEdit()
-    log_widget.setReadOnly(True)
-    log_widget.setMinimumHeight(70)
-    app.add_log_sink(lambda line: log_widget.append(line))
-
-    viewer.window.add_dock_widget(tabs, name="STiM", area="right")
+    viewer.window.add_dock_widget(container, name="STiM", area="right")
     viewer.window.add_dock_widget(table, name="Sections", area="bottom")
     viewer.window.add_dock_widget(log_widget, name="Workflow log", area="bottom")
     return app
@@ -805,5 +889,6 @@ def attach_workflow(viewer, gui):
 def _wrap(widget):
     sc = QScrollArea()
     sc.setWidgetResizable(True)
+    sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)   # reflow to width; no h-scroll
     sc.setWidget(widget)
     return sc

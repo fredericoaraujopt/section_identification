@@ -41,6 +41,54 @@ def _centroid_yx(section):
     return (cy, cx)
 
 
+def _overlay_width(app, frac: float = 0.012, lo: float = 0.5, hi: float = 8.0):
+    """A thin, consistent overlay edge width (data units) scaled to the median
+    section size, so outlines stay ~1 px on screen regardless of overview px."""
+    sizes = []
+    for s in app.project.sections:
+        x0, y0, x1, y1 = s.bbox()
+        sizes.append(max(x1 - x0, y1 - y0))
+    if not sizes:
+        return 1.0
+    med = sorted(sizes)[len(sizes) // 2]
+    return float(min(max(med * frac, lo), hi))
+
+
+ORIENT_LAYER = "Orientation"
+
+
+def show_orientation(app):
+    """Draw, per section, an arrow from its centre along the recovered canonical
+    ('up') axis — the visual interpretation of unifying section orientations."""
+    viewer = app.viewer
+    _remove(viewer, ORIENT_LAYER)
+    app.ensure_poses()
+    vecs = []
+    for s in app.project.sections:
+        if s.pose.center is None:
+            continue
+        cx, cy = s.pose.center
+        ang = np.radians(s.pose.angle_deg)
+        x0, y0, x1, y1 = s.bbox()
+        L = 0.45 * max(x1 - x0, y1 - y0)
+        vecs.append([[cy, cx], [float(np.sin(ang) * L), float(np.cos(ang) * L)]])
+    if not vecs:
+        app.log("proofread", "no sections to orient.")
+        return
+    try:
+        viewer.add_vectors(np.asarray(vecs, float), name=ORIENT_LAYER,
+                           edge_color="yellow", vector_style="arrow",
+                           edge_width=_overlay_width(app), scale=app.layer_scale())
+        app.log("proofread", f"orientation arrows for {len(vecs)} sections "
+                             "(each points along its canonical 'up' axis).")
+    except Exception as e:
+        app.log("proofread", f"orientation overlay error: {e}")
+
+
+def clear_orientation(app):
+    _remove(app.viewer, ORIENT_LAYER)
+
+
 # --------------------------------------------------------------------------- #
 # QC: recolour the existing Sections layer by severity
 # --------------------------------------------------------------------------- #
@@ -135,7 +183,7 @@ def show_rois(app):
     try:
         viewer.add_shapes(polys, shape_type="polygon", name=ROI_LAYER,
                           edge_color="cyan", face_color="transparent",
-                          edge_width=2, scale=app.layer_scale())
+                          edge_width=_overlay_width(app), scale=app.layer_scale())
     except Exception as e:
         app.log("rois", f"overlay error: {e}")
 
@@ -167,7 +215,7 @@ def show_existing_acquisition(app, data):
         try:
             viewer.add_shapes(regs, shape_type="polygon", name=EXIST_MFOV,
                               edge_color="lime", face_color="transparent",
-                              edge_width=2, scale=app.layer_scale())
+                              edge_width=_overlay_width(app), scale=app.layer_scale())
         except Exception as e:
             app.log("rois", f"mFOV overlay error: {e}")
 
@@ -255,9 +303,9 @@ def show_serial_chain(app):
         y1, x1 = _centroid_yx(seq[k + 1])
         vectors.append([[y0, x0], [y1 - y0, x1 - x0]])
     try:
-        viewer.add_vectors(np.array(vectors), name=CHAIN_LAYER, edge_width=2,
-                           vector_style="arrow", edge_color="orange",
-                           scale=app.layer_scale())
+        viewer.add_vectors(np.array(vectors), name=CHAIN_LAYER,
+                           edge_width=_overlay_width(app), vector_style="arrow",
+                           edge_color="orange", scale=app.layer_scale())
     except Exception as e:
         app.log("reorder", f"chain overlay error: {e}")
 
@@ -290,8 +338,8 @@ def show_route(app):
             y1, x1 = pts[k + 1]
             vectors.append([[y0, x0], [y1 - y0, x1 - x0]])
         try:
-            viewer.add_vectors(np.array(vectors), name=ROUTE_LAYER, edge_width=2,
-                               vector_style="arrow", edge_color="yellow",
-                               scale=app.layer_scale())
+            viewer.add_vectors(np.array(vectors), name=ROUTE_LAYER,
+                               edge_width=_overlay_width(app), vector_style="arrow",
+                               edge_color="yellow", scale=app.layer_scale())
         except Exception as e:
             app.log("imaging", f"route overlay error: {e}")

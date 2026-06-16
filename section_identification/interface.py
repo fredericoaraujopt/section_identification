@@ -214,6 +214,14 @@ class SectionIdentificationGUI(QWidget):
         self.lbl_effect.setStyleSheet("QLabel{background:#16241a;padding:6px;border-radius:4px;}")
         det.addWidget(self.lbl_effect)
 
+        # Live preview is broadly useful, so it lives at the detector top level
+        # (not buried in Advanced).
+        self.chk_viz = QCheckBox("👁 Preview parameters on the image (live)")
+        self.chk_viz.setToolTip("Overlay SAM's query-point grid, the tile grid, its "
+                                "sub-crops and a min-area disc — they update as you "
+                                "change the values, so you see how SAM will behave.")
+        det.addWidget(self.chk_viz)
+
         # ---- Advanced (nested fold): full SAM parameter set; each row has a
         #      tooltip + a "?" that opens that parameter's section in the guide ----
         self.btn_adv = QPushButton("▸ Advanced parameters"); self.btn_adv.setCheckable(True)
@@ -224,11 +232,6 @@ class SectionIdentificationGUI(QWidget):
         advcol = QVBoxLayout(adv); advcol.setContentsMargins(0, 4, 10, 4)
         self.btn_guide = QPushButton("📖 Open parameter guide")
         advcol.addWidget(self.btn_guide)
-        self.chk_viz = QCheckBox("👁 Preview parameters on the image (live)")
-        self.chk_viz.setToolTip("Overlay SAM's query-point grid, the tile grid, its "
-                                "sub-crops and a min-area disc — they update as you "
-                                "change the values, so you see how SAM will behave.")
-        advcol.addWidget(self.chk_viz)
         self.btn_adv.toggled.connect(
             lambda on: (adv.setVisible(on),
                         self.btn_adv.setText(("▾ " if on else "▸ ") + "Advanced parameters")))
@@ -734,11 +737,13 @@ class SectionIdentificationGUI(QWidget):
 
     # ----- load image + restore session -----
     def select_image(self):
+        start = getattr(self, "_last_dir", "") or ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select an image", "",
+            self, "Select an image", start,
             "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.czi)")
         if not path:
             return
+        self._last_dir = os.path.dirname(path)     # reopen here next time
         self.image_path = path
         self.lbl_path.setText(f"Selected: {os.path.basename(path)}")
         self.lbl_path.setToolTip(path)
@@ -981,7 +986,8 @@ class SectionIdentificationGUI(QWidget):
         data = [xy_to_napari(p) for p in polygons_xy] if polygons_xy else []
         self.shapes_layer = self.viewer.add_shapes(
             data, shape_type="polygon", name="Sections",
-            face_color=[1, 0, 0, 0.18], edge_width=4, scale=self._layer_scale())
+            face_color=[1, 0, 0, 0.18], edge_width=self._outline_width(),
+            scale=self._layer_scale())
         try:
             self.shapes_layer.edge_color = "red"
         except Exception:
@@ -1003,12 +1009,22 @@ class SectionIdentificationGUI(QWidget):
             except Exception:
                 pass
 
+    def _outline_width(self):
+        """A thin, ~consistent outline width (overview-data units) scaled to the
+        overview size, so section/calibration outlines stay ~thin regardless of
+        the overview-px setting (world width ≈ overview_long·0.0005 / zoom)."""
+        try:
+            return max(1.0, max(self.overview.shape[:2]) * 0.0005)
+        except Exception:
+            return 1.0
+
     def _ensure_calib_layer(self):
         if self.calib_layer is None or self.calib_layer not in self.viewer.layers:
             data = [xy_to_napari(p) for p in getattr(self, "_restored_calib_xy", [])]
             self.calib_layer = self.viewer.add_shapes(
                 data, shape_type="polygon", name="Calibration examples",
-                face_color=[0, 1, 0, 0.25], edge_width=4, scale=self._layer_scale())
+                face_color=[0, 1, 0, 0.25], edge_width=self._outline_width(),
+                scale=self._layer_scale())
             try:
                 self.calib_layer.edge_color = "lime"
             except Exception:

@@ -39,11 +39,32 @@ class FovNavigator:
         return (x0 * sx, y0 * sy, x1 * sx, y1 * sy)
 
     def _canvas_px(self):
-        try:
-            sz = self.app.viewer.window.qt_viewer.canvas.size
-            return (float(sz[0]), float(sz[1]))
-        except Exception:
-            return (900.0, 700.0)
+        # napari 0.7 moved the qt viewer to a private attr on some builds; try both.
+        for getter in (lambda: self.app.viewer.window._qt_viewer.canvas.size,
+                       lambda: self.app.viewer.window.qt_viewer.canvas.size):
+            try:
+                sz = getter()
+                if sz and sz[0] and sz[1]:
+                    return (float(sz[0]), float(sz[1]))
+            except Exception:
+                continue
+        return (900.0, 700.0)
+
+    def _consistent_zoom(self):
+        """A single zoom used for ALL sections so they appear at the same
+        magnification — the median section spans ~60% of the canvas."""
+        secs = self.app.project.sections
+        sy, sx = self._scale()
+        sizes = []
+        for s in secs:
+            x0, y0, x1, y1 = s.bbox()
+            sizes.append(max((x1 - x0) * sx, (y1 - y0) * sy))
+        sizes = [v for v in sizes if v > 0]
+        if not sizes:
+            return None
+        med = sorted(sizes)[len(sizes) // 2]
+        cw, ch = self._canvas_px()
+        return float(min(cw, ch)) / (med * 1.6)
 
     def _cam_world_xy(self):
         c = list(self.app.viewer.camera.center)
@@ -58,6 +79,31 @@ class FovNavigator:
             cam.zoom = float(zoom)
 
     # -- navigation --
+    def _center_world(self, section):
+        sy, sx = self._scale()
+        cx, cy = section.centroid()
+        return (cx * sx, cy * sy)
+
+    def center_on(self, section):
+        """Recenter on a section, KEEPING the current zoom (single-click)."""
+        if section is None:
+            return
+        wx, wy = self._center_world(section)
+        self._set_cam(wx, wy)
+        self._current = section
+
+    def fit_consistent(self, section):
+        """Center on a section at the project-wide CONSISTENT magnification
+        (double-click) — every section snaps to the same zoom."""
+        if section is None:
+            return
+        z = self._consistent_zoom()
+        if z is None:
+            return self.fit(section)
+        wx, wy = self._center_world(section)
+        self._set_cam(wx, wy, z)
+        self._current = section
+
     def fit(self, section):
         (cx, cy), zoom = fov_nav.fit_center_zoom(self._world_bbox(section),
                                                  self._canvas_px(), margin=0.2)

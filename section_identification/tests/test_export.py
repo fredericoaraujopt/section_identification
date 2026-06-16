@@ -110,6 +110,68 @@ def test_manifest_and_adapters():
         assert rows[2] == "003; S1; 1", rows
 
 
+def test_zen_contour_roi_else_outline():
+    g = _FakeGeom()
+    manifest = wafer_export.build_manifest(_project(), g)
+    # build_manifest now carries per-vertex stage µm for the section outline.
+    s3 = next(s for s in manifest["sections"] if s["id"] == "section_3")
+    # outline [[40,0],[50,0],[50,10],[40,10]] -> /zoom(0.5) -> *0.001 µm
+    assert s3["polygon_stage_um"][0] == [0.08, 0.0]
+    assert s3["polygon_stage_um"][2] == [0.1, 0.02]
+
+    with tempfile.TemporaryDirectory() as td:
+        path = wafer_export.write_zen_contour(manifest, td)
+        assert path.endswith(".contour")
+        with open(path, "rb") as f:
+            raw = f.read()
+        assert b"\r\n" in raw and b"\n\r" not in raw          # CRLF line endings
+        lines = raw.decode().strip().split("\r\n")
+        # rows in imaging/TSP order: section_3 (S3), section_1 (S2, has ROI), section_2 (S1)
+        assert [ln.split(";", 1)[0] for ln in lines] == ["S3", "S2", "S1"]
+
+        # S3 has no ROI -> outline; ring closed (first vertex repeated)
+        s3_pts = [tuple(map(float, p.split("|"))) for p in lines[0].split(";")[1:]]
+        assert len(s3_pts) == 5 and s3_pts[0] == s3_pts[-1] == (0.08, 0.0)
+
+        # S2 == section_1, which HAS an ROI [[2,2],[6,2],[6,6],[2,6]]
+        # -> /0.5 -> *0.001 -> first vertex (0.004, 0.004), closed
+        s2_pts = [tuple(map(float, p.split("|"))) for p in lines[1].split(";")[1:]]
+        assert s2_pts[0] == (0.004, 0.004) and s2_pts[0] == s2_pts[-1]
+
+    # 'outline' policy ignores the ROI -> S2 uses section_1's outline instead
+    with tempfile.TemporaryDirectory() as td:
+        path = wafer_export.write_zen_contour(manifest, td, geometry="outline")
+        lines = open(path, newline="").read().strip().split("\r\n")
+        s2_pts = [tuple(map(float, p.split("|"))) for p in lines[1].split(";")[1:]]
+        assert s2_pts[0] == (0.0, 0.0)        # section_1 outline starts at (0,0)
+
+
+def test_zen_contour_no_geom_returns_none():
+    manifest = wafer_export.build_manifest(_project(), None)   # no stage transform
+    with tempfile.TemporaryDirectory() as td:
+        assert wafer_export.write_zen_contour(manifest, td) is None
+        assert not any(fn.endswith(".contour") for fn in os.listdir(td))
+
+
+def test_fiducial_affine_geom():
+    # ground-truth map: µm = px * 0.5 + (1000, -2000), with a 90° rotation mixed in
+    px = [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [50.0, 50.0]]
+    def truth(x, y):
+        return (1000.0 + 0.5 * (-y), -2000.0 + 0.5 * x)     # rotate+scale+translate
+    um = [list(truth(x, y)) for x, y in px]
+    g = wafer_export.fiducial_affine_geom(px, um)
+    assert g.rms_um < 1e-6                                    # exact fit (overdetermined, consistent)
+    xs = np.array([10.0, 80.0]); ys = np.array([20.0, 5.0])
+    ux, uy = g.full_to_stage_um(xs, ys)
+    for i in range(2):
+        tx, ty = truth(xs[i], ys[i])
+        assert abs(ux[i] - tx) < 1e-6 and abs(uy[i] - ty) < 1e-6
+    # plugs into the manifest path for a PNG source (geom=None otherwise)
+    proj = _project(); proj.fiducials = px
+    manifest = wafer_export.build_manifest(proj, g)
+    assert manifest["sections"][0]["polygon_stage_um"] is not None
+
+
 def test_read_acquisition_on_real_czi():
     """Guarded: only runs if a local CZI with TileRegions is present."""
     import os

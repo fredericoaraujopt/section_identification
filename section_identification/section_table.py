@@ -15,8 +15,8 @@ from qtpy.QtWidgets import (QAbstractItemView, QDialog, QHeaderView, QHBoxLayout
                             QLabel, QPushButton, QScrollArea, QTableWidget,
                             QTableWidgetItem, QVBoxLayout, QWidget)
 
-COLUMNS = ["#", "id", "QC", "debris", "fold", "shred", "chatter",
-           "serial", "imaging", "status"]
+COLUMNS = ["#", "id", "area", "QC", "debris", "fold", "shred", "chatter",
+           "serial", "imaging", "status", "del"]
 
 
 class SectionTableDock(QWidget):
@@ -32,6 +32,12 @@ class SectionTableDock(QWidget):
                                     "canonical pose — scan for mis-detections.")
         self.btn_gallery.clicked.connect(self._show_gallery)
         bar.addWidget(self.btn_gallery)
+        self.btn_orient = QPushButton("Orientation")
+        self.btn_orient.setToolTip("Overlay each section's recovered 'up' axis as an "
+                                   "arrow on the wafer — the visual interpretation of "
+                                   "unifying section orientations.")
+        self.btn_orient.clicked.connect(self._show_orientation)
+        bar.addWidget(self.btn_orient)
         bar.addStretch(1)
         self.btn_accept = QPushButton("✓ accept")
         self.btn_accept.setToolTip("Mark the selected section accepted (proofread).")
@@ -54,8 +60,10 @@ class SectionTableDock(QWidget):
         except Exception:
             pass
         self.table.cellClicked.connect(self._on_click)
+        self.table.cellDoubleClicked.connect(self._on_double)
         lay.addWidget(self.table)
         self._listeners = []
+        self._rows = []          # sections in displayed (area-sorted) order
 
     def add_select_listener(self, fn):
         """Register ``fn(section)`` called when a row is selected (stages use this
@@ -73,12 +81,16 @@ class SectionTableDock(QWidget):
         except Exception:
             pass
 
+    def _row_section(self, row):
+        return self._rows[row] if 0 <= row < len(self._rows) else None
+
     def _on_click(self, row, _col):
-        secs = self.app.project.sections
-        section = secs[row] if 0 <= row < len(secs) else None
+        """Single click: select + recenter on the section, keeping the current
+        zoom (pan to it without changing magnification)."""
+        section = self._row_section(row)
         self.selected_section = section
         try:
-            self.nav.go_to_index(row, keep_fov=True)
+            self.nav.center_on(section)
         except Exception:
             pass
         for fn in self._listeners:
@@ -86,6 +98,53 @@ class SectionTableDock(QWidget):
                 fn(section)
             except Exception:
                 pass
+
+    def _on_double(self, row, _col):
+        """Double click: snap to the project-wide consistent magnification."""
+        section = self._row_section(row)
+        self.selected_section = section
+        try:
+            self.nav.fit_consistent(section)
+        except Exception:
+            pass
+
+    def _delete_section(self, section):
+        """Remove a section from the wafer (Shapes layer + model) entirely."""
+        proj = self.app.project
+        try:
+            idx = proj.sections.index(section)
+        except ValueError:
+            return
+        layer = getattr(self.app.gui, "shapes_layer", None)
+        if layer is not None:
+            try:
+                data = list(layer.data)
+                if 0 <= idx < len(data):
+                    del data[idx]
+                    layer.data = data
+            except Exception:
+                pass
+        proj.sections.remove(section)
+        if self.selected_section is section:
+            self.selected_section = None
+        self.refresh()
+        for save in (getattr(self.app.gui, "save_project", None), self.app.save_workflow):
+            try:
+                save and save()
+            except Exception:
+                pass
+        self.app.log("proofread", f"deleted {section.id}.")
+
+    def _show_orientation(self):
+        if not self.app.has_image():
+            self.app.log("proofread", "load an image and detect sections first.")
+            return
+        try:
+            self.app.sync_sections()
+            from . import layer_sync
+            layer_sync.show_orientation(self.app)
+        except Exception as e:
+            self.app.log("proofread", f"orientation error: {e}")
 
     def _show_gallery(self):
         if not self.app.has_image():
@@ -120,9 +179,11 @@ class SectionTableDock(QWidget):
         return "" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
 
     def refresh(self):
-        secs = self.app.project.sections
-        self.table.setRowCount(len(secs))
-        for r, s in enumerate(secs):
+        # display sorted by area (smallest first) — surfaces coming-in / spurious
+        # detections at the top; click maps via the displayed order.
+        self._rows = sorted(self.app.project.sections, key=lambda s: s.area())
+        self.table.setRowCount(len(self._rows))
+        for r, s in enumerate(self._rows):
             sc = s.qc.scores if s.qc else {}
             if not s.accepted:
                 status = "rejected"
@@ -130,10 +191,15 @@ class SectionTableDock(QWidget):
                 status = "review"
             else:
                 status = "ok"
-            vals = [r + 1, s.id, self._fmt(sc.get("overall")),
+            vals = [r + 1, s.id, self._fmt(s.area(), 0), self._fmt(sc.get("overall")),
                     self._fmt(sc.get("debris")), self._fmt(sc.get("fold")),
                     self._fmt(sc.get("shred")), self._fmt(sc.get("chatter")),
                     self._fmt(s.serial_index, 0), self._fmt(s.imaging_index, 0),
                     status]
             for c, v in enumerate(vals):
                 self.table.setItem(r, c, QTableWidgetItem(str(v)))
+            trash = QPushButton("🗑")
+            trash.setToolTip("Delete this section from the wafer.")
+            trash.setFixedWidth(34)
+            trash.clicked.connect(lambda _=False, sec=s: self._delete_section(sec))
+            self.table.setCellWidget(r, len(COLUMNS) - 1, trash)
