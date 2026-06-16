@@ -173,6 +173,25 @@ def clear_qc_colors(app):
 # --------------------------------------------------------------------------- #
 # ROIs
 # --------------------------------------------------------------------------- #
+FOCUS_LAYER = "Focus points"
+
+
+def show_focus_points(app):
+    """Show propagated focus support points as an editable Points layer (the user
+    can nudge/add/remove them per section natively in napari)."""
+    viewer = app.viewer
+    _remove(viewer, FOCUS_LAYER)
+    pts = [[y, x] for s in app.project.sections for (x, y) in s.focus_overview]
+    if not pts:
+        return
+    try:
+        viewer.add_points(np.asarray(pts, float), name=FOCUS_LAYER, size=8,
+                          face_color="orange", border_color="orange",
+                          scale=app.layer_scale())
+    except Exception as e:
+        app.log("rois", f"focus overlay error: {e}")
+
+
 def show_rois(app):
     viewer = app.viewer
     _remove(viewer, ROI_LAYER)

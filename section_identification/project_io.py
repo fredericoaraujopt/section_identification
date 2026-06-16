@@ -81,6 +81,8 @@ def _convert_geometry(d: dict, conv_poly, geom) -> dict:
     for s in d.get("sections", []):
         s2 = dict(s)
         s2["polygon"] = conv_poly(s.get("polygon", []), geom)
+        if s.get("focus_overview"):
+            s2["focus_overview"] = conv_poly(s.get("focus_overview", []), geom)
         if s.get("roi"):
             roi = dict(s["roi"])
             roi["polygon"] = conv_poly(roi.get("polygon", []), geom)

@@ -45,6 +45,24 @@ def propagate_to_pose(template: RoiTemplate, pose) -> list[list[float]]:
              for p in np.asarray(template.polygon_local, float).reshape(-1, 2))]
 
 
+def focus_template_from_points(pose, points_xy) -> list[list[float]]:
+    """Express focus points drawn on a reference section in its pose-normalised
+    local frame (so they propagate to every section like an ROI)."""
+    pts = np.asarray(points_xy, float).reshape(-1, 2)
+    return [[float(x), float(y)] for x, y in
+            (fov_nav.world_to_local(p, pose.center, pose.angle_deg, pose.flip)
+             for p in pts)]
+
+
+def propagate_focus_to_pose(template: RoiTemplate, pose) -> list[list[float]]:
+    """Map a template's local focus points into a section's world frame."""
+    if not template.focus_local:
+        return []
+    return [[float(x), float(y)] for x, y in
+            (fov_nav.local_to_world(p, pose.center, pose.angle_deg, pose.flip)
+             for p in np.asarray(template.focus_local, float).reshape(-1, 2))]
+
+
 def _scale_about(poly: np.ndarray, center, s: float) -> np.ndarray:
     center = np.asarray(center, float).reshape(2)
     return (poly - center) * s + center
@@ -92,12 +110,16 @@ def fit_roi(roi_polygon, section_polygon, mode: str = "template",
 
 
 def propagate_all(template: RoiTemplate, sections) -> None:
-    """Set ``section.roi`` for every section by propagating + fitting the
-    template (uses each section's pose and the template's default fit mode)."""
+    """Set ``section.roi`` (and ``focus_overview`` if the template has focus
+    points) for every section by propagating + fitting the template through each
+    section's pose."""
     for s in sections:
         if s.pose.center is None:
             continue
-        world = propagate_to_pose(template, s.pose)
-        fitted = fit_roi(world, s.polygon, template.fit_mode, template.fit_percent)
-        s.roi = Roi(polygon=fitted, fit_mode=template.fit_mode,
-                    fit_percent=template.fit_percent)
+        if template.polygon_local:
+            world = propagate_to_pose(template, s.pose)
+            fitted = fit_roi(world, s.polygon, template.fit_mode, template.fit_percent)
+            s.roi = Roi(polygon=fitted, fit_mode=template.fit_mode,
+                        fit_percent=template.fit_percent)
+        if template.focus_local:
+            s.focus_overview = propagate_focus_to_pose(template, s.pose)

@@ -156,7 +156,8 @@ class Section:
     polygon: list                                   # (x,y) overview px, canonical
     pose: Pose = field(default_factory=Pose)
     roi: Optional[Roi] = None
-    focus_points: list = field(default_factory=list)  # FocusPoint (stage µm)
+    focus_overview: list = field(default_factory=list)  # (x,y) overview px, editable
+    focus_points: list = field(default_factory=list)  # FocusPoint (stage µm, from CZI)
     qc: Optional[QCResult] = None
     serial_index: Optional[int] = None              # stage 4 reorder
     imaging_index: Optional[int] = None             # stage 4 TSP
@@ -207,6 +208,7 @@ class Section:
         return {"id": self.id, "polygon": _poly_xy(self.polygon),
                 "pose": self.pose.to_dict(),
                 "roi": self.roi.to_dict() if self.roi else None,
+                "focus_overview": _poly_xy(self.focus_overview),
                 "focus_points": [fp.to_dict() for fp in self.focus_points],
                 "qc": self.qc.to_dict() if self.qc else None,
                 "serial_index": self.serial_index,
@@ -219,6 +221,7 @@ class Section:
             id=str(d["id"]), polygon=_poly_xy(d.get("polygon", [])),
             pose=Pose.from_dict(d.get("pose")),
             roi=Roi.from_dict(d.get("roi")),
+            focus_overview=_poly_xy(d.get("focus_overview", [])),
             focus_points=[FocusPoint.from_dict(fp) for fp in d.get("focus_points", [])],
             qc=QCResult.from_dict(d.get("qc")),
             serial_index=d.get("serial_index"), imaging_index=d.get("imaging_index"),
@@ -238,6 +241,7 @@ class RoiTemplate:
     """
 
     polygon_local: list = field(default_factory=list)
+    focus_local: list = field(default_factory=list)        # (x,y) focus pts, local frame
     ref_section_id: Optional[str] = None
     fit_mode: str = "full"
     fit_percent: float = 100.0
@@ -249,6 +253,7 @@ class RoiTemplate:
 
     def to_dict(self) -> dict:
         return {"polygon_local": _poly_xy(self.polygon_local),
+                "focus_local": _poly_xy(self.focus_local),
                 "ref_section_id": self.ref_section_id, "fit_mode": self.fit_mode,
                 "fit_percent": float(self.fit_percent),
                 "tile_um": list(self.tile_um) if self.tile_um else None,
@@ -259,6 +264,7 @@ class RoiTemplate:
     def from_dict(cls, d: dict) -> "RoiTemplate":
         t = d.get("tile_um")
         return cls(polygon_local=_poly_xy(d.get("polygon_local", [])),
+                   focus_local=_poly_xy(d.get("focus_local", [])),
                    ref_section_id=d.get("ref_section_id"),
                    fit_mode=d.get("fit_mode", "full"),
                    fit_percent=float(d.get("fit_percent", 100.0)),
@@ -463,6 +469,7 @@ class WaferProject:
             t.serial_index = s.serial_index
             t.imaging_index = s.imaging_index
             t.roi = s.roi
+            t.focus_overview = s.focus_overview
             t.focus_points = s.focus_points
             t.accepted = s.accepted
             if s.pose.center is not None:

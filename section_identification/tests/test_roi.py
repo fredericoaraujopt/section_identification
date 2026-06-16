@@ -10,7 +10,7 @@ import math
 import numpy as np
 
 from section_identification import align, fov_nav, roi
-from section_identification.wafer_model import Pose, Section
+from section_identification.wafer_model import Pose, RoiTemplate, Section
 
 
 TRAP = np.array([[-10.0, -5.0], [10.0, -5.0], [5.0, 5.0], [-5.0, 5.0]])
@@ -81,6 +81,20 @@ def test_propagate_all_sets_rois():
     tmpl = roi.template_from_polygon(ref.pose, ROI_SQ, ref_section_id=ref.id, fit_mode="template")
     roi.propagate_all(tmpl, secs)
     assert all(s.roi is not None and len(s.roi.polygon) == len(ROI_SQ) for s in secs)
+
+
+def test_focus_propagation_pose_consistent():
+    ref = _section(TRAP)
+    focus_pts = [[0.0, 0.0], [3.0, -2.0]]                 # world pts on the reference
+    tmpl = RoiTemplate(ref_section_id=ref.id)
+    tmpl.focus_local = roi.focus_template_from_points(ref.pose, focus_pts)
+    tgt = _section(_transform(TRAP, 60.0, 120.0, 40.0))
+    roi.propagate_all(tmpl, [tgt])                         # focus-only template
+    assert tgt.roi is None                                 # no polygon -> no ROI created
+    assert len(tgt.focus_overview) == 2
+    back = np.array([fov_nav.world_to_local(p, tgt.pose.center, tgt.pose.angle_deg,
+                                            tgt.pose.flip) for p in tgt.focus_overview])
+    assert np.allclose(back, np.asarray(tmpl.focus_local), atol=1e-6)
 
 
 def _run_all():

@@ -29,7 +29,7 @@ from . import (compute_broker, czi_export, export as legacy_export, imaging_path
 from .app_core import StimApp
 from .nav import FovNavigator
 from .section_table import SectionTableDock
-from .wafer_model import QCResult
+from .wafer_model import QCResult, RoiTemplate
 from .worker_harness import StreamWorker
 
 
@@ -58,8 +58,18 @@ def build_tile_region_specs(project, geom, tile_um, fc, fr, z):
         x0, y0, x1, y1 = sx.min(), sy.min(), sx.max(), sy.max()
         w, h = max(x1 - x0, tile), max(y1 - y0, tile)
         cols, rows = max(1, math.ceil(w / tile)), max(1, math.ceil(h / tile))
-        sps = [(x0 + (a + 0.5) / fc * w, y0 + (b + 0.5) / fr * h, z)
-               for b in range(fr) for a in range(fc)]
+        # user-defined focus points (overview px) if present, else an fc×fr grid
+        sps = None
+        if s.focus_overview:
+            fa = np.asarray(s.focus_overview, float).reshape(-1, 2)
+            ffx, ffy = geom.ds_to_full(fa[:, 0], fa[:, 1])
+            fsu = geom.full_to_stage_um(np.ravel(ffx), np.ravel(ffy))
+            if fsu is not None:
+                sps = [(float(px), float(py), z)
+                       for px, py in zip(np.ravel(fsu[0]), np.ravel(fsu[1]))]
+        if not sps:
+            sps = [(x0 + (a + 0.5) / fc * w, y0 + (b + 0.5) / fr * h, z)
+                   for b in range(fr) for a in range(fc)]
         specs.append({
             "center_um": ((x0 + x1) / 2, (y0 + y1) / 2), "contour_um": (w, h),
             "columns": cols, "rows": rows, "z_um": z, "support_points": sps,
@@ -384,6 +394,22 @@ class StageROIs(_StageBase):
         grid.addWidget(self.sp_z)
         self.col.addLayout(grid)
 
+        focus_row = QHBoxLayout()
+        self.btn_focus_draft = QPushButton("Focus pts: place (draft)")
+        self.btn_focus_draft.setToolTip("Add a Points layer; drop autofocus support "
+                                        "points inside ONE reference section. They "
+                                        "propagate to all sections by pose. If left "
+                                        "empty, the 'focus grid' above is used instead.")
+        self.btn_focus_draft.clicked.connect(self._new_focus_draft)
+        focus_row.addWidget(self.btn_focus_draft)
+        self.btn_focus_def = QPushButton("Focus pts: define + propagate")
+        self.btn_focus_def.setToolTip("Place the drafted focus points on every section "
+                                      "via its pose; fine-tune by editing the 'Focus "
+                                      "points' layer directly in napari.")
+        self.btn_focus_def.clicked.connect(self._define_focus)
+        focus_row.addWidget(self.btn_focus_def)
+        self.col.addLayout(focus_row)
+
         b3 = QPushButton("③ Write sections + ROI mFOVs into CZI (for ZEN)")
         b3.setToolTip("Copy the CZI and inject section annotations + one ROI "
                       "TileRegion (with the tile grid + focus SupportPoints) per "
@@ -481,6 +507,49 @@ class StageROIs(_StageBase):
         lyr = v.layers[self.DRAFT]
         lyr.data = list(lyr.data) + [np.asarray(poly_yx, float)]
         self.app.log(self.STAGE, f"ROI captured ({len(lyr.data)} on draft).")
+
+    FOCUS_DRAFT = "Focus draft"
+
+    def _new_focus_draft(self):
+        v = self.app.viewer
+        if v is None:
+            return
+        if self.FOCUS_DRAFT in v.layers:
+            v.layers.remove(self.FOCUS_DRAFT)
+        try:
+            v.add_points(np.empty((0, 2)), name=self.FOCUS_DRAFT, size=8,
+                         face_color="orange", border_color="orange",
+                         scale=self.app.layer_scale())
+            self.app.log(self.STAGE, "drop focus points inside one reference section, "
+                                     "then 'Focus pts: define + propagate'.")
+        except Exception as e:
+            self.app.log(self.STAGE, f"focus draft error: {e}")
+
+    def _define_focus(self):
+        if not self._need_image():
+            return
+        self.app.sync_sections()
+        self.app.ensure_poses()
+        v = self.app.viewer
+        if (v is None or self.FOCUS_DRAFT not in v.layers
+                or len(v.layers[self.FOCUS_DRAFT].data) == 0):
+            self.app.log(self.STAGE, "place focus points on the 'Focus draft' layer first.")
+            return
+        pts_xy = _napari_to_xy(np.asarray(v.layers[self.FOCUS_DRAFT].data))
+        ref = self._reference_section(pts_xy)
+        if ref is None:
+            self.app.log(self.STAGE, "no reference section under the focus points.")
+            return
+        proj = self.app.project
+        tmpl = proj.roi_templates[0] if proj.roi_templates else RoiTemplate(ref_section_id=ref.id)
+        tmpl.focus_local = roi_mod.focus_template_from_points(ref.pose, pts_xy)
+        if not proj.roi_templates:
+            proj.roi_templates = [tmpl]
+        roi_mod.propagate_all(tmpl, proj.sections)
+        layer_sync.show_focus_points(self.app)
+        self.app.log(self.STAGE, f"focus points propagated ({len(pts_xy)} per section, "
+                                 f"ref {ref.id}). Edit the 'Focus points' layer to fine-tune.")
+        self.app.save_workflow()
 
     def _new_draft(self):
         v = self.app.viewer

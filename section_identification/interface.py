@@ -207,6 +207,19 @@ class SectionIdentificationGUI(QWidget):
         det.addLayout(host_row)
         self.lbl_host = QLabel(f"Host: {describe_device()}")
         self.lbl_host.setWordWrap(True); det.addWidget(self.lbl_host)
+        # Quality presets scale the calibrated sampling without touching the rest.
+        q_row = QHBoxLayout(); q_row.addWidget(QLabel("Quality:"))
+        self.cb_quality = QComboBox()
+        self.cb_quality.addItems(["Custom", "Fast", "Balanced", "Thorough"])
+        self.cb_quality.setToolTip("Scale the calibrated detector settings: Fast = "
+                                   "coarser sampling (quicker); Balanced = calibrated "
+                                   "values; Thorough = denser points + larger overview "
+                                   "px (slower, finds more; host-capped). Calibrate "
+                                   "first. 'Custom' keeps your manual values. Batch size "
+                                   "stays auto-set for memory safety.")
+        self.cb_quality.currentTextChanged.connect(self._apply_quality_preset)
+        q_row.addWidget(self.cb_quality, 1)
+        det.addLayout(q_row)
         # Live "effect" readout: how the current knobs translate into what SAM
         # actually does (section size to SAM, #tiles, est. time, resolved model +
         # whether its checkpoint is on disk). Updates as coupled knobs change.
@@ -1468,8 +1481,41 @@ class SectionIdentificationGUI(QWidget):
             self.sp_ppb.setValue(int(prof.points_per_batch))
             self.lbl_host.setText("Host: " + prof.summary())
         self.lbl_plan.setText("Plan: " + cal.get("plan_summary", ""))
+        # remember the calibrated baseline so the Quality presets scale from it
+        self._cal_baseline = {"pps": int(self.sp_pps.value()),
+                              "target": int(self.sp_target.value()),
+                              "ppb": int(self.sp_ppb.value())}
+        if getattr(self, "cb_quality", None) is not None:
+            self.cb_quality.blockSignals(True)
+            self.cb_quality.setCurrentText("Balanced")
+            self.cb_quality.blockSignals(False)
         self._on_crop_layers_changed(self.sp_crop.value())   # sync crop sub-knob state
         self._update_ckpt_label()
+        self._refresh_effect()
+
+    def _apply_quality_preset(self, name):
+        """Scale points/side and overview px from the calibrated baseline. Batch
+        size stays the host-safe value (memory control, not quality)."""
+        if name == "Custom":
+            return
+        base = getattr(self, "_cal_baseline", None) or {
+            "pps": int(self.sp_pps.value()), "target": int(self.sp_target.value())}
+        factors = {"Fast": (0.7, 1.0), "Balanced": (1.0, 1.0), "Thorough": (1.5, 2.0)}
+        fp, ft = factors.get(name, (1.0, 1.0))
+        ov_cap = 16384
+        try:
+            ov_cap = int(getattr(self._current_profile(), "overview_cap_px", ov_cap) or ov_cap)
+        except Exception:
+            pass
+        pps = max(4, int(round(base["pps"] * fp)))
+        target = max(1024, min(int(round(base["target"] * ft / 1024.0)) * 1024, ov_cap))
+        for w, v in ((self.sp_pps, pps), (self.sp_target, target)):
+            try:
+                w.setValue(v)
+            except Exception:
+                pass
+        self.log_msg(f"Detector quality: {name} → points/side {pps}, overview {target}px "
+                     "(reload to apply the overview change).")
         self._refresh_effect()
 
     def preview_tiling(self):
