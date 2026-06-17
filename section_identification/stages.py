@@ -474,10 +474,22 @@ class StageROIs(_StageBase):
             self.app.log(self.STAGE, "existing mFOV/focus read needs a CZI with geometry.")
             return
         try:
+            # Prefer the CZI's CAT ROI/focus annotations (the format we export);
+            # attach them to the sections so they're editable + re-exportable.
+            n_roi, n_focus = self.app.restore_annotations_from_czi()
+            if n_roi or n_focus:
+                layer_sync.show_rois(self.app)
+                layer_sync.show_focus_points(self.app)
+                self.app.save_workflow()
+                self.app.log(self.STAGE, f"loaded {n_roi} ROIs + {n_focus} focus "
+                                         "points from CZI CAT annotations.")
+                return
+            # Legacy fallback: stage-µm TileRegions from older STiM exports.
             data = czi_export.read_acquisition_overview(self.app.image_path, self.app.geom)
             layer_sync.show_existing_acquisition(self.app, data)
             self.app.log(self.STAGE, f"read {len(data['focus_points'])} focus points, "
-                                     f"{len(data['regions'])} mFOV region(s) from CZI.")
+                                     f"{len(data['regions'])} mFOV region(s) from CZI "
+                                     "(legacy TileRegions).")
         except Exception as e:
             self.app.log(self.STAGE, f"read existing acquisition failed: {e}")
 
@@ -962,6 +974,15 @@ def attach_workflow(viewer, gui):
             if app.has_image() and loaded["for"] != app.image_path:
                 if app.load_workflow():
                     app.log("io", "restored saved workflow results.")
+                else:
+                    # No sidecar: fall back to the CZI's own CAT ROI/focus
+                    # annotations so an annotated CZI reloads ROIs + focus.
+                    n_roi, n_focus = app.restore_annotations_from_czi()
+                    if n_roi or n_focus:
+                        layer_sync.show_rois(app)
+                        layer_sync.show_focus_points(app)
+                        app.log("io", f"restored {n_roi} ROIs + {n_focus} focus "
+                                      "points from CZI annotations.")
                 loaded["for"] = app.image_path
             table.refresh()
             rois.refresh_fiducials()

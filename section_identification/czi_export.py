@@ -32,6 +32,20 @@ import numpy as np
 SECTIONS_LAYER = "STiM_Sections"
 FIDUCIALS_LAYER = "STiM_Fiducials"
 
+# ZEN Correlative-Array-Tomography (CAT) layer names. ZEN's own section/ROI
+# annotations live as graphic <Polygon>s in these named layers (full-resolution
+# image pixels) under Metadata/MetadataNodes/MetadataNode/Layers — NOT in the
+# Metadata/Layers node the legacy STiM_* export used. The layer name is what the
+# CAT workflow keys off (sections in CAT_Section, ROIs in CAT_ROI); for a section
+# polygon ZEN also tags Attributes/UniqueName == "Section". Verified against a
+# real ZEN CAT acquisition (wafer_85nm_wafer5-01.czi). Focus support points have
+# no graphic-layer form in ZEN, so we round-trip them in a STiM-only marker layer.
+CAT_SECTION_LAYER = "CAT_Section"
+CAT_ROI_LAYER = "CAT_ROI"
+CAT_FOCUS_LAYER = "STiM_FocusPoints"
+_CAT_SECTION_COLOR = "#FF7CFC00"   # ZEN green
+_CAT_ROI_COLOR = "#FF40E0D0"       # ZEN turquoise
+
 
 # --------------------------------------------------------------------------- #
 # XML construction (pure, unit-testable without pylibCZIrw)
@@ -125,6 +139,172 @@ def inject_layers(xml_str: str, polygons, fiducials,
         layers.append(_make_layer(FIDUCIALS_LAYER, fid_elems))
 
     return ET.tostring(root, encoding="unicode")
+
+
+# --------------------------------------------------------------------------- #
+# ZEN CAT layers (graphic Polygons, full-res pixels, in the MetadataNode tree)
+# --------------------------------------------------------------------------- #
+def _cat_polygon_element(idx: int, points, name: str, unique_name: str,
+                         color: str) -> ET.Element:
+    """A ZEN CAT graphic <Polygon> (matches the real ZEN schema field-for-field)."""
+    poly = ET.Element("Polygon", attrib={"Id": str(idx)})
+    attrs = ET.SubElement(poly, "Attributes")
+    ET.SubElement(attrs, "Name").text = name
+    ET.SubElement(attrs, "UniqueName").text = unique_name
+    ET.SubElement(attrs, "Foreground").text = color
+    ET.SubElement(attrs, "Stroke").text = color
+    ET.SubElement(attrs, "StrokeThickness").text = "0"
+    ET.SubElement(attrs, "IsNameVisible").text = "true"
+    geom = ET.SubElement(poly, "Geometry")
+    ET.SubElement(geom, "Points").text = format_points(points)
+    return poly
+
+
+def _cat_layer(name: str, elements: list[ET.Element]) -> ET.Element:
+    """A ZEN graphic Layer wrapper (Usage == the layer name; LayerFlags=1)."""
+    layer = ET.Element("Layer", attrib={"Name": name})
+    ET.SubElement(layer, "Usage").text = name
+    ET.SubElement(layer, "IsProtected").text = "false"
+    ET.SubElement(layer, "IsAnimationEnabled").text = "false"
+    ET.SubElement(layer, "AnimationDimension").text = "None"
+    ET.SubElement(layer, "LayerFlags").text = "1"
+    container = ET.SubElement(layer, "Elements")
+    for e in elements:
+        container.append(e)
+    return layer
+
+
+def _int_text(root, tag, default=None):
+    el = root.find(f".//{tag}")
+    try:
+        return int(el.text)
+    except (TypeError, ValueError, AttributeError):
+        return default
+
+
+def _cat_layers_node(root: ET.Element) -> ET.Element:
+    """Return the <Layers> ZEN keeps CAT annotations in
+    (Metadata/MetadataNodes/MetadataNode/Layers), reusing an existing
+    MetadataNode/Layers or creating the chain (stamped with the image frame so
+    ZEN reads the pixel coordinates correctly)."""
+    for mn in root.findall(".//MetadataNodes/MetadataNode"):
+        L = mn.find("Layers")
+        if L is not None:
+            return L
+    metadata = root.find("Metadata")
+    if metadata is None:
+        metadata = root
+    mns = metadata.find("MetadataNodes")
+    if mns is None:
+        mns = ET.SubElement(metadata, "MetadataNodes")
+    mn = mns.find("MetadataNode")
+    if mn is None:
+        sx, sy = _int_text(root, "SizeX"), _int_text(root, "SizeY")
+        attrib = {"StartX": "0", "StartY": "0", "StartC": "0", "StartS": "0", "StartM": "0"}
+        if sx is not None:
+            attrib["SizeX"] = str(sx)
+        if sy is not None:
+            attrib["SizeY"] = str(sy)
+        mn = ET.SubElement(mns, "MetadataNode", attrib)
+    return ET.SubElement(mn, "Layers")
+
+
+def inject_cat_layers(xml_str: str, sections, rois=None, focus=None,
+                      fiducials=None, section_ids=None,
+                      fiducial_radius_px: float = 50.0,
+                      focus_radius_px: float = 12.0) -> str:
+    """Return CZI metadata XML with ZEN CAT section/ROI/focus layers added.
+
+    All geometry is in **full-resolution image pixels** (the frame ZEN's CAT
+    annotations use). ``sections``/``rois`` are lists of ``[(x,y), ...]`` polygons;
+    ``focus`` a list of ``(x,y)`` points; ``fiducials`` a list of ``(x,y)``. The
+    layers go in ZEN's MetadataNode Layers node so the CAT workflow picks them up.
+    Re-export is idempotent: our prior CAT/STiM layers are dropped first.
+    """
+    root = ET.fromstring(xml_str)
+    layers = _cat_layers_node(root)
+
+    ours = {CAT_SECTION_LAYER, CAT_ROI_LAYER, CAT_FOCUS_LAYER,
+            SECTIONS_LAYER, FIDUCIALS_LAYER}
+    for layer in list(layers.findall("Layer")):
+        if layer.get("Name") in ours:
+            layers.remove(layer)
+
+    if sections:
+        elems = []
+        for i, poly in enumerate(sections, start=1):
+            if section_ids is not None and i - 1 < len(section_ids):
+                label = str(section_ids[i - 1])
+            else:
+                label = f"#{i}"
+            elems.append(_cat_polygon_element(i, poly, label, "Section",
+                                              _CAT_SECTION_COLOR))
+        layers.append(_cat_layer(CAT_SECTION_LAYER, elems))
+
+    if rois:
+        elems = [_cat_polygon_element(1000 + i, poly, f"#{i}", f"STiM-ROI-{i:03d}",
+                                      _CAT_ROI_COLOR)
+                 for i, poly in enumerate(rois, start=1)]
+        layers.append(_cat_layer(CAT_ROI_LAYER, elems))
+
+    if focus:
+        elems = [_marker_element(i, float(x), float(y), focus_radius_px,
+                                 name=f"focus_{i}")
+                 for i, (x, y) in enumerate(focus, start=1)]
+        layers.append(_cat_layer(CAT_FOCUS_LAYER, elems))
+
+    if fiducials:
+        elems = [_marker_element(i, float(x), float(y), fiducial_radius_px,
+                                 name=f"fiducial_{i}")
+                 for i, (x, y) in enumerate(fiducials, start=1)]
+        layers.append(_cat_layer(FIDUCIALS_LAYER, elems))
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def _polygon_points(poly_el) -> list:
+    pts_el = poly_el.find("Geometry/Points")
+    if pts_el is None or not pts_el.text:
+        return []
+    out = []
+    for tok in pts_el.text.split():
+        if "," in tok:
+            x, y = tok.split(",")[:2]
+            out.append((float(x), float(y)))
+    return out
+
+
+def read_cat_annotations(czi_path: str) -> dict:
+    """Read sections / ROIs / focus points back from a CZI's annotation layers.
+
+    Returns ``{"sections": [...], "rois": [...], "focus": [...]}`` in
+    full-resolution pixels — ``sections``/``rois`` are polygons ``[(x,y), ...]``,
+    ``focus`` is ``[(x,y), ...]``. Reads ZEN CAT layers (``CAT_Section`` /
+    ``CAT_ROI``) AND the legacy ``STiM_Sections`` layer, categorising by the layer
+    name so section and ROI polygons are never conflated. ``accepts`` a path or a
+    raw metadata XML string.
+    """
+    xml = czi_path if czi_path.lstrip().startswith("<") else _read_metadata_xml(czi_path)
+    root = ET.fromstring(xml)
+    out = {"sections": [], "rois": [], "focus": []}
+    for layer in root.findall(".//Layer"):
+        name = layer.get("Name") or ""
+        if name in (CAT_SECTION_LAYER, SECTIONS_LAYER):
+            for p in layer.findall(".//Polygon"):
+                pts = _polygon_points(p)
+                if len(pts) >= 3:
+                    out["sections"].append(pts)
+        elif name == CAT_ROI_LAYER:
+            for p in layer.findall(".//Polygon"):
+                pts = _polygon_points(p)
+                if len(pts) >= 3:
+                    out["rois"].append(pts)
+        elif name == CAT_FOCUS_LAYER:
+            for e in layer.findall(".//Ellipse"):
+                cx, cy = e.findtext("Geometry/CenterX"), e.findtext("Geometry/CenterY")
+                if cx is not None and cy is not None:
+                    out["focus"].append((float(cx), float(cy)))
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -471,21 +651,25 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
                         copy: bool = True, fiducial_radius_px: float = 50.0,
                         section_ids: list | None = None,
                         sf_markers_stage_um=None, sf_orientation=None,
-                        tile_regions=None) -> dict:
-    """Produce a new CZI carrying STiM section polygons + fiducial markers.
+                        tile_regions=None, rois=None, focus_full=None) -> dict:
+    """Produce a new CZI carrying STiM section polygons + ROIs + focus + markers.
 
-    Copies ``src_czi`` -> ``dst_czi`` (preserving full-res pixels), injects a
-    ``<Layers>`` block into the metadata via ``pylibCZIrw.edit_czi``, then
-    re-reads the result to confirm the polygons survived (round-trip).
+    Copies ``src_czi`` -> ``dst_czi`` (preserving full-res pixels), then injects
+    ZEN CAT annotation layers (``CAT_Section`` for ``polygons``, ``CAT_ROI`` for
+    ``rois``, a focus marker layer for ``focus_full``) into the metadata via
+    ``pylibCZIrw.edit_czi`` and re-reads to confirm they survived (round-trip).
+    ``polygons``/``rois`` are full-res-pixel polygons; ``focus_full`` full-res
+    points. ROIs are stored as ZEN CAT polygons (the frame ZEN's CAT workflow
+    reads); ZEN derives the acquisition TileRegions from them via the correlative
+    calibration — so ``tile_regions`` is optional/legacy.
 
     When ``sf_markers_stage_um`` is given (a list of ``(x_um, y_um[, focus])``),
     those are ALSO written into the ZEN Shuttle & Find calibration ``<Markers>``
-    node — i.e. the fiducials become correlative POIs ZEN can use. This edits
-    only the destination COPY, never ``src_czi``, so the source's calibration is
-    untouched. ``sf_orientation`` overrides the ``StageOrientation`` sign.
+    node — the LM↔SEM correlative calibration. This edits only the destination
+    COPY, never ``src_czi``. ``sf_orientation`` overrides the ``StageOrientation``.
 
-    Returns a report dict (``dst``, ``n_polygons``, ``n_fiducials``,
-    ``n_sf_markers``, ``roundtrip_ok``).
+    Returns a report dict (``dst``, ``n_polygons``, ``n_rois``, ``n_focus``,
+    ``n_fiducials``, ``n_sf_markers``, ``roundtrip_ok``).
     """
     if copy:
         if os.path.abspath(src_czi) != os.path.abspath(dst_czi):
@@ -493,11 +677,12 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
     elif not os.path.exists(dst_czi):
         raise FileNotFoundError(dst_czi)
 
-    # Build the new metadata XML.
+    # Build the new metadata XML — ZEN CAT layers (sections/ROIs/focus/fiducials).
     old_xml = _read_metadata_xml(dst_czi)
-    new_xml = inject_layers(old_xml, polygons, fiducials,
-                            fiducial_radius_px=fiducial_radius_px,
-                            section_ids=section_ids)
+    new_xml = inject_cat_layers(old_xml, polygons, rois=rois, focus=focus_full,
+                                fiducials=fiducials,
+                                fiducial_radius_px=fiducial_radius_px,
+                                section_ids=section_ids)
     if sf_markers_stage_um:
         new_xml = inject_shuttle_and_find(new_xml, sf_markers_stage_um,
                                           orientation=sf_orientation)
@@ -511,6 +696,8 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
         "n_tile_regions": len(tile_regions or []),
         "dst": dst_czi,
         "n_polygons": len(polygons),
+        "n_rois": len(rois or []),
+        "n_focus": len(focus_full or []),
         "n_fiducials": len(fiducials or []),
         "n_sf_markers": len(sf_markers_stage_um or []),
         "roundtrip_ok": roundtrip_check(dst_czi, expect_polygons=len(polygons)),
@@ -585,13 +772,16 @@ def read_annotations(czi_path: str):
 
 
 def roundtrip_check(dst_czi: str, expect_polygons: int | None = None) -> bool:
-    """Re-read the CZI metadata and confirm STiM polygons are present."""
+    """Re-read the CZI metadata and confirm the SECTION polygons are present.
+
+    Counts polygons in the section layers only (``CAT_Section`` / ``STiM_Sections``)
+    so ROI polygons (also ``<Polygon>``) don't inflate the count.
+    """
     try:
         xml = _read_metadata_xml(dst_czi)
     except Exception:
         return False
-    root = ET.fromstring(xml)
-    polys = root.findall(".//Polygon")
+    n = len(read_cat_annotations(xml)["sections"])
     if expect_polygons is not None:
-        return len(polys) >= expect_polygons and expect_polygons > 0
-    return len(polys) > 0
+        return n >= expect_polygons and expect_polygons > 0
+    return n > 0

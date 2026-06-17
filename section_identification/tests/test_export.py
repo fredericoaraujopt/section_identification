@@ -54,6 +54,43 @@ def test_creates_chain_when_absent():
     assert len(czi_export.read_tile_regions(xml)) == 1
 
 
+# --- ZEN CAT layers (sections + ROIs + focus, pixel frame) ----------------- #
+def test_cat_layers_roundtrip_and_node_target():
+    import xml.etree.ElementTree as ET
+    skel = ("<ImageDocument><Metadata><Information><Image>"
+            "<SizeX>8000</SizeX><SizeY>8000</SizeY></Image></Information>"
+            "<MetadataNodes><MetadataNode><Layers/></MetadataNode></MetadataNodes>"
+            "</Metadata></ImageDocument>")
+    secs = [[(1000, 1000), (2000, 1000), (2000, 2000), (1000, 2000)],
+            [(5000, 5000), (6000, 5000), (6000, 6000), (5000, 6000)]]
+    rois = [[(1200, 1200), (1500, 1200), (1500, 1500), (1200, 1500)]]
+    focus = [(1300, 1300), (5300, 5300)]
+    xml = czi_export.inject_cat_layers(skel, secs, rois=rois, focus=focus,
+                                       section_ids=["S1", "S2"])
+    # CAT layers land in the MetadataNode Layers node (where ZEN reads them)
+    root = ET.fromstring(xml)
+    names = [L.get("Name")
+             for L in root.findall(".//MetadataNodes/MetadataNode/Layers/Layer")]
+    assert czi_export.CAT_SECTION_LAYER in names and czi_export.CAT_ROI_LAYER in names
+    # a section polygon is tagged UniqueName=Section (the CAT type marker)
+    assert root.find(".//Layer[@Name='CAT_Section']//UniqueName").text == "Section"
+    # read back, sections/ROIs/focus separated (never conflated)
+    ann = czi_export.read_cat_annotations(xml)
+    assert len(ann["sections"]) == 2
+    assert len(ann["rois"]) == 1
+    assert len(ann["focus"]) == 2
+
+
+def test_cat_layers_idempotent():
+    skel = ("<ImageDocument><Metadata>"
+            "<MetadataNodes><MetadataNode><Layers/></MetadataNode></MetadataNodes>"
+            "</Metadata></ImageDocument>")
+    secs = [[(0, 0), (10, 0), (10, 10), (0, 10)]]
+    xml = czi_export.inject_cat_layers(skel, secs)
+    xml = czi_export.inject_cat_layers(xml, secs)   # re-inject
+    assert len(czi_export.read_cat_annotations(xml)["sections"]) == 1   # not duplicated
+
+
 # --- export adapters ------------------------------------------------------- #
 class _FakeGeom:
     zoom = 0.5

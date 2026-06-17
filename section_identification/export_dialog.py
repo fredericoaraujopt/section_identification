@@ -172,7 +172,7 @@ class ExportDialog(QDialog):
             except Exception as e:
                 app.log("export", f"⚠️ .contour failed: {e}")
         if "czi" in fmts:
-            p = self._write_czi(proj, geom, data, build_tile_region_specs)
+            p = self._write_czi(proj, geom, data)
             if p:
                 written.append(p)
 
@@ -203,33 +203,52 @@ class ExportDialog(QDialog):
             json.dump({"type": "FeatureCollection", "features": feats}, fh, indent=2)
         return path
 
-    def _write_czi(self, proj, geom, data, build_specs):
+    def _write_czi(self, proj, geom, data):
+        """Write the annotated CZI in ZEN's CAT format: sections -> CAT_Section,
+        ROIs -> CAT_ROI, focus -> a focus marker layer (all full-res PIXEL
+        polygons, the frame ZEN's CAT workflow reads), plus the fiducials as the
+        Shuttle & Find correlative calibration (stage µm). ZEN derives the
+        acquisition TileRegions from the CAT_ROI polygons via that calibration, so
+        we do NOT write stage-µm TileRegions here."""
         if not czi_io.is_czi(self.app.image_path):
             self.app.log("export", "annotated CZI needs a CZI source image.")
             return None
+        import numpy as np
+
+        def _to_full(poly_overview):
+            a = np.asarray(poly_overview, float).reshape(-1, 2)
+            fx, fy = geom.ds_to_full(a[:, 0], a[:, 1])
+            return [[float(x), float(y)] for x, y in zip(np.ravel(fx), np.ravel(fy))]
+
         polys_full = [s.polygon_full(geom) for s in proj.sections] if "sections" in data else []
-        fids_full = []
-        sf = None
+
+        rois_full = []
+        if "rois" in data and geom is not None:
+            for s in proj.sections:
+                if s.roi and len(s.roi.polygon) >= 3:
+                    rois_full.append(_to_full(s.roi.polygon))
+
+        focus_full = []
+        if "focus" in data and geom is not None:
+            for s in proj.sections:
+                if s.focus_overview:
+                    focus_full.extend(_to_full(s.focus_overview))
+
+        fids_full, sf = [], None
         if "fiducials" in data:
-            import numpy as np
             for (fx, fy) in proj.fiducials:
                 gx, gy = geom.ds_to_full(np.asarray([fx]), np.asarray([fy]))
                 fids_full.append([float(np.ravel(gx)[0]), float(np.ravel(gy)[0])])
             man = wafer_export.build_manifest(proj, geom)
             sf = [f["stage_um"] for f in man.get("fiducials", []) if f.get("stage_um")] or None
-        specs = []
-        if "rois" in data and geom is not None:
-            tmpl = proj.roi_templates[0] if proj.roi_templates else None
-            tile = tmpl.tile_um[0] if (tmpl and tmpl.tile_um) else 50.0
-            fc = tmpl.focus_cols if tmpl else 2
-            fr = tmpl.focus_rows if tmpl else 2
-            specs, _ = build_specs(proj, geom, tile, fc, fr, 0.0)
+
         dst = os.path.splitext(self.app.image_path)[0] + "_STiM_acq.czi"
         try:
             report = czi_export.write_annotated_czi(
                 self.app.image_path, dst, polys_full, fids_full,
                 section_ids=[s.id for s in proj.sections],
-                tile_regions=specs, sf_markers_stage_um=sf)
+                rois=rois_full or None, focus_full=focus_full or None,
+                sf_markers_stage_um=sf)
             self.app.log("export", f"CZI: {report}")
             return dst
         except Exception as e:

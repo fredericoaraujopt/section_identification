@@ -145,3 +145,80 @@ class StimApp:
         self.sync_sections()
         self.project.apply_results(src)
         return True
+
+    def restore_annotations_from_czi(self) -> tuple:
+        """Read ROIs + focus points from the CZI's CAT annotations and attach them
+        to the (already-synced) sections by geometric containment. Returns
+        ``(n_rois, n_focus)``. The section polygons are restored by the GUI's
+        section layer; this fills in the per-section ROI + focus state the GUI
+        layer can't carry (so an annotated CZI reloads ROIs/focus, not just
+        sections). No-op without a CZI source + geometry, or when the CZI carries
+        no CAT ROI/focus annotations."""
+        from . import czi_export, czi_io
+        from .wafer_model import Roi
+        import numpy as np
+
+        if not (self.image_path and czi_io.is_czi(self.image_path)
+                and self.geom is not None):
+            return (0, 0)
+        try:
+            ann = czi_export.read_cat_annotations(self.image_path)
+        except Exception:
+            return (0, 0)
+        rois_full, focus_full = ann.get("rois", []), ann.get("focus", [])
+        if not rois_full and not focus_full:
+            return (0, 0)
+
+        proj = self.sync_sections()
+        geom = self.geom
+
+        def _to_overview(pts_full):
+            a = np.asarray(pts_full, float).reshape(-1, 2)
+            ox, oy = geom.full_to_ds(a[:, 0], a[:, 1])
+            return [(float(x), float(y)) for x, y in zip(np.ravel(ox), np.ravel(oy))]
+
+        # Clear what we're about to repopulate so a reload doesn't accumulate.
+        for s in proj.sections:
+            s.roi = None
+            s.focus_overview = []
+
+        n_rois = 0
+        for poly_full in rois_full:
+            ov = _to_overview(poly_full)
+            sec = self._section_containing(proj, ov)
+            if sec is not None:
+                sec.roi = Roi(polygon=[[x, y] for x, y in ov], fit_mode="manual")
+                n_rois += 1
+
+        n_focus = 0
+        for (fx, fy) in focus_full:
+            (ox, oy), = _to_overview([(fx, fy)])
+            sec = self._section_containing(proj, [(ox, oy)])
+            if sec is not None:
+                sec.focus_overview.append((ox, oy))
+                n_focus += 1
+        return (n_rois, n_focus)
+
+    @staticmethod
+    def _section_containing(proj, pts_overview):
+        """The section whose polygon contains the centroid of ``pts_overview``
+        (overview px), else the nearest section by centroid. Mirrors the ROI
+        stage's reference-section lookup so loaded ROIs land on the same section
+        the user drew them on."""
+        import numpy as np
+        cx, cy = np.asarray(pts_overview, float).reshape(-1, 2).mean(axis=0)
+        try:
+            from shapely.geometry import Point, Polygon
+            pt = Point(cx, cy)
+            for s in proj.sections:
+                if len(s.polygon) >= 3 and Polygon(s.polygon).buffer(0).contains(pt):
+                    return s
+        except Exception:
+            pass
+        best, bd = None, 1e30
+        for s in proj.sections:
+            sx, sy = s.centroid()
+            d = (sx - cx) ** 2 + (sy - cy) ** 2
+            if d < bd:
+                best, bd = s, d
+        return best

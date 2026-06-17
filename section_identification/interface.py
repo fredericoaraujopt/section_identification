@@ -877,14 +877,21 @@ class SectionIdentificationGUI(QWidget):
             return polys, fids
         if czi_io.is_czi(self.image_path) and self.geom is not None:
             try:
-                from section_identification.czi_export import read_annotations
-                pf, ff = read_annotations(self.image_path)
-                polys = [self._to_overview(p) for p in pf]
-                fids = [tuple(self._to_overview([f])[0]) for f in ff]
-                if polys or fids:
-                    self.log_msg(f"Loaded {len(polys)} polygons + {len(fids)} "
-                                 "fiducials from CZI annotations.")
-                    return polys, fids
+                from section_identification.czi_export import read_cat_annotations
+                ann = read_cat_annotations(self.image_path)
+                polys = [self._to_overview(p) for p in ann["sections"]]
+                # Fiducials come from the ZEN Shuttle & Find markers
+                # (import_czi_fiducials runs right after this on CZI load), so we
+                # don't double-place them here. ROIs/focus are restored onto the
+                # project separately (StimApp.restore_annotations_from_czi).
+                if polys:
+                    extra = ""
+                    if ann["rois"] or ann["focus"]:
+                        extra = (f" (+{len(ann['rois'])} ROIs, "
+                                 f"{len(ann['focus'])} focus points → ROIs tab)")
+                    self.log_msg(f"Loaded {len(polys)} section polygons from CZI "
+                                 f"annotations{extra}.")
+                    return polys, []
             except Exception:
                 self.log_msg("[warn] CZI annotation read failed:\n" + traceback.format_exc())
         polys, fids = self._load_legacy_csv()
