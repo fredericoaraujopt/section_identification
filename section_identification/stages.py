@@ -17,12 +17,12 @@ import math
 import os
 
 import numpy as np
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QImage, QPixmap
 from qtpy.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                            QFormLayout, QHBoxLayout, QLabel, QProgressBar,
-                            QPushButton, QScrollArea, QSpinBox, QTabWidget,
-                            QTextEdit, QVBoxLayout, QWidget)
+                            QFormLayout, QFrame, QHBoxLayout, QLabel,
+                            QProgressBar, QPushButton, QScrollArea, QSpinBox,
+                            QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 from . import (compute_broker, czi_export, export as legacy_export, imaging_path,
                layer_sync, roi as roi_mod, stage_help, wafer_export)
@@ -328,103 +328,125 @@ class StageROIs(_StageBase):
 
     def __init__(self, app, nav, table):
         super().__init__(app, nav, table)
-        self._header("<b>ROIs</b> — define once, propagate to every section, "
-                     "write mFOVs for ZEN")
+        self._header("<b>ROIs</b> — define a region, propagate it to every section")
         self.lbl_fid = QLabel("")
         self.lbl_fid.setWordWrap(True)
         self.col.addWidget(self.lbl_fid)
-        b0 = QPushButton("Read existing mFOVs + focus points from CZI")
-        b0.setToolTip("Read ZEN TileRegions + focus SupportPoints already in the CZI "
-                      "and display them on the wafer (overview pixels).")
-        b0.clicked.connect(self._read_existing)
-        self.col.addWidget(b0)
 
-        b1 = QPushButton("① New ROI draft layer (draw one polygon)")
-        b1.setToolTip("Add an empty layer; draw ONE polygon inside a section to use "
-                      "as the ROI template.")
-        b1.clicked.connect(self._new_draft)
-        self.col.addWidget(b1)
-
+        # --- Region of interest: draft (draw or SAM) -> define+propagate ---
+        self.col.addWidget(QLabel("<b>Region of interest</b>"))
+        self.btn_roi_draft = QPushButton("Draw ROI (draft)")
+        self.btn_roi_draft.setToolTip("Add a layer and draw ONE polygon inside a "
+                                      "section to use as the ROI template.")
+        self.btn_roi_draft.clicked.connect(self._new_draft)
+        self.col.addWidget(self.btn_roi_draft)
         self.btn_sam = QPushButton("SAM-assist: trace ROI (off)")
         self.btn_sam.setCheckable(True)
         self.btn_sam.setToolTip("Toggle the SAM editor to one-click an ROI inside a "
-                                "section (e.g. a resin-bounded region); the mask is "
-                                "captured onto the ROI draft, not Sections. Click "
-                                "again to stop — same as the manual detector toggle.")
+                                "section; the mask lands on the ROI draft (not "
+                                "Sections). Click again to stop — like the manual "
+                                "detector toggle.")
         self.btn_sam.toggled.connect(self._toggle_sam)
         self.col.addWidget(self.btn_sam)
-
         fit_row = QHBoxLayout()
         fit_row.addWidget(QLabel("fit:"))
         self.cb_fit = QComboBox()
         self.cb_fit.addItems(["template", "full", "percent", "clip"])
-        fit_row.addWidget(self.cb_fit)
+        self.cb_fit.setToolTip("How the ROI is fit to each (esp. smaller, coming-in) "
+                               "section: keep template / scale to full extent / to a "
+                               "percentage / clip to the section.")
+        fit_row.addWidget(self.cb_fit, 1)
         self.sp_pct = QDoubleSpinBox()
-        self.sp_pct.setRange(1, 100)
-        self.sp_pct.setValue(80)
-        self.sp_pct.setSuffix(" %")
+        self.sp_pct.setRange(1, 100); self.sp_pct.setValue(80); self.sp_pct.setSuffix(" %")
+        self.sp_pct.setMaximumWidth(72)
         fit_row.addWidget(self.sp_pct)
         self.col.addLayout(fit_row)
+        self.btn_roi_def = QPushButton("Define + propagate ROI")
+        self.btn_roi_def.setToolTip("Use the drafted ROI as a template and place it on "
+                                    "every section via that section's pose, fit per the "
+                                    "mode above.")
+        self.btn_roi_def.clicked.connect(self._propagate)
+        self.col.addWidget(self.btn_roi_def)
 
-        b2 = QPushButton("② Define + propagate to all sections")
-        b2.setToolTip("Take the drawn/SAM ROI as a template and place it on every "
-                      "section using that section's pose, then fit per the mode above.")
-        b2.clicked.connect(self._propagate)
-        self.col.addWidget(b2)
-
-        grid = QHBoxLayout()
-        grid.addWidget(QLabel("tile µm:"))
-        self.sp_tile = QDoubleSpinBox()
-        self.sp_tile.setRange(1, 5000)
-        self.sp_tile.setValue(50)
-        grid.addWidget(self.sp_tile)
-        grid.addWidget(QLabel("focus grid:"))
-        self.sp_fc = QSpinBox()
-        self.sp_fc.setRange(1, 8)
-        self.sp_fc.setValue(2)
-        grid.addWidget(self.sp_fc)
-        self.sp_fr = QSpinBox()
-        self.sp_fr.setRange(1, 8)
-        self.sp_fr.setValue(2)
-        grid.addWidget(self.sp_fr)
-        grid.addWidget(QLabel("Z µm:"))
-        self.sp_z = QDoubleSpinBox()
-        self.sp_z.setRange(-1e6, 1e6)
-        self.sp_z.setValue(0)
-        grid.addWidget(self.sp_z)
-        self.col.addLayout(grid)
-
-        focus_row = QHBoxLayout()
-        self.btn_focus_draft = QPushButton("Focus pts: place (draft)")
+        # --- Focus points: same draft -> define+propagate pattern ---
+        self.col.addWidget(QLabel("<b>Focus points</b>"))
+        self.btn_focus_draft = QPushButton("Place focus points (draft)")
         self.btn_focus_draft.setToolTip("Add a Points layer; drop autofocus support "
-                                        "points inside ONE reference section. They "
-                                        "propagate to all sections by pose. If left "
-                                        "empty, the 'focus grid' above is used instead.")
+                                        "points inside ONE reference section.")
         self.btn_focus_draft.clicked.connect(self._new_focus_draft)
-        focus_row.addWidget(self.btn_focus_draft)
-        self.btn_focus_def = QPushButton("Focus pts: define + propagate")
+        self.col.addWidget(self.btn_focus_draft)
+        self.btn_focus_def = QPushButton("Define + propagate focus")
         self.btn_focus_def.setToolTip("Place the drafted focus points on every section "
                                       "via its pose; fine-tune by editing the 'Focus "
-                                      "points' layer directly in napari.")
+                                      "points' layer in napari. If none are placed, an "
+                                      "auto grid (below) is used.")
         self.btn_focus_def.clicked.connect(self._define_focus)
-        focus_row.addWidget(self.btn_focus_def)
-        self.col.addLayout(focus_row)
+        self.col.addWidget(self.btn_focus_def)
 
-        b3 = QPushButton("③ Write sections + ROI mFOVs into CZI (for ZEN)")
-        b3.setToolTip("Copy the CZI and inject section annotations + one ROI "
-                      "TileRegion (with the tile grid + focus SupportPoints) per "
-                      "section, in imaging order — ready for ZEN acquisition.")
-        b3.clicked.connect(self._write_czi)
-        self.col.addWidget(b3)
+        # --- mFOV tiling preview ---
+        self.col.addWidget(QLabel("<b>mFOV tiling</b>"))
+        mrow = QHBoxLayout()
+        self.chk_mfov = QCheckBox("Show mFOV grid")
+        self.chk_mfov.setToolTip("Preview the tile grid ZEN will image inside each ROI "
+                                 "for the tile size below. Single-beam: one mFOV per ROI "
+                                 "when the tile is ≥ the ROI.")
+        self.chk_mfov.toggled.connect(self._toggle_mfov)
+        mrow.addWidget(self.chk_mfov)
+        mrow.addWidget(QLabel("tile µm:"))
+        self.sp_tile = QDoubleSpinBox()
+        self.sp_tile.setRange(1, 5000); self.sp_tile.setValue(50); self.sp_tile.setMaximumWidth(80)
+        self.sp_tile.setToolTip("mFOV/tile footprint in stage µm. For single-beam, set "
+                                "≥ the ROI for one tile per ROI.")
+        self.sp_tile.valueChanged.connect(lambda *_: self._refresh_mfov())
+        mrow.addWidget(self.sp_tile)
+        mrow.addStretch(1)
+        self.col.addLayout(mrow)
+        frow = QHBoxLayout()
+        frow.addWidget(QLabel("auto-focus grid:"))
+        self.sp_fc = QSpinBox(); self.sp_fc.setRange(1, 8); self.sp_fc.setValue(2)
+        self.sp_fc.setMaximumWidth(56)
+        self.sp_fr = QSpinBox(); self.sp_fr.setRange(1, 8); self.sp_fr.setValue(2)
+        self.sp_fr.setMaximumWidth(56)
+        self.sp_z = QDoubleSpinBox(); self.sp_z.setRange(-1e6, 1e6); self.sp_z.setValue(0)
+        self.sp_z.setMaximumWidth(80)
+        for w in (self.sp_fc, self.sp_fr):
+            w.setToolTip("Autofocus support-point grid used only when no manual focus "
+                         "points are placed.")
+        frow.addWidget(self.sp_fc); frow.addWidget(QLabel("×")); frow.addWidget(self.sp_fr)
+        frow.addWidget(QLabel("Z µm:")); frow.addWidget(self.sp_z)
+        frow.addStretch(1)
+        self.col.addLayout(frow)
 
-        self.lbl = QLabel("Draw an ROI inside one section, propagate it (each "
-                          "section's pose places it correctly), fit coming-in "
-                          "sections, then write TileRegions + focus SupportPoints "
-                          "into the CZI for ZEN acquisition.")
+        b0 = QPushButton("Read existing mFOVs + focus from CZI")
+        b0.setToolTip("Read ZEN TileRegions + focus SupportPoints already in the CZI "
+                      "and display them on the wafer.")
+        b0.clicked.connect(self._read_existing)
+        self.col.addWidget(b0)
+
+        self.lbl = QLabel("Define an ROI (and optional focus points) on one section — "
+                          "both propagate to all sections by pose. Write them into a "
+                          "CZI / .contour from <b>File → Export</b>.")
         self.lbl.setWordWrap(True)
         self.col.addWidget(self.lbl)
         self.col.addStretch(1)
         self.refresh_fiducials()
+
+    def _refresh_mfov(self):
+        if getattr(self, "chk_mfov", None) is not None and self.chk_mfov.isChecked():
+            self._toggle_mfov(True)
+
+    def _toggle_mfov(self, on):
+        if not on:
+            layer_sync.clear_mfov_grid(self.app)
+            return
+        self.app.sync_sections()
+        if not any(s.roi and s.roi.polygon for s in self.app.project.sections):
+            self.app.log(self.STAGE, "define + propagate an ROI first.")
+            self.chk_mfov.blockSignals(True)
+            self.chk_mfov.setChecked(False)
+            self.chk_mfov.blockSignals(False)
+            return
+        layer_sync.show_mfov_grid(self.app, self.sp_tile.value())
 
     def refresh_fiducials(self):
         """Recommend marking fiducials when none are on file (anchors stage-µm
@@ -619,42 +641,6 @@ class StageROIs(_StageBase):
                                  f"{sum(1 for s in self.app.project.sections if s.roi)} sections.")
         self.app.save_workflow()
 
-    # ---- CZI write ----
-    def _tile_region_specs(self):
-        geom = self.app.geom
-        if geom is None:
-            self.app.log(self.STAGE, "CZI geometry required to write stage-µm mFOVs.")
-            return []
-        specs, _ = build_tile_region_specs(
-            self.app.project, geom, self.sp_tile.value(),
-            self.sp_fc.value(), self.sp_fr.value(), float(self.sp_z.value()))
-        return specs
-
-    def _write_czi(self):
-        from . import czi_io
-        if not self._need_image():
-            return
-        if not czi_io.is_czi(self.app.image_path):
-            self.app.log(self.STAGE, "ROI→CZI export needs a CZI source image.")
-            return
-        self.app.sync_sections()
-        self.app.ensure_poses()
-        specs = self._tile_region_specs()
-        polys_full = [s.polygon_full(self.app.geom) for s in self.app.project.sections]
-        fids_full = []  # fiducials handled by the existing exporter in the Sections tab
-        dst = os.path.splitext(self.app.image_path)[0] + "_STiM_acq.czi"
-        self.app.log(self.STAGE, f"writing {len(polys_full)} sections + "
-                                 f"{len(specs)} mFOV regions → {os.path.basename(dst)} …")
-        try:
-            report = czi_export.write_annotated_czi(
-                self.app.image_path, dst, polys_full, fids_full,
-                section_ids=[s.id for s in self.app.project.sections],
-                tile_regions=specs)
-            self.app.log(self.STAGE, f"CZI written: {report}")
-        except Exception as e:
-            self.app.log(self.STAGE, f"CZI write failed: {e}")
-
-
 # --------------------------------------------------------------------------- #
 # Reorder + TSP stage
 # --------------------------------------------------------------------------- #
@@ -676,6 +662,21 @@ class StageReorder(_StageBase):
                                 "(open-path TSP) over section centroids; draws the route.")
         self.btn_tsp.clicked.connect(self.run_tsp)
         self.col.addWidget(self.btn_tsp)
+        num_row = QHBoxLayout()
+        self.btn_serial_num = QPushButton("Show serial #")
+        self.btn_serial_num.setToolTip("Label each section with its serial-order number "
+                                       "on the wafer (hides the outlines so numbers read "
+                                       "cleanly).")
+        self.btn_serial_num.clicked.connect(self._show_serial_numbers)
+        num_row.addWidget(self.btn_serial_num)
+        self.chk_outlines = QCheckBox("outlines")
+        self.chk_outlines.setChecked(True)
+        self.chk_outlines.setToolTip("Show/hide the section outlines (turn off to read the "
+                                     "order numbers without clutter).")
+        self.chk_outlines.toggled.connect(
+            lambda on: layer_sync.set_sections_visible(self.app, on))
+        num_row.addWidget(self.chk_outlines)
+        self.col.addLayout(num_row)
         self.btn_inspect = QPushButton("Inspect match: pick 2 sections")
         self.btn_inspect.setToolTip("Then click two rows in the table — the SIFT "
                                     "inlier correspondences are drawn between them.")
@@ -781,12 +782,23 @@ class StageReorder(_StageBase):
         for visit, idx in enumerate(order):
             secs[idx].imaging_index = visit
         layer_sync.show_route(self.app)
+        self._reflect_outlines_off()
         self.table.refresh()
         unit = "µm" if geom is not None else "px"
         self.lbl_travel.setText(f"Route: {len(order)} stops, total travel "
                                 f"{total:,.0f} {unit}")
         self.app.log(self.STAGE, f"TSP route computed: {total:,.0f} {unit} travel.")
         self.app.save_workflow()
+
+    def _show_serial_numbers(self):
+        self.app.sync_sections()
+        layer_sync.show_serial_numbers(self.app)
+        self._reflect_outlines_off()
+
+    def _reflect_outlines_off(self):
+        self.chk_outlines.blockSignals(True)
+        self.chk_outlines.setChecked(False)
+        self.chk_outlines.blockSignals(False)
 
     def _arm(self, mode):
         if not self._need_image():
@@ -886,36 +898,9 @@ def attach_workflow(viewer, gui):
     tabs.addTab(_wrap(qc), "③ QC")
     tabs.addTab(_wrap(reorder), "④ Reorder")
 
-    # ---- file-level header: import + export sit OUTSIDE the per-stage panels ----
-    header = QHBoxLayout()
-    btn_open = QPushButton("⤒ Open image…")
-    btn_open.setToolTip("Open a wafer image (CZI whole-slide, or PNG/montage).")
-    btn_open.clicked.connect(lambda: getattr(gui, "select_image", lambda: None)())
-    btn_export = QPushButton("⤓ Export wafer…")
-    btn_export.setToolTip("Write the wafer manifest + per-section CSV + mVis "
-                          "region_names.csv (IDs in imaging/TSP order), and the "
-                          "ZEN .contour if enabled. Applies to the whole wafer.")
-    chk_contour = QCheckBox("ZEN .contour")
-    chk_contour.setChecked(True)
-    chk_contour.setToolTip("Also write a ZEN .contour: one labelled stage-µm polygon "
-                           "per section in imaging order. Needs stage µm (a CZI "
-                           "source, or a PNG/LM image with fiducials calibrated to µm).")
-    btn_export.clicked.connect(lambda: run_export(app, chk_contour.isChecked()))
-    header.addWidget(btn_open)
-    header.addWidget(btn_export)
-    header.addWidget(chk_contour)
-    header.addStretch(1)
-
-    container = QWidget()
-    cl = QVBoxLayout(container)
-    cl.setContentsMargins(2, 2, 2, 2)
-    cl.setSpacing(4)
-    cl.addLayout(header)
-    cl.addWidget(tabs)
-
     # ---- the ONE log: mirror the GUI's log (which also captures detector
     # stdout via log_msg->print->write->append) into the footer; hide the
-    # Sections-tab copy so there's a single global log. ----
+    # Sections-tab copy + its "Log" label + the legacy per-stage Export section. ----
     log_widget = QTextEdit()
     log_widget.setReadOnly(True)
     log_widget.setMinimumHeight(120)
@@ -930,9 +915,44 @@ def attach_workflow(viewer, gui):
                 except Exception:
                     pass
             gui.log.append = _mirror
-            gui.log.setVisible(False)
+        for attr in ("log", "_log_label", "_export_toggle", "_export_body"):
+            w = getattr(gui, attr, None)
+            if w is not None:
+                w.setVisible(False)
     except Exception:
         pass
+
+    container = QWidget()
+    cl = QVBoxLayout(container)
+    cl.setContentsMargins(4, 4, 4, 4)
+    cl.setSpacing(6)
+    cl.addWidget(tabs, 1)
+
+    # ---- file-level actions, clearly separated at the bottom (not crammed under
+    # the dock title): a single global Import / Export for the whole wafer. ----
+    sep = QFrame()
+    sep.setFrameShape(QFrame.HLine)
+    sep.setStyleSheet("color:#444;")
+    cl.addWidget(sep)
+    filebar = QHBoxLayout()
+    filebar.addWidget(QLabel("File:"))
+    btn_open = QPushButton("Open image…")
+    btn_open.setToolTip("Open a wafer image (CZI whole-slide, or PNG/montage).")
+    btn_open.clicked.connect(lambda: getattr(gui, "select_image", lambda: None)())
+    btn_export = QPushButton("Export…")
+    btn_export.setToolTip("Global export: choose which data (sections, ROIs, focus, "
+                          "order, QC…) and which file formats to write.")
+    state = {"dlg": None}
+
+    def _open_export():
+        from .export_dialog import ExportDialog
+        state["dlg"] = ExportDialog(app, parent=container)
+        state["dlg"].show()
+    btn_export.clicked.connect(_open_export)
+    filebar.addWidget(btn_open)
+    filebar.addWidget(btn_export)
+    filebar.addStretch(1)
+    cl.addLayout(filebar)
 
     loaded = {"for": None}
 
@@ -949,9 +969,15 @@ def attach_workflow(viewer, gui):
             pass
     tabs.currentChanged.connect(_on_tab)
 
-    viewer.window.add_dock_widget(container, name="STiM", area="right")
+    dock = viewer.window.add_dock_widget(container, name="STiM", area="right")
     viewer.window.add_dock_widget(table, name="Sections", area="bottom")
     viewer.window.add_dock_widget(log_widget, name="Workflow log", area="bottom")
+    # open narrower (still user-draggable afterwards)
+    try:
+        dock.setMaximumWidth(300)
+        QTimer.singleShot(400, lambda: dock.setMaximumWidth(16777215))
+    except Exception:
+        pass
     return app
 
 

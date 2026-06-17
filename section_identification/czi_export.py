@@ -270,6 +270,17 @@ def _tile_region_element(idx: int, spec: dict) -> ET.Element:
     ET.SubElement(tr, "Columns").text = str(int(spec.get("columns", 1)))
     ET.SubElement(tr, "Rows").text = str(int(spec.get("rows", 1)))
     ET.SubElement(tr, "Z").text = f"{float(spec.get('z_um', 0.0)):.3f}"
+    # ZEN acquisition flags, in ZEN's own child order (verified field-for-field
+    # against real ZEN-authored CZIs, e.g. M411). CRITICAL: without
+    # <IsUsedForAcquisition>true ZEN keeps the region as a drawing but never
+    # images it — the others match ZEN's defaults so the region behaves like one
+    # drawn in ZEN. Anchored as Center (ContourSize is full width/height).
+    ET.SubElement(tr, "TemplateShapeId")
+    ET.SubElement(tr, "IsUsedForAcquisition").text = "true"
+    ET.SubElement(tr, "IsProtected").text = "false"
+    ET.SubElement(tr, "AreSupportPointsOutsideContourAllowed").text = "false"
+    ET.SubElement(tr, "PreferSupportPointsZ").text = "false"
+    ET.SubElement(tr, "GeometryLockingMode").text = "None"
     ET.SubElement(tr, "Contour", attrib={"Type": spec.get("contour", "Rectangle")})
     sps = spec.get("support_points") or []
     if sps:

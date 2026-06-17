@@ -13,6 +13,8 @@ so a visualisation hiccup can't take down the GUI.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 QC_LAYER = None  # QC recolours the existing Sections layer in place
@@ -192,6 +194,56 @@ def show_focus_points(app):
         app.log("rois", f"focus overlay error: {e}")
 
 
+MFOV_LAYER = "mFOV grid"
+
+
+def show_mfov_grid(app, tile_um: float):
+    """Preview the tile grid ZEN will acquire inside each ROI: subdivide each ROI
+    bbox into Columns×Rows tiles (from the ROI's stage-µm size / ``tile_um``).
+    Single-beam: when the tile ≥ the ROI, that's a single tile (the whole ROI)."""
+    viewer = app.viewer
+    _remove(viewer, MFOV_LAYER)
+    geom = app.geom
+    tile = float(tile_um) or 50.0
+    rects = []
+    for s in app.project.sections:
+        if not s.roi or len(s.roi.polygon) < 3:
+            continue
+        ra = np.asarray(s.roi.polygon, float).reshape(-1, 2)
+        x0, y0, x1, y1 = ra[:, 0].min(), ra[:, 1].min(), ra[:, 0].max(), ra[:, 1].max()
+        cols = rows = 1
+        if geom is not None:
+            fx, fy = geom.ds_to_full(ra[:, 0], ra[:, 1])
+            su = geom.full_to_stage_um(np.ravel(fx), np.ravel(fy))
+            if su is not None:
+                sx, sy = np.ravel(su[0]), np.ravel(su[1])
+                cols = max(1, math.ceil((sx.max() - sx.min()) / tile))
+                rows = max(1, math.ceil((sy.max() - sy.min()) / tile))
+        for c in range(cols):
+            for r in range(rows):
+                gx0 = x0 + (x1 - x0) * c / cols
+                gx1 = x0 + (x1 - x0) * (c + 1) / cols
+                gy0 = y0 + (y1 - y0) * r / rows
+                gy1 = y0 + (y1 - y0) * (r + 1) / rows
+                rects.append(np.array([[gy0, gx0], [gy0, gx1], [gy1, gx1], [gy1, gx0]]))
+    if not rects:
+        app.log("rois", "no ROIs to tile — define + propagate an ROI first.")
+        return
+    try:
+        viewer.add_shapes(rects, shape_type="rectangle", name=MFOV_LAYER,
+                          edge_color="yellow", face_color="transparent",
+                          edge_width=_overlay_width(app, frac=0.006),
+                          scale=app.layer_scale())
+        app.log("rois", f"mFOV grid: {len(rects)} tiles across "
+                        f"{sum(1 for s in app.project.sections if s.roi)} ROIs.")
+    except Exception as e:
+        app.log("rois", f"mFOV grid error: {e}")
+
+
+def clear_mfov_grid(app):
+    _remove(app.viewer, MFOV_LAYER)
+
+
 def show_rois(app):
     viewer = app.viewer
     _remove(viewer, ROI_LAYER)
@@ -332,7 +384,47 @@ def show_serial_chain(app):
 # --------------------------------------------------------------------------- #
 # Imaging order: TSP route + order numbers
 # --------------------------------------------------------------------------- #
-def show_route(app):
+SERIAL_NUM_LAYER = "③ Serial order #"
+
+
+def set_sections_visible(app, on: bool):
+    """Show/hide the Sections outlines (so order numbers don't clutter them)."""
+    lyr = getattr(app.gui, "shapes_layer", None)
+    if lyr is not None:
+        try:
+            lyr.visible = bool(on)
+        except Exception:
+            pass
+
+
+def show_serial_numbers(app, hide_sections: bool = True):
+    """Label each section with its recovered serial-order number on the wafer
+    (a number mask). Hides the section outlines so the numbers read cleanly."""
+    viewer = app.viewer
+    _remove(viewer, SERIAL_NUM_LAYER)
+    pts, nums = [], []
+    for s in app.project.sections:
+        if s.serial_index is None:
+            continue
+        cx, cy = s.centroid()
+        pts.append([cy, cx])
+        nums.append(int(s.serial_index) + 1)
+    if not pts:
+        app.log("reorder", "no serial order yet — compute the SIFT order first.")
+        return
+    try:
+        viewer.add_points(np.asarray(pts, float), name=SERIAL_NUM_LAYER, size=1,
+                          face_color="transparent", border_color="transparent",
+                          scale=app.layer_scale(), features={"serial": nums},
+                          text={"string": "{serial}", "size": 12, "color": "lime",
+                                "anchor": "center"})
+        if hide_sections:
+            set_sections_visible(app, False)
+    except Exception as e:
+        app.log("reorder", f"serial-number overlay error: {e}")
+
+
+def show_route(app, hide_sections: bool = True):
     viewer = app.viewer
     _remove(viewer, ROUTE_LAYER)
     _remove(viewer, ORDER_LAYER)
@@ -343,11 +435,13 @@ def show_route(app):
     order_idx = [int(s.imaging_index) if s.imaging_index is not None else k
                  for k, s in enumerate(seq)]
     try:
-        viewer.add_points(pts, name=ORDER_LAYER, size=6, face_color="cyan",
-                          scale=app.layer_scale(),
+        viewer.add_points(pts, name=ORDER_LAYER, size=1, face_color="transparent",
+                          border_color="transparent", scale=app.layer_scale(),
                           features={"imaging_order": order_idx},
-                          text={"string": "{imaging_order}", "size": 9,
-                                "color": "white", "anchor": "center"})
+                          text={"string": "{imaging_order}", "size": 11,
+                                "color": "cyan", "anchor": "center"})
+        if hide_sections:
+            set_sections_visible(app, False)
     except Exception as e:
         app.log("imaging", f"order-number overlay error: {e}")
     if len(seq) >= 2:

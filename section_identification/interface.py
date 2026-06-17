@@ -394,26 +394,35 @@ class SectionIdentificationGUI(QWidget):
                      "section, <b>r</b> to remove, <b>m</b> for a fiducial. See Help for all keys.</i>")
         _ml.setWordWrap(True); man.addWidget(_ml)
 
-        # ===== 4 · Export =====
-        ex = section("4 · Export", open=False)
+        # ===== 4 · Export (engine kept; the workflow shell hides this section and
+        # routes everything through the single global Export dialog) =====
+        self._export_toggle = QPushButton("▸ 4 · Export")
+        self._export_toggle.setCheckable(True)
+        self._export_toggle.setStyleSheet(
+            "QPushButton{text-align:left;font-weight:bold;padding:6px;border:none;"
+            "border-radius:4px;background:#333;}")
+        self._export_body = QWidget(); self._export_body.setVisible(False)
+        exb = QVBoxLayout(self._export_body); exb.setContentsMargins(10, 4, 4, 8)
+        self._export_toggle.toggled.connect(
+            lambda on: (self._export_body.setVisible(on),
+                        self._export_toggle.setText(("▾ " if on else "▸ ") + "4 · Export")))
+        layout.addWidget(self._export_toggle); layout.addWidget(self._export_body)
         exp_row = QHBoxLayout()
         self.chk_exp_csv = QCheckBox("CSV"); self.chk_exp_csv.setChecked(True)
         self.chk_exp_geojson = QCheckBox("GeoJSON"); self.chk_exp_geojson.setChecked(True)
         self.chk_exp_png = QCheckBox("PNG"); self.chk_exp_png.setChecked(True)
         self.chk_exp_czi = QCheckBox("CZI"); self.chk_exp_czi.setChecked(False)
-        self.chk_exp_czi.setToolTip("Annotated CZI for ZEN — copies the whole file "
-                                    "(can be many GB); off by default. If the Fiducials "
-                                    "layer has points, they are also written into the "
-                                    "CZI's ZEN Shuttle & Find calibration markers (the "
-                                    "copy only; the source is never modified).")
         for c in (self.chk_exp_csv, self.chk_exp_geojson, self.chk_exp_png, self.chk_exp_czi):
             exp_row.addWidget(c)
-        ex.addLayout(exp_row)
+        exb.addLayout(exp_row)
         self.btn_export = QPushButton("Export selected")
-        ex.addWidget(self.btn_export)
+        exb.addWidget(self.btn_export)
 
         # ---- bottom (always visible): log ----
-        layout.addWidget(QLabel("<b>Log</b>"))
+        # (the workflow shell hides this label + widget and mirrors output to the
+        # single global footer log; both kept so standalone use still has a log.)
+        self._log_label = QLabel("<b>Log</b>")
+        layout.addWidget(self._log_label)
         self.log = QTextEdit(); self.log.setReadOnly(True); self.log.setMinimumHeight(160)
         layout.addWidget(self.log, stretch=1)
         self.progress = QProgressBar(); self.progress.setVisible(False)
