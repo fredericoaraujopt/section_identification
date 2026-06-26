@@ -127,8 +127,12 @@ class StimApp:
         """Persist QC/order/ROI/pose/match-graph to the workflow sidecar."""
         if not self.has_image():
             return
-        from . import project_io
+        from . import layer_sync, project_io
         self.sync_sections()
+        try:
+            self.project.display_settings = layer_sync.capture_display(self)
+        except Exception:
+            pass
         project_io.save(self.project, self.geom,
                         path=project_io.workflow_path(self.image_path))
 
@@ -165,8 +169,20 @@ class StimApp:
             ann = czi_export.read_cat_annotations(self.image_path)
         except Exception:
             return (0, 0)
-        rois_full, focus_full = ann.get("rois", []), ann.get("focus", [])
-        if not rois_full and not focus_full:
+        rois_full = ann.get("rois", [])
+        # Focus points live in ZEN's TileRegion autofocus SupportPoints (stage µm),
+        # NOT as pixel annotations. Read them from there (already mapped to overview
+        # px) and fall back to the legacy STiM_FocusPoints pixel layer for older
+        # exports that predate this.
+        focus_overview = []
+        try:
+            acq = czi_export.read_acquisition_overview(self.image_path, self.geom)
+            focus_overview = [(float(p[0]), float(p[1]))
+                              for p in acq.get("focus_points", [])]
+        except Exception:
+            focus_overview = []
+        focus_full = ann.get("focus", [])      # legacy pixel-layer fallback
+        if not rois_full and not focus_full and not focus_overview:
             return (0, 0)
 
         proj = self.sync_sections()
@@ -190,9 +206,12 @@ class StimApp:
                 sec.roi = Roi(polygon=[[x, y] for x, y in ov], fit_mode="manual")
                 n_rois += 1
 
+        # Prefer the TileRegion support points; only fall back to the legacy pixel
+        # layer when no support points were found.
+        if not focus_overview and focus_full:
+            focus_overview = [_to_overview([(fx, fy)])[0] for (fx, fy) in focus_full]
         n_focus = 0
-        for (fx, fy) in focus_full:
-            (ox, oy), = _to_overview([(fx, fy)])
+        for (ox, oy) in focus_overview:
             sec = self._section_containing(proj, [(ox, oy)])
             if sec is not None:
                 sec.focus_overview.append((ox, oy))

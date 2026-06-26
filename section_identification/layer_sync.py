@@ -456,3 +456,155 @@ def show_route(app, hide_sections: bool = True):
                                edge_color="yellow", scale=app.layer_scale())
         except Exception as e:
             app.log("imaging", f"route overlay error: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Session restore: redraw overlays for restored data, then reapply the user's
+# saved display settings (widths / sizes / colours / opacity / visibility).
+# --------------------------------------------------------------------------- #
+def restore_overlays(app):
+    """Redraw the overlays for whatever workflow data was just restored (ROIs,
+    focus points, serial-order chain, imaging/TSP route + numbers). Section
+    visibility is left to :func:`apply_display` so we never force-hide here."""
+    proj = app.project
+    for cond, fn in (
+        (lambda: any(getattr(s, "roi", None) and s.roi.polygon for s in proj.sections),
+         lambda: show_rois(app)),
+        (lambda: any(getattr(s, "focus_overview", None) for s in proj.sections),
+         lambda: show_focus_points(app)),
+        (lambda: bool(proj.match_graph.order)
+                 or any(s.serial_index is not None for s in proj.sections),
+         lambda: show_serial_chain(app)),
+        (lambda: any(s.imaging_index is not None for s in proj.sections),
+         lambda: show_route(app, hide_sections=False)),
+    ):
+        try:
+            if cond():
+                fn()
+        except Exception as e:
+            app.log("io", f"overlay restore skipped: {e}")
+
+
+def _scalar(arr, current=None):
+    """A representative scalar from a napari per-element prop (edge_width / size).
+    Prefer the actual per-element array (what's rendered); the ``current_*`` value
+    only sets the width/size for *new* elements, so it lags what the user sees."""
+    for src in (arr, current):
+        try:
+            a = np.ravel(np.asarray(src, dtype=float))
+            if a.size:
+                return float(a[0])
+        except Exception:
+            continue
+    return None
+
+
+def _color_to_json(c):
+    """Normalise a napari colour (named string, hex, or RGBA array) to something
+    JSON-serialisable that the matching setter accepts back."""
+    try:
+        if c is None:
+            return None
+        if isinstance(c, str):
+            return c
+        a = np.ravel(np.asarray(c))
+        if a.dtype.kind in "US":          # array of colour strings
+            return str(a[0])
+        return [float(x) for x in a[:4]]
+    except Exception:
+        return None
+
+
+def capture_display(app) -> dict:
+    """Snapshot the visual properties of every STiM layer (everything except the
+    base wafer image, for which only visibility/opacity are kept) into a
+    JSON-serialisable dict keyed by layer name, so they persist across sessions."""
+    from napari.layers import Image, Points, Shapes, Vectors
+    viewer = getattr(app, "viewer", None)
+    if viewer is None:
+        return {}
+    out = {}
+    for lyr in list(viewer.layers):
+        try:
+            d = {"visible": bool(lyr.visible), "opacity": float(lyr.opacity)}
+            if isinstance(lyr, Image):
+                out[lyr.name] = d
+                continue
+            if isinstance(lyr, Shapes):
+                d["edge_width"] = _scalar(lyr.edge_width, getattr(lyr, "current_edge_width", None))
+                d["edge_color"] = _color_to_json(getattr(lyr, "current_edge_color", None))
+                d["face_color"] = _color_to_json(getattr(lyr, "current_face_color", None))
+            elif isinstance(lyr, Points):
+                d["size"] = _scalar(lyr.size, getattr(lyr, "current_size", None))
+                d["face_color"] = _color_to_json(getattr(lyr, "current_face_color", None))
+                d["border_color"] = _color_to_json(getattr(lyr, "current_border_color", None))
+                if getattr(lyr, "text", None) is not None and lyr.text.string is not None:
+                    try:
+                        d["text_size"] = float(lyr.text.size)
+                    except Exception:
+                        pass
+            elif isinstance(lyr, Vectors):
+                try:
+                    d["edge_width"] = float(lyr.edge_width)
+                except Exception:
+                    pass
+                d["edge_color"] = _color_to_json(getattr(lyr, "edge_color", None))
+            out[lyr.name] = {k: v for k, v in d.items() if v is not None}
+        except Exception:
+            continue
+    return out
+
+
+def _set_attr(lyr, attr, val):
+    if val is None:
+        return
+    try:
+        setattr(lyr, attr, val)
+    except Exception:
+        pass
+
+
+def apply_display(app) -> int:
+    """Reapply saved visual properties to any matching layers currently present.
+    Best-effort per property; returns the number of layers touched. The Sections
+    layer's colours are left alone (they're driven by detection / QC)."""
+    from napari.layers import Points, Shapes, Vectors
+    viewer = getattr(app, "viewer", None)
+    settings = getattr(app.project, "display_settings", None) or {}
+    if viewer is None or not settings:
+        return 0
+    n = 0
+    for lyr in list(viewer.layers):
+        d = settings.get(lyr.name)
+        if not d:
+            continue
+        keep_colors = lyr.name != "Sections"      # don't flatten per-section QC colours
+        try:
+            _set_attr(lyr, "visible", bool(d["visible"]) if "visible" in d else None)
+            _set_attr(lyr, "opacity", float(d["opacity"]) if "opacity" in d else None)
+            if isinstance(lyr, Shapes):
+                if d.get("edge_width") is not None:
+                    _set_attr(lyr, "edge_width", float(d["edge_width"]))
+                    _set_attr(lyr, "current_edge_width", float(d["edge_width"]))
+                if keep_colors:
+                    _set_attr(lyr, "edge_color", d.get("edge_color"))
+                    _set_attr(lyr, "face_color", d.get("face_color"))
+            elif isinstance(lyr, Points):
+                if d.get("size") is not None:
+                    _set_attr(lyr, "size", float(d["size"]))
+                    _set_attr(lyr, "current_size", float(d["size"]))
+                _set_attr(lyr, "face_color", d.get("face_color"))
+                _set_attr(lyr, "border_color", d.get("border_color"))
+                if d.get("text_size") is not None and getattr(lyr, "text", None) is not None:
+                    try:
+                        lyr.text.size = float(d["text_size"])
+                    except Exception:
+                        pass
+            elif isinstance(lyr, Vectors):
+                if d.get("edge_width") is not None:
+                    _set_attr(lyr, "edge_width", float(d["edge_width"]))
+                _set_attr(lyr, "edge_color", d.get("edge_color"))
+            n += 1
+        except Exception:
+            continue
+    return n

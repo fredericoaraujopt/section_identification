@@ -19,10 +19,10 @@ import os
 import numpy as np
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtGui import QImage, QPixmap
-from qtpy.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
-                            QFormLayout, QFrame, QHBoxLayout, QLabel,
-                            QProgressBar, QPushButton, QScrollArea, QSpinBox,
-                            QTabWidget, QTextEdit, QVBoxLayout, QWidget)
+from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
+                            QDoubleSpinBox, QFormLayout, QFrame, QHBoxLayout,
+                            QLabel, QProgressBar, QPushButton, QScrollArea,
+                            QSpinBox, QTabWidget, QTextEdit, QVBoxLayout, QWidget)
 
 from . import (compute_broker, czi_export, export as legacy_export, imaging_path,
                layer_sync, roi as roi_mod, stage_help, wafer_export)
@@ -966,29 +966,77 @@ def attach_workflow(viewer, gui):
     filebar.addStretch(1)
     cl.addLayout(filebar)
 
-    loaded = {"for": None}
+    loaded = {"done": None, "target": None, "tries": 0}
+
+    def _restore_for_current_image():
+        """Restore the saved workflow sidecar for the current image: merge the
+        ROI/focus/order/QC data, redraw their overlays, and reapply the saved
+        display settings. Runs once per image; waits a few ticks for the legacy
+        GUI to finish restoring the section masks first (apply_results matches by
+        section id, so the masks must be in place before we merge)."""
+        if not app.has_image():
+            return
+        path = app.image_path
+        if loaded["done"] == path:
+            return
+        if loaded["target"] != path:                 # a new image -> reset the wait
+            loaded["target"] = path
+            loaded["tries"] = 0
+        proj = app.sync_sections()
+        loaded["tries"] += 1
+        if not proj.sections and loaded["tries"] < 15:
+            return                                    # masks not restored yet; retry
+        if app.load_workflow():
+            layer_sync.restore_overlays(app)
+            n = layer_sync.apply_display(app)
+            app.log("io", "restored saved ROIs / focus / order"
+                          + (f" + display settings ({n} layers)" if n else ""))
+        else:
+            # No sidecar: fall back to the CZI's own CAT ROI/focus annotations
+            # so an annotated CZI reloads ROIs + focus.
+            n_roi, n_focus = app.restore_annotations_from_czi()
+            if n_roi or n_focus:
+                layer_sync.show_rois(app)
+                layer_sync.show_focus_points(app)
+                app.log("io", f"restored {n_roi} ROIs + {n_focus} focus "
+                              "points from CZI annotations.")
+        loaded["done"] = path
+        table.refresh()
+        rois.refresh_fiducials()
 
     def _on_tab(_i):
         try:
             app.sync_sections()
-            if app.has_image() and loaded["for"] != app.image_path:
-                if app.load_workflow():
-                    app.log("io", "restored saved workflow results.")
-                else:
-                    # No sidecar: fall back to the CZI's own CAT ROI/focus
-                    # annotations so an annotated CZI reloads ROIs + focus.
-                    n_roi, n_focus = app.restore_annotations_from_czi()
-                    if n_roi or n_focus:
-                        layer_sync.show_rois(app)
-                        layer_sync.show_focus_points(app)
-                        app.log("io", f"restored {n_roi} ROIs + {n_focus} focus "
-                                      "points from CZI annotations.")
-                loaded["for"] = app.image_path
+            _restore_for_current_image()
             table.refresh()
             rois.refresh_fiducials()
         except Exception:
             pass
     tabs.currentChanged.connect(_on_tab)
+
+    # Restore promptly after an image is opened, not only when a tab is clicked.
+    # Cheap no-op once done; keeps watching so reopening a different wafer also
+    # restores. Parented to ``container`` so Qt keeps it alive.
+    def _poll_restore():
+        try:
+            _restore_for_current_image()
+        except Exception:
+            pass
+    _restore_poll = QTimer(container)
+    _restore_poll.setInterval(700)
+    _restore_poll.timeout.connect(_poll_restore)
+    _restore_poll.start()
+
+    # Persist on quit so display-only tweaks (e.g. dragging an outline/arrow
+    # width slider, which don't trigger a data save) still carry over.
+    _qapp = QApplication.instance()
+    if _qapp is not None:
+        def _save_on_quit():
+            try:
+                app.save_workflow()
+            except Exception:
+                pass
+        _qapp.aboutToQuit.connect(_save_on_quit)
 
     dock = viewer.window.add_dock_widget(container, name="STiM", area="right")
     viewer.window.add_dock_widget(table, name="Sections", area="bottom")

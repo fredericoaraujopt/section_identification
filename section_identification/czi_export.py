@@ -458,7 +458,9 @@ def _tile_region_element(idx: int, spec: dict) -> ET.Element:
     ET.SubElement(tr, "TemplateShapeId")
     ET.SubElement(tr, "IsUsedForAcquisition").text = "true"
     ET.SubElement(tr, "IsProtected").text = "false"
-    ET.SubElement(tr, "AreSupportPointsOutsideContourAllowed").text = "false"
+    # The region contour is the ROI bbox, but a STiM focus point may sit on the
+    # SECTION body (outside the ROI) — allow that so it isn't rejected/clamped.
+    ET.SubElement(tr, "AreSupportPointsOutsideContourAllowed").text = "true"
     ET.SubElement(tr, "PreferSupportPointsZ").text = "false"
     ET.SubElement(tr, "GeometryLockingMode").text = "None"
     ET.SubElement(tr, "Contour", attrib={"Type": spec.get("contour", "Rectangle")})

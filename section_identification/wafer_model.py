@@ -333,6 +333,7 @@ class WaferProject:
     roi_templates: list = field(default_factory=list)         # RoiTemplate
     match_graph: MatchGraph = field(default_factory=MatchGraph)
     qc_summary: dict = field(default_factory=dict)
+    display_settings: dict = field(default_factory=dict)     # per-layer napari visual props
 
     # -- section management --
     def get(self, sid: str) -> Optional[Section]:
@@ -440,6 +441,7 @@ class WaferProject:
             "roi_templates": [t.to_dict() for t in self.roi_templates],
             "match_graph": self.match_graph.to_dict(),
             "qc_summary": self.qc_summary,
+            "display_settings": self.display_settings,
         }
 
     @classmethod
@@ -454,6 +456,7 @@ class WaferProject:
             roi_templates=[RoiTemplate.from_dict(t) for t in d.get("roi_templates", [])],
             match_graph=MatchGraph.from_dict(d.get("match_graph")),
             qc_summary=dict(d.get("qc_summary", {})),
+            display_settings=dict(d.get("display_settings", {})),
         )
 
     def apply_results(self, source: "WaferProject") -> "WaferProject":
@@ -475,6 +478,8 @@ class WaferProject:
             if s.pose.center is not None:
                 t.pose = s.pose
         self.match_graph = source.match_graph
+        if getattr(source, "display_settings", None):
+            self.display_settings = source.display_settings
         self.roi_templates = source.roi_templates
         self.qc_summary = source.qc_summary
         return self
