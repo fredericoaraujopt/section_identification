@@ -15,6 +15,7 @@ setup(
         "scikit-image",
         "scipy",          # QC FFT peaks, TSP/seriation distances (also a sklearn/skimage dep)
         "shapely",
+        "psutil",          # host RAM/CPU probing + live detector load readout
         "opencv-python",
         "tifffile",
         "torch>=2.5.1",

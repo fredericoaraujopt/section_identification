@@ -86,7 +86,7 @@ def tiled_detect(image, checkpoint, *, model_cfg=None, device=None,
                  box_nms_thresh=0.7, crop_n_layers=0, crop_nms_thresh=0.7,
                  crop_overlap_ratio=512 / 1500, crop_n_points_downscale_factor=1,
                  min_mask_region_area=None, use_m2m=False, multimask_output=True,
-                 on_tile=None, on_tile_start=None, dedup_dist_frac=0.5):
+                 cap_ppb=True, on_tile=None, on_tile_start=None, dedup_dist_frac=0.5):
     """Detect sections by tiling an in-memory RGB image; return section dicts.
 
     Each result: ``{"polygon": Nx2 (x,y) in image coords, "area": float,
@@ -116,8 +116,19 @@ def tiled_detect(image, checkpoint, *, model_cfg=None, device=None,
     H0, W0 = image.shape[:2]
     eff = int(math.ceil(tile_px * (1.0 + max(0.0, overlap))))
     eff_h, eff_w = min(H0, eff), min(W0, eff)
-    safe_ppb = host_profile.safe_points_per_batch(
-        budget, eff_h, eff_w, points_per_batch, masks_per_point=masks_per_point)
+    if cap_ppb:
+        safe_ppb = host_profile.safe_points_per_batch(
+            budget, eff_h, eff_w, points_per_batch, masks_per_point=masks_per_point)
+    else:
+        # User opted out of the host RAM budget: run EXACTLY the requested batch
+        # for throughput, accepting the OOM/thrash risk. Show what the guard WOULD
+        # have allowed so the gap is visible in the run log.
+        capped = host_profile.safe_points_per_batch(
+            budget, eff_h, eff_w, points_per_batch, masks_per_point=masks_per_point)
+        safe_ppb = int(points_per_batch)
+        print(f"STIM_PROGRESS: SAM points_per_batch cap DISABLED — forcing "
+              f"{safe_ppb} (host budget would allow {capped}). Watch RAM below.",
+              flush=True)
     mmra = int(min_mask_region_area) if min_mask_region_area is not None \
         else int(max(4, min_area))
     params = {
@@ -133,7 +144,8 @@ def tiled_detect(image, checkpoint, *, model_cfg=None, device=None,
         # whole-image tile can't recreate the multi-GB binary-mask cache.
         "min_mask_region_area": mmra, "output_mode": "coco_rle",
     }
-    print(f"STIM_PROGRESS: SAM points_per_batch={safe_ppb} (host budget) on {device}", flush=True)
+    _ppb_src = "host budget" if cap_ppb else "uncapped"
+    print(f"STIM_PROGRESS: SAM points_per_batch={safe_ppb} ({_ppb_src}) on {device}", flush=True)
     amg = build_mask_generator(checkpoint, model_cfg, device, params)
 
     H, W = image.shape[:2]

@@ -17,7 +17,88 @@ Progress/markers on stdout: ``STIM_TILES``, ``STIM_TILE``, ``STIM_PROGRESS``,
 import argparse
 import json
 import sys
+import threading
 import time
+
+
+class _ResourceMonitor(threading.Thread):
+    """Sample this worker's memory/CPU load while SAM runs and print it.
+
+    The automatic detector is the heaviest thing STiM does to the user's
+    machine; this makes that cost visible. A daemon thread samples every
+    ``interval`` seconds (so it can't block detection or outlive it) and prints
+    ``STIM_PROGRESS`` lines — process RSS, its share of system RAM, and CPU% —
+    plus, on CUDA, the torch peak VRAM. A final summary reports the peak RSS.
+
+    Degrades gracefully: if ``psutil`` isn't importable we say so once and stop,
+    rather than failing the run (psutil is optional across STiM).
+    """
+
+    def __init__(self, device="", interval=3.0):
+        super().__init__(daemon=True)
+        self.device = (device or "").lower()
+        self.interval = float(interval)
+        self._stop = threading.Event()
+        self.peak_rss = 0
+        try:
+            import psutil
+            self._psutil = psutil
+            self._proc = psutil.Process()
+            self._proc.cpu_percent(None)          # prime the % baseline
+            self._cores = psutil.cpu_count() or 1
+        except Exception:
+            self._psutil = None
+
+    def _cuda_peak_gb(self):
+        if "cuda" not in self.device:
+            return None
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.max_memory_allocated() / (1024 ** 3)
+        except Exception:
+            pass
+        return None
+
+    def _sample(self, final=False):
+        GB = 1024 ** 3
+        try:
+            rss = self._proc.memory_info().rss
+            self.peak_rss = max(self.peak_rss, rss)
+            vm = self._psutil.virtual_memory()
+            cpu = self._proc.cpu_percent(None)     # sum across cores; may be >100
+            msg = (f"RSS {rss / GB:.2f} GB "
+                   f"({rss / vm.total * 100:.0f}% of {vm.total / GB:.0f} GB) · "
+                   f"sys RAM {vm.percent:.0f}% used, {vm.available / GB:.1f} GB free · "
+                   f"CPU {cpu:.0f}% (of {self._cores * 100}%)")
+            vram = self._cuda_peak_gb()
+            if vram is not None:
+                msg += f" · CUDA peak {vram:.2f} GB"
+            tag = "peak load" if final else "load"
+            print(f"STIM_PROGRESS: [{tag}] {msg}", flush=True)
+        except Exception:
+            pass
+
+    def run(self):
+        if self._psutil is None:
+            print("STIM_PROGRESS: [load] resource monitor unavailable "
+                  "(install psutil to see RAM/CPU load).", flush=True)
+            return
+        while not self._stop.wait(self.interval):
+            self._sample()
+
+    def stop_and_report(self):
+        self._stop.set()
+        if self._psutil is None:
+            return
+        GB = 1024 ** 3
+        # one last live sample, then the run's peak RSS
+        self._sample()
+        try:
+            print(f"STIM_PROGRESS: [peak load] worker peak RSS "
+                  f"{self.peak_rss / GB:.2f} GB.", flush=True)
+        except Exception:
+            pass
 
 
 def _run_stream(a):
@@ -70,6 +151,7 @@ def _run_stream(a):
         crop_n_points_downscale_factor=a.crop_n_points_downscale_factor,
         min_mask_region_area=(a.min_mask_region_area if a.min_mask_region_area >= 0 else None),
         use_m2m=bool(a.use_m2m), multimask_output=bool(a.multimask),
+        cap_ppb=not bool(a.no_ppb_cap),
         on_tile=on_tile, on_tile_start=on_tile_start)
     print(f"STIM_DONE: {len(res)} sections", flush=True)
 
@@ -94,6 +176,9 @@ def main():
     ap.add_argument("--use-m2m", type=int, default=0)
     # 1 = SAM default (3 masks/point, best recall); 0 = low-memory (1 mask/point)
     ap.add_argument("--multimask", type=int, default=1)
+    # 1 = ignore the host RAM budget and run points-per-batch exactly as requested
+    # (higher throughput, no OOM/thrash guard); 0 = clamp to a memory-safe value.
+    ap.add_argument("--no-ppb-cap", type=int, default=0)
     ap.add_argument("--min-area", type=float, default=20.0)
     # 0 / negative => single whole-image tile
     ap.add_argument("--tile-px", type=int, default=0)
@@ -102,6 +187,8 @@ def main():
     a = ap.parse_args()
 
     t0 = time.time()
+    monitor = _ResourceMonitor(device=a.device or "")
+    monitor.start()
     try:
         _run_stream(a)
         print(f"STIM_PROGRESS: finished in {time.time() - t0:.0f}s", flush=True)
@@ -110,6 +197,8 @@ def main():
         print("STIM_ERROR: " + repr(e), flush=True)
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        monitor.stop_and_report()
 
 
 if __name__ == "__main__":

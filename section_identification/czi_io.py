@@ -445,8 +445,29 @@ def build_czi_dask_pyramid(path: str, channel: int = 0, max_levels: int = 7,
 # session's zoom into a fast block read instead of a CZI decode. Inspired by the
 # mVis viewer, which builds its pyramid once and caches it beside the source.
 
-ZARR_CHUNK = 1024  # storage chunk (px). Smaller than the 3072 build tile so a
-                   # pan reads less per step and the block cache is finer-grained.
+ZARR_CHUNK = 1024   # logical chunk (px) = runtime read granularity. Small so a pan
+                    # reads little per step and the block cache is fine-grained.
+ZARR_SHARD = 8192   # physical shard (px): ZARR_SHARD/ZARR_CHUNK squared chunks are
+                    # packed into ONE file. Keeps fine-grained reads while collapsing
+                    # ~tens-of-thousands of tiny chunk files into a few hundred large
+                    # ones -- the difference between minutes and hours when the cache
+                    # is written to a slow network (SMB) share next to the image.
+
+
+def _chunk_shard_dims(lh: int, lw: int):
+    """(chunks, shards) for a level of size ``(lh, lw, 3)``.
+
+    Shard dims are whole multiples of the chunk dims (a Zarr sharding requirement)
+    and never larger than the level rounded up to a chunk, so small levels get one
+    (partial) shard rather than an oversized empty one.
+    """
+    ch = (min(ZARR_CHUNK, lh), min(ZARR_CHUNK, lw), 3)
+
+    def _sd(dim, c):
+        k = max(1, ZARR_SHARD // c)                    # chunks per shard along dim
+        return min(c * k, ((dim + c - 1) // c) * c)    # multiple of chunk, <= ceil(dim)
+
+    return ch, (_sd(lh, ch[0]), _sd(lw, ch[1]), 3)
 
 
 def zarr_pyramid_path(out_dir: str, image_path: str) -> str:
@@ -501,40 +522,126 @@ def open_czi_zarr_pyramid(zpath: str):
             for i in range(meta["n_levels"])]
 
 
-def write_czi_zarr_pyramid(image_path: str, zpath: str, channel: int = 0,
-                           progress=None, **build_kwargs):
-    """Build the CZI display pyramid once and persist it to a chunked Zarr.
+# --- parallel shard workers (module-level so a ProcessPool can pickle them) --- #
+# pylibCZIrw is NOT safe for concurrent reads within one process, so we parallelise
+# across PROCESSES (each with its own handle), never threads -- this is why the old
+# builder was pinned to Dask's single-threaded scheduler. Each worker opens the CZI
+# once and decodes whole SHARD-aligned regions; shards tile the level exactly, so
+# every task writes one distinct shard file and no two workers ever race on a file.
+_PYRAMID_WORKER: dict = {}
 
-    Decodes the whole CZI exactly once with bounded memory (Dask streams the
-    pyramid block by block). Writes to a ``.part`` dir and renames atomically so
-    a crash never leaves a half-written cache that passes :func:`zarr_pyramid_exists`.
-    Returns the freshly-written pyramid reopened as dask-from-Zarr arrays, so the
-    caller can switch the display to the fast on-disk copy immediately.
+
+def _pyramid_worker_init(image_path, channel, lo, hi, bbox):
+    from pylibCZIrw import czi as pyczi
+    cm = pyczi.open_czi(image_path)
+    _PYRAMID_WORKER.update(cm=cm, cz=cm.__enter__(), channel=channel,
+                           lo=lo, hi=hi, bbox=bbox, arrs={})
+
+
+def _pyramid_worker_shard(task):
+    import zarr
+    level_path, z, r0, c0, oh, ow = task
+    bx, by, bw, bh = _PYRAMID_WORKER["bbox"]
+    fx = int(bx + round(c0 / z))
+    fy = int(by + round(r0 / z))
+    fw = int(round(ow / z))
+    fh = int(round(oh / z))
+    x0 = int(max(bx, min(fx, bx + bw - 1)))
+    y0 = int(max(by, min(fy, by + bh - 1)))
+    w = int(max(1, min(fw, bx + bw - x0)))
+    h = int(max(1, min(fh, by + bh - y0)))
+    raw = np.squeeze(_PYRAMID_WORKER["cz"].read(
+        roi=(x0, y0, w, h), plane={"C": _PYRAMID_WORKER["channel"]}, zoom=float(z)))
+    rgb = to_rgb8(raw, clahe=False, lo=_PYRAMID_WORKER["lo"], hi=_PYRAMID_WORKER["hi"])
+    out = np.zeros((oh, ow, 3), dtype=np.uint8)
+    hh, ww = min(oh, rgb.shape[0]), min(ow, rgb.shape[1])
+    out[:hh, :ww] = rgb[:hh, :ww]
+    arrs = _PYRAMID_WORKER["arrs"]
+    if level_path not in arrs:
+        arrs[level_path] = zarr.open(level_path, mode="r+")
+    arrs[level_path][r0:r0 + oh, c0:c0 + ow] = out
+    return oh * ow
+
+
+def write_czi_zarr_pyramid(image_path: str, zpath: str, channel: int = 0,
+                           progress=None, max_workers: int | None = None,
+                           max_levels: int = 7, min_level_px: int = 1500,
+                           contrast_long_side: int = 2048, **_ignored):
+    """Build the CZI display pyramid once and persist it to a SHARDED Zarr.
+
+    Decodes the whole CZI exactly once, in PARALLEL across a process pool (each
+    worker holds its own pylibCZIrw handle, reused for every block), with ONE global
+    contrast mapping identical to :func:`build_czi_dask_pyramid` so the cache matches
+    the live display. Output is a Zarr-v3 pyramid with a 1024-px logical CHUNK
+    (fine-grained runtime reads) packed into few large SHARD files -- so writing the
+    cache next to the image on a slow network share is a handful of big files rather
+    than tens of thousands of tiny ones.
+
+    Writes to a ``.part`` dir and renames atomically, so a crash never leaves a
+    half-written cache that passes :func:`zarr_pyramid_exists`. Returns the pyramid
+    reopened as dask-from-Zarr arrays (level 0 = full res).
     ``progress(level_done, level_total)`` is called per level if provided.
     """
+    import multiprocessing as mp
     import shutil
-    import dask
-    import dask.array as da
+    from concurrent.futures import ProcessPoolExecutor
+    import zarr
+    from pylibCZIrw import czi as pyczi
 
-    levels, _ = build_czi_dask_pyramid(image_path, channel=channel, **build_kwargs)
+    with pyczi.open_czi(image_path) as cz:
+        bx, by, bw, bh = cz.total_bounding_rectangle
+    ov_arr, _, _ = read_czi_overview(image_path, target_long_side=contrast_long_side,
+                                     channel=channel)
+    lo, hi = percentile_lo_hi(ov_arr)
+
+    # Plan levels: L0 = full bbox, each level halves, down to ~min_level_px long side.
+    plan = []
+    for L in range(max_levels):
+        z = 0.5 ** L
+        lw = max(1, int(round(bw * z)))
+        lh = max(1, int(round(bh * z)))
+        plan.append((L, z, lw, lh))
+        if max(lw, lh) <= min_level_px:
+            break
+    n = len(plan)
+
     tmp = zpath + ".part"
     if os.path.isdir(tmp):
         shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp, exist_ok=True)
-    n = len(levels)
+
+    if max_workers is None:
+        max_workers = max(1, min(8, (os.cpu_count() or 2) - 2))
+    # spawn (not fork): safe alongside the Qt/napari threads this runs under, and each
+    # worker opens its own CZI handle. The console-script entry point is __main__-
+    # guarded, so spawn re-importing __main__ does not relaunch the app.
+    ctx = mp.get_context("spawn")
+
     shapes = []
-    # Force the SINGLE-THREADED scheduler for the decode. Each block opens the CZI
-    # via pylibCZIrw, which is not safe under concurrent reads — the default threaded
-    # scheduler races (a worker dies and surfaces as ``KeyError: '_read_block-…'``)
-    # and runs many full-res blocks at once, breaking the bounded-memory guarantee.
-    # Synchronous = one block at a time; this runs in a background thread already.
-    with dask.config.set(scheduler="single-threaded"):
-        for i, lvl in enumerate(levels):
-            ch = (min(ZARR_CHUNK, lvl.shape[0]), min(ZARR_CHUNK, lvl.shape[1]), 3)
-            da.to_zarr(lvl.rechunk(ch), os.path.join(tmp, str(i)), overwrite=True)
-            shapes.append([int(s) for s in lvl.shape])
+    ex = ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx,
+                             initializer=_pyramid_worker_init,
+                             initargs=(image_path, channel, lo, hi, (bx, by, bw, bh)))
+    try:
+        for (L, z, lw, lh) in plan:
+            lp = os.path.join(tmp, str(L))
+            ch, sh = _chunk_shard_dims(lh, lw)
+            zarr.create_array(store=lp, shape=(lh, lw, 3), chunks=ch, shards=sh,
+                              dtype="uint8")
+            tasks = []
+            for r0 in range(0, lh, sh[0]):
+                oh = min(sh[0], lh - r0)
+                for c0 in range(0, lw, sh[1]):
+                    ow = min(sh[1], lw - c0)
+                    tasks.append((lp, z, r0, c0, oh, ow))
+            # ex.map re-raises the first shard failure here -> surfaced to the caller.
+            for _ in ex.map(_pyramid_worker_shard, tasks):
+                pass
+            shapes.append([lh, lw, 3])
             if progress is not None:
-                progress(i + 1, n)
+                progress(L + 1, n)
+    finally:
+        ex.shutdown(wait=True)
+
     try:
         st = os.stat(image_path)
         src = {"size": st.st_size, "mtime": int(st.st_mtime)}
@@ -542,7 +649,7 @@ def write_czi_zarr_pyramid(image_path: str, zpath: str, channel: int = 0,
         src = {}
     with open(os.path.join(tmp, "_stim_pyramid.json"), "w") as f:
         json.dump({"complete": True, "n_levels": n, "shapes": shapes,
-                   "chunk": ZARR_CHUNK, "source": src}, f)
+                   "chunk": ZARR_CHUNK, "shard": ZARR_SHARD, "source": src}, f)
     if os.path.isdir(zpath):
         shutil.rmtree(zpath, ignore_errors=True)
     os.replace(tmp, zpath)

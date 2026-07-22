@@ -13,6 +13,7 @@ import ast
 import csv
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -96,7 +97,14 @@ class _CheckpointDownloader(QThread):
 
 
 class _ZarrPyramidBuilder(QThread):
-    """Build + persist a CZI display pyramid to Zarr off the UI thread."""
+    """Build + persist a CZI display pyramid to Zarr off the UI thread.
+
+    The actual (parallel, sharded) build runs in a SEPARATE process
+    (``python -m section_identification.build_pyramid``): its process-pool workers
+    then re-import only that lightweight module, never napari/Qt, so worker startup
+    is fast and the GUI can't relaunch itself. This QThread just supervises that
+    subprocess and relays its ``PROGRESS`` lines as Qt signals.
+    """
     progress = Signal(int, int)     # (level_done, level_total)
     done = Signal(str, object)      # (image_path, levels) — levels = dask-from-Zarr list
     failed = Signal(str, str)       # (image_path, message)
@@ -107,13 +115,29 @@ class _ZarrPyramidBuilder(QThread):
 
     def run(self):
         try:
-            levels = czi_io.write_czi_zarr_pyramid(
-                self.image_path, self.zpath,
-                progress=lambda d, t: self.progress.emit(d, t))
+            cmd = [sys.executable, "-m", "section_identification.build_pyramid",
+                   self.image_path, self.zpath]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+            tail = []  # keep the last lines to report if the build fails
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line.startswith("PROGRESS "):
+                    try:
+                        _, d, t = line.split()
+                        self.progress.emit(int(d), int(t))
+                        continue
+                    except ValueError:
+                        pass
+                if line:
+                    tail.append(line)
+                    del tail[:-40]
+            if proc.wait() != 0:
+                raise RuntimeError(f"build_pyramid exited {proc.returncode}\n"
+                                   + "\n".join(tail))
+            levels = czi_io.open_czi_zarr_pyramid(self.zpath)
             self.done.emit(self.image_path, levels)
         except Exception as e:  # noqa: BLE001 — surfaced to the user via the log
-            # A bare KeyError repr (e.g. a dask task key) hides the real cause, so
-            # send the type + full traceback to the log.
             self.failed.emit(self.image_path,
                              f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
@@ -367,6 +391,11 @@ class SectionIdentificationGUI(QWidget):
             "Memory-saver: SAM emits 1 mask per point instead of 3 → ~3× less peak mask "
             "memory (eases pressure on Macs / weak machines). May slightly lower recall on "
             "ambiguous sections. Off = SAM default (3 masks/point, best recall).", gperf)
+        self.chk_nocap = _row(QCheckBox(), "uncap points/batch", "points_per_batch",
+            "Ignore the host RAM budget and run points/batch EXACTLY as set above. "
+            "Raises throughput on a machine with spare memory, but removes the OOM/thrash "
+            "guard — if the detector stalls or the machine swaps, turn this back off. "
+            "The terminal prints live RAM/CPU load so you can watch the headroom.", gperf)
 
         # crop sub-knobs are inert until crop layers ≥ 1.
         self.sp_cropov.setEnabled(False); self.sp_cropds.setEnabled(False)
@@ -1227,6 +1256,7 @@ class SectionIdentificationGUI(QWidget):
                 "--min-mask-region-area", str(self.sp_minmask.value()),
                 "--use-m2m", "1" if self.chk_m2m.isChecked() else "0",
                 "--multimask", "0" if self.chk_lowmem.isChecked() else "1",
+                "--no-ppb-cap", "1" if self.chk_nocap.isChecked() else "0",
                 "--tile-px", str(tile_px), "--overlap", str(self.sp_overlap.value()),
                 "--min-area", str(min_area), "--max-area", str(max_area)]
         self._stream_mode = True
@@ -1239,6 +1269,9 @@ class SectionIdentificationGUI(QWidget):
                      f"overview {self.sp_target.value()}px · "
                      f"{'whole image' if whole else 'tiles'}, tile_px={tile_px}, grid "
                      f"{self.sp_pps.value()}, area {min_area:.0f}–{max_area:.0f}.")
+        if self.chk_nocap.isChecked():
+            self.log_msg(f"⚠ points/batch uncapped: forcing {self.sp_ppb.value()} "
+                         f"(host RAM budget bypassed — watch the terminal for load).")
         self._proc_buf = ""
 
         self.proc = QProcess(self)
