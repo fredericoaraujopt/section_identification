@@ -367,6 +367,15 @@ class StageROIs(_StageBase):
                                     "mode above.")
         self.btn_roi_def.clicked.connect(self._propagate)
         self.col.addWidget(self.btn_roi_def)
+        self.btn_roi_center = QPushButton("Propagate ROI to section centers")
+        self.btn_roi_center.setToolTip("Place a copy of the drafted ROI — with its "
+                                       "drawn dimensions and orientation unchanged — at "
+                                       "the centroid of every section. Ignores pose and "
+                                       "the fit mode above; use when section polygons "
+                                       "vary widely in size and pose-based fitting "
+                                       "misplaces the ROI.")
+        self.btn_roi_center.clicked.connect(self._propagate_center)
+        self.col.addWidget(self.btn_roi_center)
 
         # --- Focus points: same draft -> define+propagate pattern ---
         self.col.addWidget(QLabel("<b>Focus points</b>"))
@@ -650,6 +659,39 @@ class StageROIs(_StageBase):
         roi_mod.propagate_all(tmpl, self.app.project.sections)
         layer_sync.show_rois(self.app)
         self.app.log(self.STAGE, f"propagated ROI (ref {ref.id}, fit={fit}) to "
+                                 f"{sum(1 for s in self.app.project.sections if s.roi)} sections.")
+        self.app.save_workflow()
+
+    def _propagate_center(self):
+        """Propagate the drafted ROI to every section's centroid unchanged (no pose,
+        no size fitting) — robust when section polygons vary widely in size."""
+        if not self._need_image():
+            return
+        self.app.sync_sections()
+        self.app.ensure_poses()
+        roi_xy = self._draft_polygon_xy()
+        if roi_xy is None:
+            self.app.log(self.STAGE, "draw an ROI on the 'ROI draft' layer first.")
+            return
+        ref = self._reference_section(roi_xy)
+        if ref is None:
+            self.app.log(self.STAGE, "no reference section found under the ROI.")
+            return
+        tmpl = roi_mod.template_from_polygon(ref.pose, roi_xy, ref_section_id=ref.id,
+                                             fit_mode="center", fit_percent=self.sp_pct.value(),
+                                             focus_cols=self.sp_fc.value(),
+                                             focus_rows=self.sp_fr.value(),
+                                             tile_um=(self.sp_tile.value(), self.sp_tile.value()))
+        # Center mode keeps the ROI exactly as drawn (no pose rotation), so store the
+        # raw drawn polygon rather than the pose-normalised one; propagation only
+        # translates it onto each section centroid.
+        tmpl.polygon_local = [[float(x), float(y)] for x, y in
+                              np.asarray(roi_xy, float).reshape(-1, 2)]
+        self.app.project.roi_templates = [tmpl]
+        roi_mod.propagate_all(tmpl, self.app.project.sections)
+        layer_sync.show_rois(self.app)
+        self.app.log(self.STAGE, f"propagated ROI (ref {ref.id}, centered, dimensions "
+                                 f"unchanged) to "
                                  f"{sum(1 for s in self.app.project.sections if s.roi)} sections.")
         self.app.save_workflow()
 

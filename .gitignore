@@ -23,3 +23,6 @@ checkpoint/
 section_examples/
 *_stim_project.json
 STIM_SESSION_STATE.md
+
+# Local experiments (not shared across machines)
+experiments/

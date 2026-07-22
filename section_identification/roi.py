@@ -54,6 +54,22 @@ def focus_template_from_points(pose, points_xy) -> list[list[float]]:
              for p in pts)]
 
 
+def propagate_centered_to_section(template: RoiTemplate, section) -> list[list[float]] | None:
+    """Place the template's ROI at a section's centroid with **no** pose, scale or
+    shape adjustment — the polygon keeps its drawn dimensions and orientation and
+    is simply translated so its centroid lands on the section centroid.
+
+    Unlike :func:`propagate_to_pose` + :func:`fit_roi`, this ignores the section's
+    rotation and size. It is the robust choice when section polygons vary widely in
+    size across a wafer, where size-based fitting misplaces the ROI."""
+    local = np.asarray(template.polygon_local, float).reshape(-1, 2)
+    if len(local) < 3 or not section.polygon:
+        return None
+    local = local - local.mean(axis=0)      # centre the ROI on the origin
+    cx, cy = section.centroid()
+    return [[float(x + cx), float(y + cy)] for x, y in local]
+
+
 def propagate_focus_to_pose(template: RoiTemplate, pose) -> list[list[float]]:
     """Map a template's local focus points into a section's world frame."""
     if not template.focus_local:
@@ -112,14 +128,22 @@ def fit_roi(roi_polygon, section_polygon, mode: str = "template",
 def propagate_all(template: RoiTemplate, sections) -> None:
     """Set ``section.roi`` (and ``focus_overview`` if the template has focus
     points) for every section by propagating + fitting the template through each
-    section's pose."""
+    section's pose.
+
+    ``fit_mode == "center"`` is special: the ROI is placed at each section's
+    centroid unchanged (see :func:`propagate_centered_to_section`), independent of
+    pose — for wafers whose section polygons vary widely in size."""
     for s in sections:
-        if s.pose.center is None:
-            continue
         if template.polygon_local:
-            world = propagate_to_pose(template, s.pose)
-            fitted = fit_roi(world, s.polygon, template.fit_mode, template.fit_percent)
-            s.roi = Roi(polygon=fitted, fit_mode=template.fit_mode,
-                        fit_percent=template.fit_percent)
-        if template.focus_local:
+            if template.fit_mode == "center":
+                fitted = propagate_centered_to_section(template, s)
+                if fitted is not None:
+                    s.roi = Roi(polygon=fitted, fit_mode="center",
+                                fit_percent=template.fit_percent)
+            elif s.pose.center is not None:
+                world = propagate_to_pose(template, s.pose)
+                fitted = fit_roi(world, s.polygon, template.fit_mode, template.fit_percent)
+                s.roi = Roi(polygon=fitted, fit_mode=template.fit_mode,
+                            fit_percent=template.fit_percent)
+        if template.focus_local and s.pose.center is not None:
             s.focus_overview = propagate_focus_to_pose(template, s.pose)

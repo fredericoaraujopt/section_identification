@@ -83,6 +83,28 @@ def test_propagate_all_sets_rois():
     assert all(s.roi is not None and len(s.roi.polygon) == len(ROI_SQ) for s in secs)
 
 
+def test_propagate_center_keeps_dimensions_and_centres():
+    # sections of wildly different sizes; centered mode must keep ROI size fixed
+    ref = _section(TRAP)
+    small = _section(_transform(TRAP * 0.2, 30.0, 300.0, 100.0))
+    big = _section(_transform(TRAP * 5.0, 100.0, -400.0, 50.0))
+    # center mode stores the raw drawn polygon (as the ROI-stage button does)
+    tmpl = RoiTemplate(polygon_local=[[float(x), float(y)] for x, y in ROI_SQ],
+                       ref_section_id=ref.id, fit_mode="center")
+    roi.propagate_all(tmpl, [ref, small, big])
+
+    def dims(p):
+        p = np.asarray(p, float)
+        return (p[:, 0].max() - p[:, 0].min(), p[:, 1].max() - p[:, 1].min())
+    roi_w, roi_h = dims(ROI_SQ)
+    for s in (ref, small, big):
+        assert s.roi is not None and s.roi.fit_mode == "center"
+        w, h = dims(s.roi.polygon)
+        assert abs(w - roi_w) < 1e-6 and abs(h - roi_h) < 1e-6   # unchanged dimensions
+        c = np.asarray(s.roi.polygon, float).mean(axis=0)        # ROI centroid ...
+        assert np.allclose(c, np.asarray(s.centroid()), atol=1e-6)  # ... on section centroid
+
+
 def test_focus_propagation_pose_consistent():
     ref = _section(TRAP)
     focus_pts = [[0.0, 0.0], [3.0, -2.0]]                 # world pts on the reference
