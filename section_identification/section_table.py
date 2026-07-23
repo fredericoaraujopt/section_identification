@@ -38,6 +38,16 @@ class SectionTableDock(QWidget):
                                    "unifying section orientations.")
         self.btn_orient.clicked.connect(self._show_orientation)
         bar.addWidget(self.btn_orient)
+        self.btn_prev = QPushButton("▲ prev")
+        self.btn_prev.setToolTip("Go to the previous section, keeping the current zoom "
+                                 "(keyboard: Up arrow while the image is focused).")
+        self.btn_prev.clicked.connect(lambda: self._step(-1))
+        self.btn_next = QPushButton("▼ next")
+        self.btn_next.setToolTip("Go to the next section, keeping the current zoom "
+                                 "(keyboard: Down arrow while the image is focused).")
+        self.btn_next.clicked.connect(lambda: self._step(1))
+        bar.addWidget(self.btn_prev)
+        bar.addWidget(self.btn_next)
         bar.addStretch(1)
         self.btn_accept = QPushButton("✓ accept")
         self.btn_accept.setToolTip("Mark the selected section accepted (proofread).")
@@ -61,6 +71,9 @@ class SectionTableDock(QWidget):
             pass
         self.table.cellClicked.connect(self._on_click)
         self.table.cellDoubleClicked.connect(self._on_double)
+        # Arrow-key row changes (table focused) also drive the viewer.
+        self.table.currentCellChanged.connect(
+            lambda cur, _c, _pr, _pc: self._activate_row(cur))
         lay.addWidget(self.table)
         self._listeners = []
         self._rows = []          # sections in displayed (area-sorted) order
@@ -84,10 +97,13 @@ class SectionTableDock(QWidget):
     def _row_section(self, row):
         return self._rows[row] if 0 <= row < len(self._rows) else None
 
-    def _on_click(self, row, _col):
-        """Single click: select + recenter on the section, keeping the current
-        zoom (pan to it without changing magnification)."""
+    def _activate_row(self, row):
+        """Select the row + recenter on its section, keeping the current zoom
+        (pan without changing magnification). Shared by click, arrow keys, and the
+        prev/next buttons."""
         section = self._row_section(row)
+        if section is None:
+            return
         self.selected_section = section
         try:
             self.nav.center_on(section)
@@ -98,6 +114,28 @@ class SectionTableDock(QWidget):
                 fn(section)
             except Exception:
                 pass
+
+    def _on_click(self, row, _col):
+        """Single click: select + recenter on the section (keeps magnification)."""
+        self._activate_row(row)
+
+    def _step(self, delta):
+        """Move the selection up/down the table by ``delta`` rows and pan to that
+        section at the current zoom — the prev/next buttons and Up/Down arrows.
+        Wraps the selection to the ends so it never gets stuck."""
+        n = len(self._rows)
+        if n == 0:
+            return
+        cur = self.table.currentRow()
+        nxt = 0 if cur < 0 else (cur + delta) % n        # wrap around
+        moved = nxt != self.table.currentRow()
+        self.table.setCurrentCell(nxt, 0)                # → currentCellChanged → activate
+        try:
+            self.table.scrollToItem(self.table.item(nxt, 0))
+        except Exception:
+            pass
+        if not moved:                                    # single row: still recenter
+            self._activate_row(nxt)
 
     def _on_double(self, row, _col):
         """Double click: snap to the project-wide consistent magnification."""

@@ -1411,6 +1411,14 @@ def attach_workflow(viewer, gui):
     nav = FovNavigator(app)
     table = SectionTableDock(app, nav)
 
+    # Up/Down arrows (while the image canvas is focused) step to the prev/next
+    # section at the current zoom — quick section-to-section proofreading.
+    try:
+        viewer.bind_key("Up", lambda v: table._step(-1), overwrite=True)
+        viewer.bind_key("Down", lambda v: table._step(1), overwrite=True)
+    except Exception:
+        pass
+
     tabs = QTabWidget()
     gui_scroll = QScrollArea()
     gui_scroll.setWidgetResizable(True)

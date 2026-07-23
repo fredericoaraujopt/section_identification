@@ -19,6 +19,10 @@ import numpy as np
 
 QC_LAYER = None  # QC recolours the existing Sections layer in place
 ROI_LAYER = "② ROIs"
+# Cyan edge + a faint cyan face (matches the edge, like the Sections layer's
+# red edge + [1,0,0,0.18] face — a touch less opaque).
+ROI_EDGE = "cyan"
+ROI_FACE = [0.0, 1.0, 1.0, 0.12]
 MATCH_LAYER = "③ SIFT matches"
 CHAIN_LAYER = "③ Serial order"
 ROUTE_LAYER = "④ Route"
@@ -270,7 +274,7 @@ def ensure_roi_layer(app):
         return viewer.layers[ROI_LAYER]
     try:
         lyr = viewer.add_shapes([], shape_type="polygon", name=ROI_LAYER,
-                                edge_color="cyan", face_color="transparent",
+                                edge_color=ROI_EDGE, face_color=ROI_FACE,
                                 edge_width=_overlay_width(app), scale=app.layer_scale())
         _connect_autosave(app, lyr)
         return lyr
@@ -386,36 +390,46 @@ def clear_current_section(app):
     _remove(app.viewer, ROI_CURRENT_LAYER)
 
 
-def _closed_paths(polys_yx):
-    """Close each polygon into a path (append the first vertex). Paths render as
-    an edge-only outline, so napari never triangulates a face — which is what
-    crashes on the ROI's exact, un-simplified SAM contours (hundreds of vertices).
-    The face is transparent anyway, so the visual result is identical."""
-    out = []
-    for p in polys_yx:
-        a = np.asarray(p, float).reshape(-1, 2)
-        if len(a) < 2:
-            continue
-        if not np.array_equal(a[0], a[-1]):
-            a = np.vstack([a, a[0]])
-        out.append(a)
-    return out
+def _repair_polygon_yx(poly_yx):
+    """Make a polygon valid via shapely ``buffer(0)`` (removes self-intersections /
+    spikes that crash napari's face triangulator on exact SAM contours). yx in/out;
+    returns None if it can't be repaired."""
+    try:
+        from shapely.geometry import Polygon
+        xy = np.asarray(poly_yx, float).reshape(-1, 2)[:, ::-1]
+        g = Polygon(xy).buffer(0)
+        if g.is_empty:
+            return None
+        if g.geom_type == "MultiPolygon":
+            g = max(g.geoms, key=lambda z: z.area)
+        c = np.asarray(g.exterior.coords)[:-1]
+        return c[:, ::-1] if len(c) >= 3 else None
+    except Exception:
+        return None
 
 
 def show_rois(app):
+    """Draw the per-section ROIs as filled polygons (cyan edge + faint cyan face)
+    so they stay selectable AND draggable by their interior with napari's select
+    tool — matching the Sections layer's edge-coloured, low-opacity fill. ROI
+    polygons keep their exact SAM coordinates; only a polygon napari can't
+    triangulate (a rare invalid, self-intersecting contour) is repaired for display
+    via shapely — never simplified — and one that still can't render is skipped
+    rather than crashing the app."""
     viewer = app.viewer
     _remove(viewer, ROI_LAYER)
     polys = [_xy_to_yx(s.roi.polygon) for s in app.project.sections
              if s.roi and len(s.roi.polygon) >= 3]
     if not polys:
         return
-    paths = _closed_paths(polys)
-    kw = dict(shape_type="path", name=ROI_LAYER, edge_color="cyan",
-              edge_width=_overlay_width(app), scale=app.layer_scale())
+    kw = dict(shape_type="polygon", name=ROI_LAYER, edge_color=ROI_EDGE,
+              face_color=ROI_FACE, edge_width=_overlay_width(app),
+              scale=app.layer_scale())
     try:
-        lyr = viewer.add_shapes(paths, **kw)
+        lyr = viewer.add_shapes(polys, **kw)          # fast path: all render as-is
     except Exception:
-        # Per-shape fallback: never let one bad outline take down the app.
+        # A bad polygon in the batch aborts the whole add — rebuild per-shape,
+        # keeping each exact if it renders and repairing only the ones that fail.
         _remove(viewer, ROI_LAYER)
         try:
             lyr = viewer.add_shapes([], **kw)
@@ -423,13 +437,21 @@ def show_rois(app):
             app.log("rois", f"overlay error: {e}")
             return
         skipped = 0
-        for pth in paths:
-            try:
-                lyr.add(pth, shape_type="path")
-            except Exception:
+        for p in polys:
+            added = False
+            for cand in (p, _repair_polygon_yx(p)):
+                if cand is None:
+                    continue
+                try:
+                    lyr.add(cand, shape_type="polygon")
+                    added = True
+                    break
+                except Exception:
+                    continue
+            if not added:
                 skipped += 1
         if skipped:
-            app.log("rois", f"skipped {skipped} ROI outline(s) napari could not render.")
+            app.log("rois", f"skipped {skipped} ROI polygon(s) napari could not render.")
     try:
         _connect_autosave(app, lyr)
     except Exception:
