@@ -197,17 +197,27 @@ FOCUS_LAYER = "Focus points"
 
 def show_focus_points(app):
     """Show propagated focus support points as an editable Points layer (the user
-    can nudge/add/remove them per section natively in napari)."""
+    can nudge/add/remove them per section natively in napari). Tagged
+    ``stim_screen_pts`` so the GUI keeps them a small, constant on-screen size
+    (they don't blow up as you zoom in) — the point analogue of the constant-width
+    outlines. Only sections with an ROI carry focus points."""
     viewer = app.viewer
     _remove(viewer, FOCUS_LAYER)
     pts = [[y, x] for s in app.project.sections for (x, y) in s.focus_overview]
     if not pts:
         return
     try:
-        lyr = viewer.add_points(np.asarray(pts, float), name=FOCUS_LAYER, size=4,
+        lyr = viewer.add_points(np.asarray(pts, float), name=FOCUS_LAYER, size=2,
                                 face_color="orange", border_color="orange",
-                                scale=app.layer_scale())
+                                scale=app.layer_scale(),
+                                metadata={"stim_screen_pts": True})
         _connect_autosave(app, lyr)
+        sync = getattr(getattr(app, "gui", None), "_sync_outline_widths", None)
+        if sync is not None:
+            try:
+                sync()
+            except Exception:
+                pass
     except Exception as e:
         app.log("rois", f"focus overlay error: {e}")
 
@@ -406,6 +416,26 @@ def _repair_polygon_yx(poly_yx):
         return c[:, ::-1] if len(c) >= 3 else None
     except Exception:
         return None
+
+
+def append_roi(app, polygon_xy):
+    """Add ONE ROI polygon (overview xy) to the editable overlay without rebuilding
+    it — O(1) per commit, so defining ROIs one-by-one (manual SAM / hand-draw)
+    stays fast on wafers with many ROIs instead of re-triangulating every existing
+    shape each time. Repairs geometry napari can't triangulate; never crashes."""
+    lyr = ensure_roi_layer(app)
+    if lyr is None:
+        return
+    yx = _xy_to_yx(polygon_xy)
+    for cand in (yx, _repair_polygon_yx(yx)):
+        if cand is None:
+            continue
+        try:
+            lyr.add(np.asarray(cand, float), shape_type="polygon")
+            return
+        except Exception:
+            continue
+    app.log("rois", "could not render that ROI polygon.")
 
 
 def show_rois(app):

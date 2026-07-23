@@ -1126,8 +1126,13 @@ class SectionIdentificationGUI(QWidget):
             return 1.0
 
     def _schedule_outline_sync(self, *a):
+        # Fire once AFTER the zoom gesture settles (not ~25×/s during it): each
+        # sync re-meshes every shape layer, so on wafers with thousands of shapes
+        # a per-tick re-mesh is what makes zooming lag. During the gesture the
+        # outline just scales with the view; it snaps back to constant width when
+        # the zoom stops.
         try:
-            self._outline_timer.start(40)
+            self._outline_timer.start(180)
         except Exception:
             self._sync_outline_widths()
 

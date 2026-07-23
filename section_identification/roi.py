@@ -101,13 +101,20 @@ def _point_in_polygon(pt, poly) -> bool:
 
 
 def focus_anchors_from_points(ref_section, points_xy) -> list[dict]:
-    """Classify each focus point (world/overview px) against a reference section:
-    a point inside the section's ROI anchors to the ROI, otherwise to the section.
-    Stored as the drawn offset ``[dx, dy]`` from that anchor's centroid so that
-    :func:`propagate_focus_centered` can drop it at the same offset on every
-    section's (propagated) ROI / section centroid — no pose, no scaling."""
+    """Classify each drafted focus point (overview px) against a reference section
+    and record how to reproduce it on every section. A point inside the section's
+    ROI anchors to the **ROI**; otherwise to the **section**. Each anchor stores:
+
+    * ``local`` — the offset from the anchor centroid in the reference section's
+      pose-normalised (upright) frame → used by pose/relative propagation so it
+      lands at the same *relative* spot (e.g. an ROI's top-left → every ROI's
+      top-left), rotation-aware.
+    * ``drawn`` — the raw world offset from the anchor centroid → used by
+      centre propagation (no pose, no scaling)."""
     pts = np.asarray(points_xy, float).reshape(-1, 2)
     sec_c = np.asarray(ref_section.centroid(), float)
+    a_ref = ref_section.pose.angle_deg
+    flip = ref_section.pose.flip
     roi_poly = None
     roi_c = None
     if getattr(ref_section, "roi", None) and len(ref_section.roi.polygon) >= 3:
@@ -116,32 +123,62 @@ def focus_anchors_from_points(ref_section, points_xy) -> list[dict]:
     anchors = []
     for p in pts:
         if roi_poly is not None and _point_in_polygon(p, roi_poly):
-            anchors.append({"anchor": "roi",
-                            "off": [float(p[0] - roi_c[0]), float(p[1] - roi_c[1])]})
+            anchor, ac = "roi", roi_c
         else:
-            anchors.append({"anchor": "section",
-                            "off": [float(p[0] - sec_c[0]), float(p[1] - sec_c[1])]})
+            anchor, ac = "section", sec_c
+        local = fov_nav.world_to_local(p, (float(ac[0]), float(ac[1])), a_ref, flip)
+        anchors.append({"anchor": anchor,
+                        "local": [float(local[0]), float(local[1])]})
     return anchors
 
 
-def propagate_focus_centered(template: RoiTemplate, section) -> list[list[float]]:
-    """Place the template's focus points on a section by anchor, unchanged in
-    offset (no pose / scaling). ROI-anchored points ride the section's propagated
-    ROI centroid; section-anchored points sit at the section centroid. Falls back
-    to the section centroid when a point is ROI-anchored but the section has no
-    ROI yet."""
-    if not template.focus_anchors:
-        return []
+def _anchor_centroids(section):
+    """(roi_centroid, section_centroid) for a section, or (None, section_centroid)
+    when it has no ROI."""
     sec_c = np.asarray(section.centroid(), float)
     roi_c = None
     if getattr(section, "roi", None) and len(section.roi.polygon) >= 3:
         roi_c = np.asarray(section.roi.polygon, float).reshape(-1, 2).mean(axis=0)
+    return roi_c, sec_c
+
+
+def propagate_focus_anchored(template: RoiTemplate, section, mode: str) -> list[list[float]]:
+    """Place the template's anchored focus points on a section. Only sections that
+    have an ROI receive focus points (an ROI-less region isn't imaged, so it needs
+    no focus). ``mode='pose'`` reproduces the relative position through the
+    section's pose (rotation-aware — e.g. an ROI's top-left → each ROI's top-left);
+    ``mode='center'`` places every point at the ROI / section **centroid**."""
+    if not template.focus_anchors:
+        return []
+    roi_c, sec_c = _anchor_centroids(section)
+    if roi_c is None:                       # no ROI → no focus points (req. #1)
+        return []
     out = []
     for a in template.focus_anchors:
-        off = np.asarray(a.get("off", [0.0, 0.0]), float).reshape(2)
-        base = roi_c if (a.get("anchor") == "roi" and roi_c is not None) else sec_c
-        out.append([float(base[0] + off[0]), float(base[1] + off[1])])
+        base = roi_c if a.get("anchor") == "roi" else sec_c
+        if mode == "center":
+            out.append([float(base[0]), float(base[1])])       # at the centroid
+        else:
+            w = fov_nav.local_to_world(a.get("local", [0.0, 0.0]),
+                                       (float(base[0]), float(base[1])),
+                                       section.pose.angle_deg, section.pose.flip)
+            out.append([float(w[0]), float(w[1])])
     return out
+
+
+def propagate_focus_only(template: RoiTemplate, sections) -> None:
+    """Set ``section.focus_overview`` for every section **without touching the
+    ROIs**. Used by the focus buttons so propagating focus never re-propagates /
+    overwrites the per-section ROIs (that clobbering also gave ROI-less sections a
+    focus point). Focus lands only on sections that have an ROI."""
+    for s in sections:
+        if template.focus_anchors:
+            s.focus_overview = propagate_focus_anchored(template, s, getattr(template, "focus_mode", "pose"))
+        elif template.focus_local and s.pose.center is not None \
+                and getattr(s, "roi", None) and len(s.roi.polygon) >= 3:
+            s.focus_overview = propagate_focus_to_pose(template, s.pose)   # legacy
+        else:
+            s.focus_overview = []
 
 
 def _scale_about(poly: np.ndarray, center, s: float) -> np.ndarray:
@@ -210,12 +247,18 @@ def propagate_all(template: RoiTemplate, sections) -> None:
                 fitted = fit_roi(world, s.polygon, template.fit_mode, template.fit_percent)
                 s.roi = Roi(polygon=fitted, fit_mode=template.fit_mode,
                             fit_percent=template.fit_percent)
-        # Focus points. "center" mode is anchor-based and pose-free (robust for
-        # size-varying sections); "pose" maps the local focus frame via the pose.
-        if getattr(template, "focus_mode", "pose") == "center" and template.focus_anchors:
-            s.focus_overview = propagate_focus_centered(template, s)
-        elif template.focus_local and s.pose.center is not None:
-            s.focus_overview = propagate_focus_to_pose(template, s.pose)
+        # Focus points — only on sections that have an ROI (an un-imaged region
+        # needs no focus). Each point rides its anchor (ROI if drawn inside it,
+        # else the section): "pose" keeps the relative spot rotation-aware,
+        # "center" drops the drawn offset at the ROI/section centroid unchanged.
+        mode = getattr(template, "focus_mode", "pose")
+        if template.focus_anchors:
+            s.focus_overview = propagate_focus_anchored(template, s, mode)
+        elif template.focus_local and s.pose.center is not None \
+                and getattr(s, "roi", None) and len(s.roi.polygon) >= 3:
+            s.focus_overview = propagate_focus_to_pose(template, s.pose)   # legacy
+        else:
+            s.focus_overview = []
 
 
 # --------------------------------------------------------------------------- #

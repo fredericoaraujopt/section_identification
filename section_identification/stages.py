@@ -671,21 +671,16 @@ class StageROIs(_StageBase):
 
     def _capture_manual_roi(self, poly_yx):
         """Commit a SAM-traced polygon as the ROI of the section that contains its
-        centroid (replacing any existing ROI on that section)."""
+        centroid. Appends the one shape to the overlay (O(1)) instead of rebuilding
+        it, so defining many ROIs one-by-one stays fast."""
         poly_xy = _napari_to_xy(np.asarray(poly_yx, float))
         self.app.sync_sections()
-        # Fold any pending hand-drawn ROI edits into the model before we rebuild
-        # the overlay, so redrawing it doesn't discard them.
-        try:
-            self.app.capture_annotations()
-        except Exception:
-            pass
         sec = self.app._section_containing(self.app.project, poly_xy)
         if sec is None:
             self.app.log(self.STAGE, "no section under that ROI — hover inside a section.")
             return
         sec.roi = Roi(polygon=[[float(x), float(y)] for x, y in poly_xy], fit_mode="manual")
-        layer_sync.show_rois(self.app)
+        layer_sync.append_roi(self.app, poly_xy)       # incremental — no full rebuild
         self.app.save_workflow()
         self.app.log(self.STAGE, f"ROI set on section {sec.id} "
                                  f"({sum(1 for s in self.app.project.sections if s.roi)} total).")
@@ -699,9 +694,16 @@ class StageROIs(_StageBase):
         if self.FOCUS_DRAFT in v.layers:
             v.layers.remove(self.FOCUS_DRAFT)
         try:
-            v.add_points(np.empty((0, 2)), name=self.FOCUS_DRAFT, size=4,
+            v.add_points(np.empty((0, 2)), name=self.FOCUS_DRAFT, size=2,
                          face_color="orange", border_color="orange",
-                         scale=self.app.layer_scale())
+                         scale=self.app.layer_scale(),
+                         metadata={"stim_screen_pts": True})
+            sync = getattr(self.app.gui, "_sync_outline_widths", None)
+            if sync is not None:
+                try:
+                    sync()
+                except Exception:
+                    pass
             self.app.log(self.STAGE, "drop focus points inside one reference section, "
                                      "then 'Focus pts: define + propagate'.")
         except Exception as e:
@@ -714,10 +716,12 @@ class StageROIs(_StageBase):
         self._propagate_focus(mode="center")
 
     def _propagate_focus(self, mode: str):
-        """Propagate drafted focus points to every section. ``pose`` maps them via
-        each section's pose (rotation-aware); ``center`` anchors each point to the
-        ROI (if drawn inside it) or the section (if outside) and places it at that
-        anchor's centroid unchanged — robust when sections vary widely in size."""
+        """Propagate drafted focus points to every section **that has an ROI**. Each
+        point is anchored to the ROI (if drawn inside it) or the section (if
+        outside): ``pose`` maps its relative offset through the section's pose
+        (rotation-aware — an ROI's top-left → every ROI's top-left); ``center``
+        drops the drawn offset at the ROI / section centroid unchanged (robust when
+        sections vary widely in size)."""
         if not self._need_image():
             return
         self.app.sync_sections()
@@ -727,27 +731,30 @@ class StageROIs(_StageBase):
                 or len(v.layers[self.FOCUS_DRAFT].data) == 0):
             self.app.log(self.STAGE, "place focus points on the 'Focus draft' layer first.")
             return
+        proj = self.app.project
+        if not any(getattr(s, "roi", None) and s.roi.polygon for s in proj.sections):
+            self.app.log(self.STAGE, "define + propagate an ROI first — focus points are "
+                                     "only placed on sections that have an ROI.")
+            return
         pts_xy = _napari_to_xy(np.asarray(v.layers[self.FOCUS_DRAFT].data))
         ref = self._reference_section(pts_xy)
         if ref is None:
             self.app.log(self.STAGE, "no reference section under the focus points.")
             return
-        proj = self.app.project
         tmpl = proj.roi_templates[0] if proj.roi_templates else RoiTemplate(ref_section_id=ref.id)
         tmpl.focus_local = roi_mod.focus_template_from_points(ref.pose, pts_xy)
         tmpl.focus_mode = mode
-        if mode == "center":
-            tmpl.focus_anchors = roi_mod.focus_anchors_from_points(ref, pts_xy)
-            n_roi = sum(1 for a in tmpl.focus_anchors if a.get("anchor") == "roi")
-            anchor_note = f" ({n_roi} anchored to ROI, {len(pts_xy) - n_roi} to section)"
-        else:
-            anchor_note = ""
+        tmpl.focus_anchors = roi_mod.focus_anchors_from_points(ref, pts_xy)
+        n_roi = sum(1 for a in tmpl.focus_anchors if a.get("anchor") == "roi")
         if not proj.roi_templates:
             proj.roi_templates = [tmpl]
-        roi_mod.propagate_all(tmpl, proj.sections)
+        # Focus-only: never re-propagate / overwrite the per-section ROIs.
+        roi_mod.propagate_focus_only(tmpl, proj.sections)
         layer_sync.show_focus_points(self.app)
-        self.app.log(self.STAGE, f"focus points propagated ({mode}, {len(pts_xy)} per "
-                                 f"section, ref {ref.id}){anchor_note}. Edit the 'Focus "
+        n_sec = sum(1 for s in proj.sections if s.focus_overview)
+        self.app.log(self.STAGE, f"focus points propagated ({mode}, {len(pts_xy)}/section "
+                                 f"to {n_sec} ROI sections; {n_roi} anchored to ROI, "
+                                 f"{len(pts_xy) - n_roi} to section). Edit the 'Focus "
                                  "points' layer to fine-tune.")
         self.app.save_workflow()
 

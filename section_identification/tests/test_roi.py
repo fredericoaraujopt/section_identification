@@ -105,23 +105,59 @@ def test_propagate_center_keeps_dimensions_and_centres():
         assert np.allclose(c, np.asarray(s.centroid()), atol=1e-6)  # ... on section centroid
 
 
-def test_focus_propagation_pose_consistent():
+def test_focus_only_on_roi_sections():
+    # Focus points are placed ONLY on sections that have an ROI (an un-imaged
+    # region needs no focus). A section-anchored point propagates pose-relative
+    # to the section, so it maps consistently across rotations.
     ref = _section(TRAP)
-    focus_pts = [[0.0, 0.0], [3.0, -2.0]]                 # world pts on the reference
-    tmpl = RoiTemplate(ref_section_id=ref.id)
-    tmpl.focus_local = roi.focus_template_from_points(ref.pose, focus_pts)
-    tgt = _section(_transform(TRAP, 60.0, 120.0, 40.0))
-    roi.propagate_all(tmpl, [tgt])                         # focus-only template
-    assert tgt.roi is None                                 # no polygon -> no ROI created
-    assert len(tgt.focus_overview) == 2
-    back = np.array([fov_nav.world_to_local(p, tgt.pose.center, tgt.pose.angle_deg,
-                                            tgt.pose.flip) for p in tgt.focus_overview])
-    assert np.allclose(back, np.asarray(tmpl.focus_local), atol=1e-6)
+    tmpl = roi.template_from_polygon(ref.pose, ROI_SQ, ref_section_id=ref.id, fit_mode="template")
+    with_roi = _section(_transform(TRAP, 60.0, 120.0, 40.0))
+    no_roi = _section(_transform(TRAP, 10.0, -200.0, 50.0))
+    roi.propagate_all(tmpl, [ref, with_roi, no_roi])       # ROI on all 3 (template mode)
+    no_roi.roi = None                                       # this one has no ROI
+
+    # focus-only template (no polygon_local → doesn't recreate ROIs): a
+    # section-anchored focus point outside the ROI but inside the section.
+    ftmpl = RoiTemplate(ref_section_id=ref.id)
+    ftmpl.focus_anchors = roi.focus_anchors_from_points(ref, [[9.0, -4.0]])
+    ftmpl.focus_mode = "pose"
+    assert ftmpl.focus_anchors[0]["anchor"] == "section"
+    roi.propagate_all(ftmpl, [ref, with_roi, no_roi])
+    assert len(with_roi.focus_overview) == 1               # has ROI → gets focus
+    assert no_roi.focus_overview == []                     # no ROI → no focus (req. #1)
+
+
+def test_focus_pose_anchoring_roi_vs_section():
+    # Pose mode: an ROI-anchored point rides each section's ROI (rotation-aware);
+    # a section-anchored point rides the section. Verify both land at the same
+    # pose-normalised offset from their respective anchor on a rotated section.
+    ref = _section(TRAP)
+    tgt = _section(_transform(TRAP, 73.0, 400.0, -150.0))
+    tmpl = roi.template_from_polygon(ref.pose, ROI_SQ, ref_section_id=ref.id, fit_mode="template")
+    roi.propagate_all(tmpl, [ref, tgt])
+    roi_c_ref = np.asarray(ref.roi.polygon, float).mean(axis=0)
+    p_in = [float(roi_c_ref[0] + 1.0), float(roi_c_ref[1] + 1.0)]   # inside ROI
+    p_out = [9.0, -4.0]                                             # in section, outside ROI
+    tmpl.focus_anchors = roi.focus_anchors_from_points(ref, [p_in, p_out])
+    tmpl.focus_mode = "pose"
+    assert [a["anchor"] for a in tmpl.focus_anchors] == ["roi", "section"]
+    roi.propagate_all(tmpl, [ref, tgt])
+    fp = np.asarray(tgt.focus_overview, float)
+    roi_c_t = np.asarray(tgt.roi.polygon, float).mean(axis=0)
+    # ROI-anchored point, mapped back into the target's local frame about the ROI
+    # centroid, equals the stored local offset (rotation-aware, same relative spot)
+    back_roi = fov_nav.world_to_local(fp[0], (roi_c_t[0], roi_c_t[1]),
+                                      tgt.pose.angle_deg, tgt.pose.flip)
+    assert np.allclose(back_roi, tmpl.focus_anchors[0]["local"], atol=1e-6)
+    back_sec = fov_nav.world_to_local(fp[1], tgt.centroid(),
+                                      tgt.pose.angle_deg, tgt.pose.flip)
+    assert np.allclose(back_sec, tmpl.focus_anchors[1]["local"], atol=1e-6)
 
 
 def test_focus_center_anchoring():
-    # ROI-anchored focus rides each section's ROI centroid; section-anchored
-    # focus rides the section centroid — both unchanged in offset (no pose).
+    # Centre mode: an ROI-anchored point lands exactly on each section's ROI
+    # centroid; a section-anchored point lands on the section centroid — wherever
+    # in the anchor it was drawn (no offset, no pose).
     ref = _section(TRAP)
     small = _section(_transform(TRAP * 0.3, 20.0, 300.0, 100.0))
     big = _section(_transform(TRAP * 4.0, 90.0, -400.0, 50.0))
@@ -130,24 +166,32 @@ def test_focus_center_anchoring():
                        ref_section_id=ref.id, fit_mode="center")
     roi.propagate_all(tmpl, secs)                 # every section gets a centered ROI
 
-    # focus points are drawn relative to the propagated ROI as it appears on the
-    # reference section (the real GUI flow), not the original draft location.
     ref_roi_c = np.asarray(ref.roi.polygon, float).mean(axis=0)
-    p_in = [float(ref_roi_c[0] + 0.5), float(ref_roi_c[1] + 0.5)]   # inside the ROI
+    p_in = [float(ref_roi_c[0] + 0.5), float(ref_roi_c[1] + 0.5)]   # off-centre inside ROI
     p_out = [9.0, -4.0]                                             # in section, outside ROI
     tmpl.focus_anchors = roi.focus_anchors_from_points(ref, [p_in, p_out])
-    tmpl.focus_local = roi.focus_template_from_points(ref.pose, [p_in, p_out])
     tmpl.focus_mode = "center"
     assert [a["anchor"] for a in tmpl.focus_anchors] == ["roi", "section"]
 
-    roi.propagate_all(tmpl, secs)
-    sec_off = np.array(p_out) - np.array(ref.centroid())
-    roi_off = np.array(p_in) - np.asarray(ref.roi.polygon, float).mean(axis=0)
+    roi.propagate_focus_only(tmpl, secs)
     for s in secs:
         fp = np.asarray(s.focus_overview, float)
         roi_c = np.asarray(s.roi.polygon, float).mean(axis=0)
-        assert np.allclose(fp[0], roi_c + roi_off, atol=1e-6)
-        assert np.allclose(fp[1], np.asarray(s.centroid()) + sec_off, atol=1e-6)
+        assert np.allclose(fp[0], roi_c, atol=1e-6)                # ROI-anchored → ROI centre
+        assert np.allclose(fp[1], np.asarray(s.centroid()), atol=1e-6)  # section centre
+
+
+def test_focus_anchors_serialize_roundtrip():
+    # focus_anchors (anchor + local) must survive save/reload, else propagation
+    # silently reverts to the centroid on the next session.
+    t = RoiTemplate(focus_mode="pose",
+                    focus_anchors=[{"anchor": "roi", "local": [1.5, -2.5]},
+                                   {"anchor": "section", "local": [3.0, 4.0]}])
+    t2 = RoiTemplate.from_dict(t.to_dict())
+    assert t2.focus_mode == "pose"
+    assert [a["anchor"] for a in t2.focus_anchors] == ["roi", "section"]
+    assert t2.focus_anchors[0]["local"] == [1.5, -2.5]
+    assert t2.focus_anchors[1]["local"] == [3.0, 4.0]
 
 
 def test_section_point_grid_inside_and_scales():

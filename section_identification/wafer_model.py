@@ -273,8 +273,8 @@ class RoiTemplate:
                 "focus_cols": int(self.focus_cols), "focus_rows": int(self.focus_rows),
                 "focus_mode": self.focus_mode,
                 "focus_anchors": [{"anchor": str(a.get("anchor", "section")),
-                                   "off": [float(a.get("off", [0, 0])[0]),
-                                           float(a.get("off", [0, 0])[1])]}
+                                   "local": [float(a.get("local", [0, 0])[0]),
+                                             float(a.get("local", [0, 0])[1])]}
                                   for a in self.focus_anchors],
                 "auto_params": dict(self.auto_params)}
 
