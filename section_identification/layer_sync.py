@@ -190,6 +190,35 @@ def clear_qc_colors(app):
 
 
 # --------------------------------------------------------------------------- #
+# Sections: mark auto-added (synthetic) sections so they stand out
+# --------------------------------------------------------------------------- #
+# Per-shape EDGE colours (independent of the QC face-colour channel): a detected
+# section keeps the usual red; a section auto-created around a section-less ROI
+# (Section.synthetic) is drawn in gold so it's obvious at a glance which sections
+# STiM added versus detected.
+DETECTED_EDGE = [1.0, 0.15, 0.15, 1.0]     # red — as detected
+SYNTHETIC_EDGE = [1.0, 0.82, 0.0, 1.0]     # gold — built around a section-less ROI
+
+
+def color_sections_by_origin(app):
+    """Set the 'Sections' layer's per-shape edge colour by provenance: detected
+    sections red, ``synthetic`` (auto-added around a section-less ROI) sections
+    gold. Self-correcting (re-applied from the model each call) and independent of
+    the QC face colouring. No-op when the layer and model are out of step — the
+    caller keeps them in lockstep (see ``StimApp._add_synthetic_sections``)."""
+    layer = getattr(app.gui, "shapes_layer", None)
+    secs = app.project.sections
+    if layer is None or not secs or len(layer.data) != len(secs):
+        return
+    try:
+        colors = np.array([SYNTHETIC_EDGE if getattr(s, "synthetic", False)
+                           else DETECTED_EDGE for s in secs], dtype=float)
+        layer.edge_color = colors
+    except Exception as e:
+        app.log("rois", f"section colour error: {e}")
+
+
+# --------------------------------------------------------------------------- #
 # ROIs
 # --------------------------------------------------------------------------- #
 FOCUS_LAYER = "Focus points"
@@ -448,6 +477,7 @@ def show_rois(app):
     rather than crashing the app."""
     viewer = app.viewer
     _remove(viewer, ROI_LAYER)
+    color_sections_by_origin(app)        # keep auto-added sections visibly distinct
     polys = [_xy_to_yx(s.roi.polygon) for s in app.project.sections
              if s.roi and len(s.roi.polygon) >= 3]
     if not polys:

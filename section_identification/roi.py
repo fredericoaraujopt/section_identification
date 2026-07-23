@@ -100,6 +100,85 @@ def _point_in_polygon(pt, poly) -> bool:
         return inside
 
 
+# An ROI counts as "belonging to" a section when at least this fraction of the
+# ROI's area lies inside it. A genuine per-section ROI clears this easily (even
+# one that overhangs a small coming-in section); an ROI drawn where no section
+# was detected overlaps every section at ~0, so it stays below the floor and is
+# flagged for its own section. Deliberately low so a legitimate ROI is never
+# mistaken for section-less.
+ROI_SECTION_MIN_OVERLAP = 0.30
+
+
+def match_rois_to_sections(section_polygons, roi_polygons,
+                           min_overlap: float = ROI_SECTION_MIN_OVERLAP) -> list:
+    """Assign each ROI to the section it sits inside, by area overlap.
+
+    Returns a list the same length as ``roi_polygons``: entry ``i`` is the index
+    of the section that should own ROI ``i``, or ``None`` when the ROI has no
+    home (it overlaps no section by ``min_overlap`` — a section-less ROI — or its
+    only container was already claimed by an earlier ROI — an "extra" second ROI
+    in one section). Assignment is by strict area overlap with **no**
+    nearest-section fallback, so a section-less ROI is never silently snapped to a
+    neighbour. Each section is claimed by at most one ROI (first-come by input
+    order; ties broken toward the highest overlap then the smallest section), so
+    ``None`` entries are exactly the ROIs a caller must give their own section to
+    keep one ROI per section. ``polygons`` are ``[(x, y), ...]`` (overview px)."""
+    result: list = [None] * len(roi_polygons)
+    if not section_polygons or not roi_polygons:
+        return result
+    try:
+        from shapely import STRtree
+        from shapely.geometry import Polygon
+
+        secs = []
+        for sp in section_polygons:
+            a = np.asarray(sp, float).reshape(-1, 2)
+            secs.append(Polygon(a).buffer(0) if len(a) >= 3 else None)
+        valid_idx = [i for i, g in enumerate(secs) if g is not None and not g.is_empty]
+        tree = STRtree([secs[i] for i in valid_idx]) if valid_idx else None
+        claimed: set = set()
+        for r, roi in enumerate(roi_polygons):
+            a = np.asarray(roi, float).reshape(-1, 2)
+            if len(a) < 3:
+                continue
+            R = Polygon(a).buffer(0)
+            if R.is_empty or R.area <= 0:
+                continue
+            if tree is not None:
+                cand = [valid_idx[int(j)] for j in np.atleast_1d(tree.query(R))]
+            else:
+                cand = list(valid_idx)
+            scored = []
+            for i in cand:
+                ov = R.intersection(secs[i]).area / R.area
+                if ov >= min_overlap:
+                    scored.append((ov, -secs[i].area, i))   # best overlap, smallest section
+            scored.sort(reverse=True)
+            for _ov, _negarea, i in scored:
+                if i not in claimed:
+                    claimed.add(i)
+                    result[r] = i
+                    break
+        return result
+    except Exception:
+        # Shapely unavailable: fall back to centroid-in-polygon (still strict, no
+        # nearest fallback) with the same first-come claiming.
+        claimed = set()
+        for r, roi in enumerate(roi_polygons):
+            a = np.asarray(roi, float).reshape(-1, 2)
+            if len(a) < 3:
+                continue
+            cx, cy = float(a[:, 0].mean()), float(a[:, 1].mean())
+            for i, sp in enumerate(section_polygons):
+                if i in claimed:
+                    continue
+                if _point_in_polygon((cx, cy), sp):
+                    claimed.add(i)
+                    result[r] = i
+                    break
+        return result
+
+
 def focus_anchors_from_points(ref_section, points_xy) -> list[dict]:
     """Classify each drafted focus point (overview px) against a reference section
     and record how to reproduce it on every section. A point inside the section's

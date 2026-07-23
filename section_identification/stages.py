@@ -88,6 +88,7 @@ def run_export(app, write_contour: bool = True):
         app.log("export", "load an image and detect sections first.")
         return
     proj = app.sync_sections()
+    app.capture_annotations()   # preserve section-less ROIs as synthetic sections
     geom = app.geom
     counts = {}
     tmpl = proj.roi_templates[0] if proj.roi_templates else None
@@ -670,20 +671,26 @@ class StageROIs(_StageBase):
             self.app.log(self.STAGE, "Manual ROI OFF.")
 
     def _capture_manual_roi(self, poly_yx):
-        """Commit a SAM-traced polygon as the ROI of the section that contains its
-        centroid. Appends the one shape to the overlay (O(1)) instead of rebuilding
-        it, so defining many ROIs one-by-one stays fast."""
-        poly_xy = _napari_to_xy(np.asarray(poly_yx, float))
+        """Commit a SAM-traced polygon as the ROI of the section it overlaps. A
+        trace made where no section was detected is preserved by promoting it to
+        its own margined section, rather than overwriting the nearest section's
+        ROI. Appends the one shape to the overlay (O(1)) instead of rebuilding it,
+        so defining many ROIs one-by-one stays fast."""
+        poly_xy = np.asarray(_napari_to_xy(np.asarray(poly_yx, float)), float).reshape(-1, 2)
         self.app.sync_sections()
-        sec = self.app._section_containing(self.app.project, poly_xy)
+        sec, promoted = self.app.assign_or_promote_roi(
+            [[float(x), float(y)] for x, y in poly_xy])
         if sec is None:
-            self.app.log(self.STAGE, "no section under that ROI — hover inside a section.")
+            self.app.log(self.STAGE, "couldn't place that ROI.")
             return
-        sec.roi = Roi(polygon=[[float(x), float(y)] for x, y in poly_xy], fit_mode="manual")
         layer_sync.append_roi(self.app, poly_xy)       # incremental — no full rebuild
         self.app.save_workflow()
-        self.app.log(self.STAGE, f"ROI set on section {sec.id} "
-                                 f"({sum(1 for s in self.app.project.sections if s.roi)} total).")
+        total = sum(1 for s in self.app.project.sections if s.roi)
+        if promoted:
+            self.app.log(self.STAGE, f"ROI was outside every section — created section "
+                                     f"{sec.id} around it ({total} total).")
+        else:
+            self.app.log(self.STAGE, f"ROI set on section {sec.id} ({total} total).")
 
     FOCUS_DRAFT = "Focus draft"
 

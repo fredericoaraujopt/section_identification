@@ -1267,6 +1267,29 @@ class SectionIdentificationGUI(QWidget):
         return [napari_to_xy(d) for d in self.shapes_layer.data
                 if len(np.asarray(d)) >= 3]
 
+    def add_section_polygons(self, polygons_xy):
+        """Append section polygons (overview xy) to the live 'Sections' layer so
+        they become real, editable sections. Used to materialise a section built
+        around a section-less ROI; the model side is kept in lockstep by the
+        caller (see ``StimApp._add_synthetic_sections``). Returns the number
+        appended (0 if none were valid / no viewer)."""
+        polys = [np.asarray(p, float).reshape(-1, 2) for p in polygons_xy]
+        polys = [p for p in polys if len(p) >= 3]
+        if not polys or getattr(self, "viewer", None) is None:
+            return 0
+        if self.shapes_layer is None or self.shapes_layer not in self.viewer.layers:
+            # No edit layer yet — seed one with the current + new polygons.
+            self._ensure_edit_layers(self.current_polygons_xy()
+                                     + [[[float(x), float(y)] for x, y in p] for p in polys])
+        else:
+            self.shapes_layer.data = list(self.shapes_layer.data) + \
+                [xy_to_napari(p) for p in polys]
+        try:
+            self._sync_outline_widths()
+        except Exception:
+            pass
+        return len(polys)
+
     def current_fiducials_xy(self):
         if self.fid_layer is None or len(self.fid_layer.data) == 0:
             return []

@@ -145,6 +145,11 @@ class ExportDialog(QDialog):
             app.log("export", "select at least one format.")
             return
         proj = app.sync_sections()
+        # Fold in any hand-edited ROIs and, crucially, preserve section-less ones:
+        # capture promotes each ROI that has no section of its own into a margined
+        # synthetic section, so every exported ROI is the sole ROI of some section
+        # (what ZEN's CAT pairing expects) rather than being silently dropped.
+        app.capture_annotations()
         app.ensure_poses()
         geom = app.geom
         from .stages import build_tile_region_specs

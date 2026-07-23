@@ -45,6 +45,27 @@ def _identity_or(geom, attr: str):
     return None if geom is None else getattr(geom, attr, None)
 
 
+# Each side of a synthetic section's rectangle is pushed out by this fraction of
+# the ROI's width/height, so the section clearly encloses (and is visually
+# distinguishable from) the ROI it was built around.
+SYNTHETIC_SECTION_MARGIN = 0.30
+
+
+def synthetic_section_polygon(roi_polygon, margin_frac: float = SYNTHETIC_SECTION_MARGIN
+                              ) -> list[list[float]]:
+    """Axis-aligned rectangle enclosing an ROI, expanded by ``margin_frac`` of the
+    ROI's width/height on EACH side. Returns a 4-point ``(x, y)`` polygon in the
+    ROI's own frame (overview px). Used to give a section-less ROI its own section
+    at export so ZEN still sees one ROI per section (the ROI sits well inside it)."""
+    p = np.asarray(roi_polygon, dtype=float).reshape(-1, 2)
+    x0, y0 = float(p[:, 0].min()), float(p[:, 1].min())
+    x1, y1 = float(p[:, 0].max()), float(p[:, 1].max())
+    mx = max(x1 - x0, 1e-9) * float(margin_frac)
+    my = max(y1 - y0, 1e-9) * float(margin_frac)
+    x0 -= mx; x1 += mx; y0 -= my; y1 += my
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+
 # --------------------------------------------------------------------------- #
 # per-section sub-records
 # --------------------------------------------------------------------------- #
@@ -163,6 +184,7 @@ class Section:
     imaging_index: Optional[int] = None             # stage 4 TSP
     accepted: bool = True                            # proofread / QC accept-reject
     sift_ref: Optional[str] = None                   # cached-descriptor path
+    synthetic: bool = False                          # built around a section-less ROI
 
     # -- geometry helpers (overview frame) --
     def polygon_array(self) -> np.ndarray:
@@ -213,7 +235,8 @@ class Section:
                 "qc": self.qc.to_dict() if self.qc else None,
                 "serial_index": self.serial_index,
                 "imaging_index": self.imaging_index,
-                "accepted": bool(self.accepted), "sift_ref": self.sift_ref}
+                "accepted": bool(self.accepted), "sift_ref": self.sift_ref,
+                "synthetic": bool(self.synthetic)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Section":
@@ -225,7 +248,8 @@ class Section:
             focus_points=[FocusPoint.from_dict(fp) for fp in d.get("focus_points", [])],
             qc=QCResult.from_dict(d.get("qc")),
             serial_index=d.get("serial_index"), imaging_index=d.get("imaging_index"),
-            accepted=bool(d.get("accepted", True)), sift_ref=d.get("sift_ref"))
+            accepted=bool(d.get("accepted", True)), sift_ref=d.get("sift_ref"),
+            synthetic=bool(d.get("synthetic", False)))
 
 
 # --------------------------------------------------------------------------- #
@@ -380,6 +404,19 @@ class WaferProject:
     def add_section(self, polygon, sid: Optional[str] = None) -> Section:
         s = Section(id=sid or self.new_id(), polygon=_poly_xy(polygon))
         self.sections.append(s)
+        return s
+
+    def promote_roi_to_section(self, roi_polygon,
+                               margin_frac: float = SYNTHETIC_SECTION_MARGIN
+                               ) -> Section:
+        """Create a new (``synthetic``) section built around ``roi_polygon`` — a
+        margined rectangle enclosing it (see :func:`synthetic_section_polygon`) —
+        with that ROI attached. Preserves an ROI drawn where no section was
+        detected, keeping the one-ROI-per-section invariant ZEN expects. The
+        section polygon and ROI are both in overview px."""
+        s = self.add_section(synthetic_section_polygon(roi_polygon, margin_frac))
+        s.roi = Roi(polygon=_poly_xy(roi_polygon), fit_mode="manual")
+        s.synthetic = True
         return s
 
     def set_sections_from_polygons(self, polygons) -> None:

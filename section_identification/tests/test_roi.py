@@ -245,6 +245,32 @@ def test_calibrate_roi_params_from_template():
     assert p["roi_area"] > 0 and p["min_area_frac"] < 1.0 < p["max_area_mult"]
 
 
+def test_match_rois_to_sections_assigns_and_flags_orphans():
+    # Two disjoint sections; ROIs: one inside each, one far outside (orphan), and
+    # a second ROI sharing section 0 (an "extra"). Only the two genuinely-homed
+    # ROIs get a section index; the orphan and the extra return None so the caller
+    # gives each its own section (preserving every ROI, one per section).
+    s0 = [[0, 0], [100, 0], [100, 100], [0, 100]]
+    s1 = [[200, 0], [300, 0], [300, 100], [200, 100]]
+    inside0 = [[40, 40], [60, 40], [60, 60], [40, 60]]
+    inside1 = [[240, 40], [260, 40], [260, 60], [240, 60]]
+    orphan = [[500, 500], [520, 500], [520, 520], [500, 520]]
+    extra0 = [[10, 10], [30, 10], [30, 30], [10, 30]]           # also inside s0
+    m = roi.match_rois_to_sections([s0, s1], [inside0, inside1, orphan, extra0])
+    assert m[0] == 0 and m[1] == 1
+    assert m[2] is None                                          # orphan → its own section
+    assert m[3] is None                                          # extra → its own section
+
+
+def test_match_rois_to_sections_keeps_overhanging_roi():
+    # A legitimate ROI that overhangs its (small) section still counts as belonging
+    # to it — it is NOT mistaken for a section-less ROI (regression guard for the
+    # overlap floor being too strict on coming-in sections).
+    s0 = [[0, 0], [100, 0], [100, 100], [0, 100]]
+    overhang = [[-20, -20], [60, -20], [60, 60], [-20, 60]]     # ~56% of its area in s0
+    assert roi.match_rois_to_sections([s0], [overhang])[0] == 0
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

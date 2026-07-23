@@ -10,7 +10,7 @@ import numpy as np
 
 from section_identification.wafer_model import (
     SCHEMA_VERSION, FocusPoint, MatchEdge, MatchGraph, QCResult, Roi,
-    RoiTemplate, Section, WaferProject,
+    RoiTemplate, Section, WaferProject, synthetic_section_polygon,
 )
 
 
@@ -105,6 +105,34 @@ def test_manual_order_editing():
     # remaining compacted to 0..1
     idxs = sorted(s.imaging_index for s in p.sections if s.imaging_index is not None)
     assert idxs == [0, 1]
+
+
+def test_synthetic_section_polygon_encloses_roi_with_margin():
+    roi = [[100, 200], [140, 200], [140, 260], [100, 260]]     # 40 x 60 ROI
+    sec = np.asarray(synthetic_section_polygon(roi, margin_frac=0.30), float)
+    sx0, sy0 = sec[:, 0].min(), sec[:, 1].min()
+    sx1, sy1 = sec[:, 0].max(), sec[:, 1].max()
+    # each side pushed out by 30% of the ROI's width (12) / height (18)
+    assert (sx0, sy0, sx1, sy1) == (100 - 12, 200 - 18, 140 + 12, 260 + 18)
+    # the ROI sits strictly inside the section, well clear of every edge
+    assert sx0 < 100 and sx1 > 140 and sy0 < 200 and sy1 > 260
+
+
+def test_promote_roi_to_section_preserves_roi():
+    p = WaferProject()
+    p.set_sections_from_polygons([SQUARE])                      # one real section
+    roi_poly = [[500, 500], [520, 500], [520, 520], [500, 520]]  # far from SQUARE
+    s = p.promote_roi_to_section(roi_poly)
+    assert len(p.sections) == 2 and s is p.sections[-1]
+    assert s.synthetic is True
+    assert s.roi is not None and s.roi.polygon == [[500.0, 500.0], [520.0, 500.0],
+                                                   [520.0, 520.0], [500.0, 520.0]]
+    # the promoted section geometrically contains its ROI centroid (510, 510)
+    x0, y0, x1, y1 = s.bbox()
+    assert x0 < 510 < x1 and y0 < 510 < y1
+    # survives save/reload with the synthetic flag intact
+    s2 = Section.from_dict(s.to_dict())
+    assert s2.synthetic is True and s2.roi.polygon == s.roi.polygon
 
 
 def test_project_roundtrip():

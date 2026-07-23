@@ -303,7 +303,7 @@ class StimApp:
         only in the napari layers, which are regenerated from the model on the
         next refresh and never persisted."""
         import numpy as np
-        from . import layer_sync
+        from . import layer_sync, roi as roi_mod
         from .wafer_model import Roi
 
         viewer = self.viewer
@@ -312,44 +312,42 @@ class StimApp:
         proj = self.project
         touched = False
 
-        def _area(poly):
-            p = np.asarray(poly, float).reshape(-1, 2)
-            x, y = p[:, 0], p[:, 1]
-            return abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2.0
-
         has_roi = layer_sync.ROI_LAYER in viewer.layers
         has_focus = layer_sync.FOCUS_LAYER in viewer.layers
         if not (has_roi or has_focus):
             return False
-        locate = self._section_locator(proj)         # built once, reused below
 
-        # ROIs: Shapes layer stored as napari (y, x); model keeps (x, y). The
-        # model holds one ROI per section, so on a collision keep the largest.
+        # ROIs: Shapes layer stored as napari (y, x); model keeps (x, y). Every
+        # ROI must become the sole ROI of some section (what ZEN expects
+        # downstream), so match each to the section it overlaps. An ROI with no
+        # home — drawn where no section was detected, or a second ROI inside one
+        # section — is PRESERVED by promoting it to its own margined section, never
+        # dropped or snapped onto a neighbour (the old lossy "keep the largest"
+        # behaviour that discarded a section-less ROI).
         if has_roi:
             for s in proj.sections:
                 s.roi = None
-            dropped = 0
+            roi_polys = []
             for shp in list(viewer.layers[layer_sync.ROI_LAYER].data):
                 arr = np.asarray(shp, float).reshape(-1, 2)
-                if len(arr) < 3:
-                    continue
-                xy = [[float(x), float(y)] for y, x in arr]
-                cx, cy = arr[:, 1].mean(), arr[:, 0].mean()      # centroid (x, y)
-                sec = locate(cx, cy)
-                if sec is None:
-                    continue
-                if sec.roi is not None:
-                    dropped += 1
-                    if _area(xy) <= _area(sec.roi.polygon):
-                        continue
-                sec.roi = Roi(polygon=xy, fit_mode="manual")
-            if dropped:
-                self.log("rois", f"{dropped} ROI shape(s) shared a section with "
-                                 "another; kept the largest (one ROI per section).")
+                if len(arr) >= 3:
+                    roi_polys.append([[float(x), float(y)] for y, x in arr])
+            match = roi_mod.match_rois_to_sections(
+                [s.polygon for s in proj.sections], roi_polys)
+            orphans = [xy for xy, idx in zip(roi_polys, match) if idx is None]
+            for xy, idx in zip(roi_polys, match):
+                if idx is not None:
+                    proj.sections[idx].roi = Roi(polygon=xy, fit_mode="manual")
+            promoted = self._add_synthetic_sections(orphans)
+            if promoted:
+                self.log("rois", f"{len(promoted)} section-less/extra ROI(s) preserved — "
+                                 "built a margined section around each (one ROI per section).")
             touched = True
 
-        # Focus points: Points layer stored as napari (y, x).
+        # Focus points: Points layer stored as napari (y, x). Locate against the
+        # sections as they stand now (including any just-promoted synthetic ones).
         if has_focus:
+            locate = self._section_locator(proj)
             for s in proj.sections:
                 s.focus_overview = []
             for p in np.asarray(viewer.layers[layer_sync.FOCUS_LAYER].data,
@@ -361,6 +359,62 @@ class StimApp:
             touched = True
 
         return touched
+
+    def _add_synthetic_sections(self, roi_polys_xy):
+        """Preserve section-less / "extra" ROIs by promoting each to its own real,
+        editable section (a margined rectangle around the ROI — see
+        :func:`wafer_model.synthetic_section_polygon`). Adds them to the GUI
+        'Sections' layer AND the model in lockstep: the layer is pushed first
+        (it is what :meth:`sync_sections` rebuilds the model from), and the model
+        is left untouched if that push can't happen — a section-count mismatch
+        would make the next ``sync_sections`` rebuild and lose every section's
+        ROI/QC/order state. Returns the new Section objects (``[]`` on no-op)."""
+        from .wafer_model import synthetic_section_polygon
+        polys = [p for p in (roi_polys_xy or []) if len(p) >= 3]
+        if not polys:
+            return []
+        sec_polys = [synthetic_section_polygon(p) for p in polys]
+        # Push to the GUI 'Sections' layer first; bail (without touching the model)
+        # if there is a viewer but no way to draw into it, so we never desync.
+        if self.viewer is not None:
+            add = getattr(self.gui, "add_section_polygons", None)
+            if not callable(add):
+                return []
+            try:
+                if not add(sec_polys):
+                    return []
+            except Exception as e:
+                self.log("rois", f"could not add synthetic section(s) to the view: {e}")
+                return []
+        # Model side — the SAME deterministic polygons, in the SAME order.
+        added = [self.project.promote_roi_to_section(roi_xy) for roi_xy in polys]
+        try:                                    # tint the new sections gold at once
+            from . import layer_sync
+            layer_sync.color_sections_by_origin(self)
+        except Exception:
+            pass
+        return added
+
+    def assign_or_promote_roi(self, poly_xy):
+        """Set ``poly_xy`` (overview xy) as the ROI of the section it overlaps,
+        replacing any ROI already there; if it overlaps no section, promote it to
+        its own margined section. Returns ``(section, promoted)`` — ``section`` is
+        ``None`` only when promotion had no viewer to draw into. Lets the manual
+        per-section ROI tool preserve a trace made outside every section instead of
+        overwriting the nearest section's ROI."""
+        from . import roi as roi_mod
+        from .wafer_model import Roi
+        proj = self.project
+        match = roi_mod.match_rois_to_sections(
+            [s.polygon for s in proj.sections], [poly_xy])
+        idx = match[0] if match else None
+        if idx is not None:
+            s = proj.sections[idx]
+            s.roi = Roi(polygon=[[float(x), float(y)] for x, y in poly_xy],
+                        fit_mode="manual")
+            return s, False
+        added = self._add_synthetic_sections([[[float(x), float(y)] for x, y in poly_xy]])
+        return (added[0] if added else None), True
 
     def save_all(self) -> bool:
         """Capture every editable overlay into the model and persist everything:
