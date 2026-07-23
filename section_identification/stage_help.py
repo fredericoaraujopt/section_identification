@@ -36,25 +36,62 @@ the exact feature map that produced its dominant flag on the wafer.</p>
 """,
     "rois": """
 <h2>ROIs &amp; mFOVs</h2>
-<p>Define one region of interest on a reference section; it is stored in that
-section's <b>pose-normalised</b> (upright, centred) frame, then propagated to
-every section through each section's recovered pose — so it lands on the same
-anatomical region regardless of how the section is rotated on the wafer.</p>
-<h3>Workflow</h3>
+<p>This stage has three sub-tabs — <b>ROI</b> (place a region of interest on every
+section), <b>Focus</b> (autofocus support points), and <b>mFOV</b> (tile grid
+preview + CZI read). Mark fiducials first (Sections tab → CZI Shuttle &amp; Find,
+or the 'm' key) — they anchor the pixel↔stage-µm transform used for every write.</p>
+
+<h3>Placing ROIs — three methods</h3>
+<p>Draw one polygon on the <i>ROI draft</i> layer (or SAM-assist trace it), then
+pick how it reaches the other sections:</p>
 <ol>
-<li>Draw one polygon on the <i>ROI draft</i> layer (inside a section).</li>
-<li><i>Define + propagate</i>: the section under the ROI becomes the reference;
-the ROI maps onto all sections.</li>
-<li><b>Fit</b> coming-in (smaller/partial) sections: <code>full</code> scales the
-ROI to the section extent; <code>percent</code> to a fraction; <code>clip</code>
-intersects it with the section so mFOVs never image empty resin.</li>
-<li><i>Write into CZI</i>: sections become annotation <code>&lt;Layers&gt;</code>;
+<li><b>Define + propagate</b> (pose) — the drafted ROI is stored in the reference
+section's pose-normalised (upright, centred) frame and mapped onto every section
+through its recovered pose, so it lands on the same anatomical region regardless
+of rotation. <b>Fit</b> handles coming-in sections: <code>full</code> scales to the
+section extent, <code>percent</code> to a fraction, <code>clip</code> intersects
+with the section. Best when sections share a consistent geometry.</li>
+<li><b>Propagate ROI to section centers</b> — drops a copy of the ROI, unchanged in
+size and orientation, on each section's centroid. Use when sections vary widely in
+size and pose-based fitting misplaces the ROI.</li>
+<li><b>Automatic ROI detection (SAM)</b> — when the ROI is visually distinct from
+the resin, SAM finds it inside each section (below).</li>
+</ol>
+
+<h3>Automatic detection — how SAM samples each section</h3>
+<p>The drawn template tells SAM the ROI's expected <i>size and shape</i>; SAM finds
+<i>where</i> it is in each section. Per section:</p>
+<ol>
+<li><b>Embed once.</b> The section's bounding box (plus <i>crop margin</i>) is read
+as a crop, downscaled so its long side ≈ 1024 px, and encoded by SAM — one pass,
+the expensive step.</li>
+<li><b>Distribute a point grid.</b> A <code>points_per_side × points_per_side</code>
+grid is laid across the section bbox (the same grid SAM's automatic detector uses)
+and clipped to the section polygon, so SAM is prompted only <i>inside</i> the
+section. This is exactly what the <b>Preview grid on sections</b> overlay shows —
+double-click a table row to inspect one section's grid.</li>
+<li><b>Predict at each point.</b> Each grid point is a cheap decoder prompt
+returning up to 3 candidate masks (whole/part/subpart) with SAM's predicted IoU and
+a stability score. Masks below <i>pred IoU</i> or <i>stability</i> are dropped.</li>
+<li><b>Keep the one that matches the template.</b> Every surviving mask is scored on
+SAM confidence + area closeness to the template (the <i>min/max area × template</i>
+band) + shape overlap with the template + how well it sits inside the section. The
+single best-scoring mask becomes that section's ROI; if none clears the
+<i>score floor</i>, the section keeps its propagated-template ROI (fallback), so
+every section always ends up with an ROI.</li>
+</ol>
+<p><b>Calibrate from template</b> populates every parameter from the template's
+dimensions — grid density so several points land on the ROI, quality gates from the
+ROI's apparent size, and the area band around the template area — the ROI analogue
+of the section detector's calibration. Tune any value afterwards; the preview
+updates live. <b>Contour</b> chooses whether the ROI outline is SAM's mask boundary
+or the template shape re-fitted to the mask (uniform shape across sections).</p>
+
+<h3>Writing to CZI</h3>
+<p><i>File → Export</i>: sections become annotation <code>&lt;Layers&gt;</code>;
 each ROI becomes a <code>&lt;TileRegion&gt;</code> (stage µm) with a tile grid
 (Columns×Rows from your tile-µm) and a focus <code>&lt;SupportPoints&gt;</code>
-grid — the exact nodes ZEN reads to place mFOVs and autofocus.</li>
-</ol>
-<p>Mark fiducials first (Sections tab → CZI Shuttle &amp; Find, or the 'm' key) —
-they anchor the pixel↔stage-µm transform used for every stage-µm write.</p>
+grid — the exact nodes ZEN reads to place mFOVs and autofocus.</p>
 """,
     "reorder": """
 <h2>Reorder &amp; imaging order</h2>

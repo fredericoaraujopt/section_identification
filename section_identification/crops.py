@@ -81,6 +81,54 @@ def read_section_crop(image_path, geom, polygon_overview, overview=None,
     return gray, mask, (x0, y0, scale)
 
 
+def read_section_rgb_crop(image_path, geom, polygon_overview, overview=None,
+                          target_long_side: int = 1024, margin_frac: float = 0.15):
+    """RGB ``uint8`` crop of a section's bbox (grown by ``margin_frac``) for SAM,
+    plus the mapping ``(ox0, oy0, scale)`` back to the overview frame, where
+    ``scale`` is crop-px per overview-px so ``overview = (ox0 + cx/scale, oy0 +
+    cy/scale)``. CZI reads at higher native resolution (read_czi_region); PNG
+    slices the loaded overview. Long side ≈ ``target_long_side``."""
+    p = np.asarray(polygon_overview, float).reshape(-1, 2)
+    ox0, oy0 = float(p[:, 0].min()), float(p[:, 1].min())
+    ox1, oy1 = float(p[:, 0].max()), float(p[:, 1].max())
+    wo, ho = max(ox1 - ox0, 1.0), max(oy1 - oy0, 1.0)
+    ox0 -= wo * margin_frac; oy0 -= ho * margin_frac
+    ox1 += wo * margin_frac; oy1 += ho * margin_frac
+    wo = max(ox1 - ox0, 1.0)
+
+    if czi_io.is_czi(image_path) and geom is not None:
+        fx0, fy0 = geom.ds_to_full(np.array([ox0]), np.array([oy0]))
+        fx1, fy1 = geom.ds_to_full(np.array([ox1]), np.array([oy1]))
+        x0f, y0f = int(np.floor(fx0[0])), int(np.floor(fy0[0]))
+        wf = max(int(np.ceil(fx1[0] - fx0[0])), 1)
+        hf = max(int(np.ceil(fy1[0] - fy0[0])), 1)
+        zoom_read = min(1.0, float(target_long_side) / max(wf, hf))
+        rgb = czi_io.read_czi_region(image_path, x0f, y0f, wf, hf,
+                                     zoom=zoom_read, as_rgb8=True)
+    else:
+        if overview is None:
+            from PIL import Image
+            overview = np.array(Image.open(image_path).convert("RGB"))
+        cx0, cy0 = max(0, int(ox0)), max(0, int(oy0))
+        crop = overview[cy0:int(np.ceil(oy1)), cx0:int(np.ceil(ox1))]
+        ox0, oy0 = float(cx0), float(cy0)
+        wo = max(crop.shape[1], 1)
+        if crop.ndim == 2:
+            crop = np.repeat(crop[:, :, None], 3, axis=2)
+        crop = np.ascontiguousarray(crop[:, :, :3])
+        if cv2 is not None and crop.size and max(crop.shape[:2]) > target_long_side:
+            s = float(target_long_side) / max(crop.shape[:2])
+            crop = cv2.resize(crop, (max(1, int(crop.shape[1] * s)),
+                                     max(1, int(crop.shape[0] * s))),
+                              interpolation=cv2.INTER_AREA)
+        rgb = crop
+    if rgb is None or getattr(rgb, "size", 0) == 0:
+        return None
+    rgb = np.ascontiguousarray(rgb)
+    scale = rgb.shape[1] / float(wo)                 # crop-px per overview-px
+    return rgb, (ox0, oy0, float(scale))
+
+
 def _poly_full(polygon_overview, geom):
     p = np.asarray(polygon_overview, float).reshape(-1, 2)
     if geom is None:

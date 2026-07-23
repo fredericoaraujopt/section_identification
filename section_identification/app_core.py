@@ -241,3 +241,94 @@ class StimApp:
             if d < bd:
                 best, bd = s, d
         return best
+
+    # -- live capture of hand-edits made to the ROI / focus overlays ----------
+    def capture_annotations(self) -> bool:
+        """Read native napari edits (move / add / delete) from the live "② ROIs"
+        and "Focus points" overlays back into the per-section model, so they
+        survive save + reload. Each shape / point is assigned to the section
+        whose polygon contains its centroid. Returns True if either overlay was
+        present (and therefore captured — including having been emptied).
+
+        This is what makes the overlays authoritative: without it, edits live
+        only in the napari layers, which are regenerated from the model on the
+        next refresh and never persisted."""
+        import numpy as np
+        from . import layer_sync
+        from .wafer_model import Roi
+
+        viewer = self.viewer
+        if viewer is None or not self.project.sections:
+            return False
+        proj = self.project
+        touched = False
+
+        def _area(poly):
+            p = np.asarray(poly, float).reshape(-1, 2)
+            x, y = p[:, 0], p[:, 1]
+            return abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2.0
+
+        # ROIs: Shapes layer stored as napari (y, x); model keeps (x, y). The
+        # model holds one ROI per section, so on a collision keep the largest.
+        if layer_sync.ROI_LAYER in viewer.layers:
+            for s in proj.sections:
+                s.roi = None
+            dropped = 0
+            for shp in list(viewer.layers[layer_sync.ROI_LAYER].data):
+                arr = np.asarray(shp, float).reshape(-1, 2)
+                if len(arr) < 3:
+                    continue
+                xy = [[float(x), float(y)] for y, x in arr]
+                sec = self._section_containing(proj, xy)
+                if sec is None:
+                    continue
+                if sec.roi is not None:
+                    dropped += 1
+                    if _area(xy) <= _area(sec.roi.polygon):
+                        continue
+                sec.roi = Roi(polygon=xy, fit_mode="manual")
+            if dropped:
+                self.log("rois", f"{dropped} ROI shape(s) shared a section with "
+                                 "another; kept the largest (one ROI per section).")
+            touched = True
+
+        # Focus points: Points layer stored as napari (y, x).
+        if layer_sync.FOCUS_LAYER in viewer.layers:
+            for s in proj.sections:
+                s.focus_overview = []
+            for p in np.asarray(viewer.layers[layer_sync.FOCUS_LAYER].data,
+                                float).reshape(-1, 2):
+                ox, oy = float(p[1]), float(p[0])
+                sec = self._section_containing(proj, [(ox, oy)])
+                if sec is not None:
+                    sec.focus_overview.append((ox, oy))
+            touched = True
+
+        return touched
+
+    def save_all(self) -> bool:
+        """Capture every editable overlay into the model and persist everything:
+        the legacy project JSON (sections / fiducials / calibration) and the
+        workflow sidecar (ROIs / focus / poses / order / display). Safe to call
+        often; used by the debounced autosave, the manual Save button, and on
+        quit. Returns True on success."""
+        if not self.has_image():
+            return False
+        try:
+            self.sync_sections()
+            self.capture_annotations()
+        except Exception:
+            pass
+        ok = False
+        try:
+            save_project = getattr(self.gui, "save_project", None)
+            if callable(save_project):
+                save_project()
+        except Exception:
+            pass
+        try:
+            self.save_workflow()
+            ok = True
+        except Exception:
+            pass
+        return ok

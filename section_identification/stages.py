@@ -29,7 +29,7 @@ from . import (compute_broker, czi_export, export as legacy_export, imaging_path
 from .app_core import StimApp
 from .nav import FovNavigator
 from .section_table import SectionTableDock
-from .wafer_model import QCResult, RoiTemplate
+from .wafer_model import QCResult, Roi, RoiTemplate
 from .worker_harness import StreamWorker
 
 
@@ -113,6 +113,36 @@ def run_export(app, write_contour: bool = True):
             app.log("export", "⚠️ ZEN .contour skipped — no stage-µm transform "
                     "(CZI source, or calibrate fiducials to stage µm for a PNG/LM image).")
     app.log("export", f"wrote to {out_dir}: {[os.path.basename(p) for p in paths.values()]}")
+
+
+class _CollapsibleSection(QWidget):
+    """A titled header button that shows/hides a content widget — the accordion
+    idiom used by the Sections tab (Calibrate / Automatic detector / Manual
+    editor). Multiple can be open at once."""
+
+    def __init__(self, title, content, open=True):
+        super().__init__()
+        self._title = title
+        self.content = content
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        self.toggle = QPushButton(self._label(open))
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(open)
+        self.toggle.setStyleSheet("QPushButton{text-align:left; font-weight:bold; "
+                                  "padding:5px; border:none;}")
+        self.toggle.toggled.connect(self._on_toggled)
+        self.content.setVisible(open)
+        v.addWidget(self.toggle)
+        v.addWidget(self.content)
+
+    def _label(self, on):
+        return ("▼  " if on else "▶  ") + self._title
+
+    def _on_toggled(self, on):
+        self.content.setVisible(on)
+        self.toggle.setText(self._label(on))
 
 
 class _StageBase(QWidget):
@@ -333,13 +363,37 @@ class StageROIs(_StageBase):
         self.lbl_fid.setWordWrap(True)
         self.col.addWidget(self.lbl_fid)
 
-        # --- Region of interest: draft (draw or SAM) -> define+propagate ---
-        self.col.addWidget(QLabel("<b>Region of interest</b>"))
+        # Three collapsible sub-stages (accordion), mirroring the Sections tab:
+        # ROI placement / focus placement / mFOV visualisation.
+        self.sec_roi = _CollapsibleSection("ROI", self._build_roi_tab(), open=True)
+        self.sec_focus = _CollapsibleSection("Focus", self._build_focus_tab(), open=False)
+        self.sec_mfov = _CollapsibleSection("mFOV", self._build_mfov_tab(), open=False)
+        self.sec_roi.toggle.toggled.connect(self._on_roi_collapsed)
+        for s in (self.sec_roi, self.sec_focus, self.sec_mfov):
+            self.col.addWidget(s)
+        self.col.addStretch(1)
+        self._auto_running = False
+        try:
+            self.worker.finished.connect(self._on_roi_worker_finished)
+        except Exception:
+            pass
+        self.refresh_fiducials()
+
+    def _on_roi_collapsed(self, on):
+        """Clear the auto-detect grid preview when the ROI section is collapsed."""
+        if not on and getattr(self, "chk_auto_preview", None) is not None \
+                and self.chk_auto_preview.isChecked():
+            self.chk_auto_preview.setChecked(False)
+
+    # ---- sub-tab builders -------------------------------------------------- #
+    def _build_roi_tab(self):
+        w = QWidget(); c = QVBoxLayout(w)
+        c.addWidget(QLabel("<b>Region of interest</b>"))
         self.btn_roi_draft = QPushButton("Draw ROI (draft)")
         self.btn_roi_draft.setToolTip("Add a layer and draw ONE polygon inside a "
                                       "section to use as the ROI template.")
         self.btn_roi_draft.clicked.connect(self._new_draft)
-        self.col.addWidget(self.btn_roi_draft)
+        c.addWidget(self.btn_roi_draft)
         self.btn_sam = QPushButton("SAM-assist: trace ROI (off)")
         self.btn_sam.setCheckable(True)
         self.btn_sam.setToolTip("Toggle the SAM editor to one-click an ROI inside a "
@@ -347,7 +401,20 @@ class StageROIs(_StageBase):
                                 "Sections). Click again to stop — like the manual "
                                 "detector toggle.")
         self.btn_sam.toggled.connect(self._toggle_sam)
-        self.col.addWidget(self.btn_sam)
+        c.addWidget(self.btn_sam)
+        self.btn_manual_roi = QPushButton("Manual ROI per section (SAM): OFF")
+        self.btn_manual_roi.setCheckable(True)
+        self.btn_manual_roi.setToolTip("Define a personalised ROI directly on each "
+                                       "section (no template): pan / double-click table "
+                                       "rows to a section, hover inside it and press "
+                                       "SPACE to SAM-trace its ROI — written straight to "
+                                       "that section (replacing any existing ROI). You "
+                                       "can also hand-draw polygons on the '② ROIs' "
+                                       "layer with napari's tools; both are saved.")
+        self.btn_manual_roi.toggled.connect(self._toggle_manual_roi)
+        c.addWidget(self.btn_manual_roi)
+
+        c.addWidget(QLabel("<b>Propagate a template</b>"))
         fit_row = QHBoxLayout()
         fit_row.addWidget(QLabel("fit:"))
         self.cb_fit = QComboBox()
@@ -360,13 +427,13 @@ class StageROIs(_StageBase):
         self.sp_pct.setRange(1, 100); self.sp_pct.setValue(80); self.sp_pct.setSuffix(" %")
         self.sp_pct.setMaximumWidth(72)
         fit_row.addWidget(self.sp_pct)
-        self.col.addLayout(fit_row)
+        c.addLayout(fit_row)
         self.btn_roi_def = QPushButton("Define + propagate ROI")
         self.btn_roi_def.setToolTip("Use the drafted ROI as a template and place it on "
                                     "every section via that section's pose, fit per the "
                                     "mode above.")
         self.btn_roi_def.clicked.connect(self._propagate)
-        self.col.addWidget(self.btn_roi_def)
+        c.addWidget(self.btn_roi_def)
         self.btn_roi_center = QPushButton("Propagate ROI to section centers")
         self.btn_roi_center.setToolTip("Place a copy of the drafted ROI — with its "
                                        "drawn dimensions and orientation unchanged — at "
@@ -375,25 +442,42 @@ class StageROIs(_StageBase):
                                        "vary widely in size and pose-based fitting "
                                        "misplaces the ROI.")
         self.btn_roi_center.clicked.connect(self._propagate_center)
-        self.col.addWidget(self.btn_roi_center)
+        c.addWidget(self.btn_roi_center)
 
-        # --- Focus points: same draft -> define+propagate pattern ---
-        self.col.addWidget(QLabel("<b>Focus points</b>"))
+        self._build_auto_detect_group(c)          # automatic SAM ROI detection
+        c.addStretch(1)
+        return w
+
+    def _build_focus_tab(self):
+        w = QWidget(); c = QVBoxLayout(w)
+        c.addWidget(QLabel("<b>Focus points</b>"))
         self.btn_focus_draft = QPushButton("Place focus points (draft)")
         self.btn_focus_draft.setToolTip("Add a Points layer; drop autofocus support "
                                         "points inside ONE reference section.")
         self.btn_focus_draft.clicked.connect(self._new_focus_draft)
-        self.col.addWidget(self.btn_focus_draft)
+        c.addWidget(self.btn_focus_draft)
         self.btn_focus_def = QPushButton("Define + propagate focus")
         self.btn_focus_def.setToolTip("Place the drafted focus points on every section "
                                       "via its pose; fine-tune by editing the 'Focus "
                                       "points' layer in napari. If none are placed, an "
                                       "auto grid (below) is used.")
         self.btn_focus_def.clicked.connect(self._define_focus)
-        self.col.addWidget(self.btn_focus_def)
+        c.addWidget(self.btn_focus_def)
+        self.btn_focus_center = QPushButton("Propagate focus to centers")
+        self.btn_focus_center.setToolTip("Place the drafted focus points at each "
+                                         "section's centroid unchanged. Each point is "
+                                         "anchored to the ROI if it was drawn inside the "
+                                         "ROI (so it rides the propagated ROI), else to "
+                                         "the section. Use when sections vary widely in "
+                                         "size, like the matching ROI option.")
+        self.btn_focus_center.clicked.connect(self._define_focus_center)
+        c.addWidget(self.btn_focus_center)
+        c.addStretch(1)
+        return w
 
-        # --- mFOV tiling preview ---
-        self.col.addWidget(QLabel("<b>mFOV tiling</b>"))
+    def _build_mfov_tab(self):
+        w = QWidget(); c = QVBoxLayout(w)
+        c.addWidget(QLabel("<b>mFOV tiling</b>"))
         mrow = QHBoxLayout()
         self.chk_mfov = QCheckBox("Show mFOV grid")
         self.chk_mfov.setToolTip("Preview the tile grid ZEN will image inside each ROI "
@@ -409,7 +493,7 @@ class StageROIs(_StageBase):
         self.sp_tile.valueChanged.connect(lambda *_: self._refresh_mfov())
         mrow.addWidget(self.sp_tile)
         mrow.addStretch(1)
-        self.col.addLayout(mrow)
+        c.addLayout(mrow)
         frow = QHBoxLayout()
         frow.addWidget(QLabel("auto-focus grid:"))
         self.sp_fc = QSpinBox(); self.sp_fc.setRange(1, 8); self.sp_fc.setValue(2)
@@ -418,27 +502,27 @@ class StageROIs(_StageBase):
         self.sp_fr.setMaximumWidth(56)
         self.sp_z = QDoubleSpinBox(); self.sp_z.setRange(-1e6, 1e6); self.sp_z.setValue(0)
         self.sp_z.setMaximumWidth(80)
-        for w in (self.sp_fc, self.sp_fr):
-            w.setToolTip("Autofocus support-point grid used only when no manual focus "
-                         "points are placed.")
+        for wd in (self.sp_fc, self.sp_fr):
+            wd.setToolTip("Autofocus support-point grid used only when no manual focus "
+                          "points are placed.")
         frow.addWidget(self.sp_fc); frow.addWidget(QLabel("×")); frow.addWidget(self.sp_fr)
         frow.addWidget(QLabel("Z µm:")); frow.addWidget(self.sp_z)
         frow.addStretch(1)
-        self.col.addLayout(frow)
+        c.addLayout(frow)
 
         b0 = QPushButton("Read existing mFOVs + focus from CZI")
         b0.setToolTip("Read ZEN TileRegions + focus SupportPoints already in the CZI "
                       "and display them on the wafer.")
         b0.clicked.connect(self._read_existing)
-        self.col.addWidget(b0)
+        c.addWidget(b0)
 
         self.lbl = QLabel("Define an ROI (and optional focus points) on one section — "
                           "both propagate to all sections by pose. Write them into a "
                           "CZI / .contour from <b>File → Export</b>.")
         self.lbl.setWordWrap(True)
-        self.col.addWidget(self.lbl)
-        self.col.addStretch(1)
-        self.refresh_fiducials()
+        c.addWidget(self.lbl)
+        c.addStretch(1)
+        return w
 
     def _refresh_mfov(self):
         if getattr(self, "chk_mfov", None) is not None and self.chk_mfov.isChecked():
@@ -551,6 +635,61 @@ class StageROIs(_StageBase):
         lyr.data = list(lyr.data) + [np.asarray(poly_yx, float)]
         self.app.log(self.STAGE, f"ROI captured ({len(lyr.data)} on draft).")
 
+    def _toggle_manual_roi(self, on):
+        """Per-section manual ROI mode: route SAM commits straight to the section
+        under the cursor (not the template draft), and keep an editable '② ROIs'
+        layer around for hand-drawing. Mutually exclusive with SAM-assist draft."""
+        ed = self._editor()
+        if ed is None:
+            self.btn_manual_roi.setChecked(False)
+            return
+        if on:
+            if not self._need_image():
+                self.btn_manual_roi.setChecked(False)
+                return
+            if self.btn_sam.isChecked():          # don't fight the draft SAM toggle
+                self.btn_sam.setChecked(False)
+            self.app.sync_sections()
+            self.app.ensure_poses()
+            layer_sync.ensure_roi_layer(self.app)
+            try:
+                ed.deactivate()
+            except Exception:
+                pass
+            ed.activate(commit_target=self._capture_manual_roi)
+            self.btn_manual_roi.setText("● Manual ROI per section (SAM): ON — click to stop")
+            self.app.log(self.STAGE, "Manual ROI ON — hover inside a section, SPACE to "
+                                     "SAM-trace its ROI. Double-click table rows / pan to "
+                                     "move between sections.")
+        else:
+            try:
+                ed.deactivate()
+            except Exception:
+                pass
+            self.btn_manual_roi.setText("Manual ROI per section (SAM): OFF")
+            self.app.log(self.STAGE, "Manual ROI OFF.")
+
+    def _capture_manual_roi(self, poly_yx):
+        """Commit a SAM-traced polygon as the ROI of the section that contains its
+        centroid (replacing any existing ROI on that section)."""
+        poly_xy = _napari_to_xy(np.asarray(poly_yx, float))
+        self.app.sync_sections()
+        # Fold any pending hand-drawn ROI edits into the model before we rebuild
+        # the overlay, so redrawing it doesn't discard them.
+        try:
+            self.app.capture_annotations()
+        except Exception:
+            pass
+        sec = self.app._section_containing(self.app.project, poly_xy)
+        if sec is None:
+            self.app.log(self.STAGE, "no section under that ROI — hover inside a section.")
+            return
+        sec.roi = Roi(polygon=[[float(x), float(y)] for x, y in poly_xy], fit_mode="manual")
+        layer_sync.show_rois(self.app)
+        self.app.save_workflow()
+        self.app.log(self.STAGE, f"ROI set on section {sec.id} "
+                                 f"({sum(1 for s in self.app.project.sections if s.roi)} total).")
+
     FOCUS_DRAFT = "Focus draft"
 
     def _new_focus_draft(self):
@@ -560,7 +699,7 @@ class StageROIs(_StageBase):
         if self.FOCUS_DRAFT in v.layers:
             v.layers.remove(self.FOCUS_DRAFT)
         try:
-            v.add_points(np.empty((0, 2)), name=self.FOCUS_DRAFT, size=8,
+            v.add_points(np.empty((0, 2)), name=self.FOCUS_DRAFT, size=4,
                          face_color="orange", border_color="orange",
                          scale=self.app.layer_scale())
             self.app.log(self.STAGE, "drop focus points inside one reference section, "
@@ -569,6 +708,16 @@ class StageROIs(_StageBase):
             self.app.log(self.STAGE, f"focus draft error: {e}")
 
     def _define_focus(self):
+        self._propagate_focus(mode="pose")
+
+    def _define_focus_center(self):
+        self._propagate_focus(mode="center")
+
+    def _propagate_focus(self, mode: str):
+        """Propagate drafted focus points to every section. ``pose`` maps them via
+        each section's pose (rotation-aware); ``center`` anchors each point to the
+        ROI (if drawn inside it) or the section (if outside) and places it at that
+        anchor's centroid unchanged — robust when sections vary widely in size."""
         if not self._need_image():
             return
         self.app.sync_sections()
@@ -586,12 +735,20 @@ class StageROIs(_StageBase):
         proj = self.app.project
         tmpl = proj.roi_templates[0] if proj.roi_templates else RoiTemplate(ref_section_id=ref.id)
         tmpl.focus_local = roi_mod.focus_template_from_points(ref.pose, pts_xy)
+        tmpl.focus_mode = mode
+        if mode == "center":
+            tmpl.focus_anchors = roi_mod.focus_anchors_from_points(ref, pts_xy)
+            n_roi = sum(1 for a in tmpl.focus_anchors if a.get("anchor") == "roi")
+            anchor_note = f" ({n_roi} anchored to ROI, {len(pts_xy) - n_roi} to section)"
+        else:
+            anchor_note = ""
         if not proj.roi_templates:
             proj.roi_templates = [tmpl]
         roi_mod.propagate_all(tmpl, proj.sections)
         layer_sync.show_focus_points(self.app)
-        self.app.log(self.STAGE, f"focus points propagated ({len(pts_xy)} per section, "
-                                 f"ref {ref.id}). Edit the 'Focus points' layer to fine-tune.")
+        self.app.log(self.STAGE, f"focus points propagated ({mode}, {len(pts_xy)} per "
+                                 f"section, ref {ref.id}){anchor_note}. Edit the 'Focus "
+                                 "points' layer to fine-tune.")
         self.app.save_workflow()
 
     def _new_draft(self):
@@ -694,6 +851,320 @@ class StageROIs(_StageBase):
                                  f"unchanged) to "
                                  f"{sum(1 for s in self.app.project.sections if s.roi)} sections.")
         self.app.save_workflow()
+
+    # ----- automatic per-section SAM ROI detection ----- #
+    def _build_auto_detect_group(self, c):
+        """Automatic ROI detection: SAM runs inside each section, prompted by a grid
+        of points, and the mask most compatible with the template becomes the ROI.
+        Parameters mirror the section detector and are populated from the template."""
+        c.addWidget(QLabel("<b>Automatic ROI detection (SAM)</b>"))
+        self.btn_auto_cal = QPushButton("Calibrate from template")
+        self.btn_auto_cal.setToolTip("Populate the parameters below from the drawn ROI "
+                                     "template's size (grid density, quality gates, area "
+                                     "band) — the ROI analogue of the section detector's "
+                                     "'Calibrate'. Draw/propagate a template first.")
+        self.btn_auto_cal.clicked.connect(self._calibrate_auto)
+        c.addWidget(self.btn_auto_cal)
+
+        ck_row = QHBoxLayout()
+        self.lbl_auto_ckpt = QLabel("SAM checkpoint:")
+        self.btn_auto_ckpt = QPushButton("Select checkpoint…")
+        self.btn_auto_ckpt.setToolTip("Choose the SAM model checkpoint used for detection "
+                                      "(shared with the section detector).")
+        self.btn_auto_ckpt.clicked.connect(self._select_auto_checkpoint)
+        ck_row.addWidget(self.lbl_auto_ckpt); ck_row.addWidget(self.btn_auto_ckpt, 1)
+        c.addLayout(ck_row)
+
+        # Parameters live behind an "Advanced" fold, like the section detector.
+        adv = QWidget(); ac = QVBoxLayout(adv)
+        ac.setContentsMargins(0, 0, 0, 0)
+
+        def _drow(label, w, tip):
+            r = QHBoxLayout(); r.addWidget(QLabel(label)); w.setToolTip(tip)
+            r.addWidget(w, 1); ac.addLayout(r); return w
+
+        self.sp_auto_pps = QSpinBox(); self.sp_auto_pps.setRange(2, 48); self.sp_auto_pps.setValue(9)
+        _drow("points / side:", self.sp_auto_pps,
+              "Prompt-point grid density across each section (points_per_side, like the "
+              "section detector). More points = SAM samples more locations to find the ROI.")
+        self.sp_auto_iou = QDoubleSpinBox(); self.sp_auto_iou.setRange(0.0, 1.0)
+        self.sp_auto_iou.setSingleStep(0.05); self.sp_auto_iou.setValue(0.80)
+        _drow("pred IoU ≥:", self.sp_auto_iou,
+              "Drop masks whose SAM predicted IoU is below this (pred_iou_thresh).")
+        self.sp_auto_stab = QDoubleSpinBox(); self.sp_auto_stab.setRange(0.0, 1.0)
+        self.sp_auto_stab.setSingleStep(0.02); self.sp_auto_stab.setValue(0.90)
+        _drow("stability ≥:", self.sp_auto_stab,
+              "Drop unstable masks (stability_score_thresh).")
+        self.sp_auto_amin = QDoubleSpinBox(); self.sp_auto_amin.setRange(0.05, 1.0)
+        self.sp_auto_amin.setSingleStep(0.05); self.sp_auto_amin.setValue(0.5)
+        _drow("min area × tmpl:", self.sp_auto_amin,
+              "Reject masks smaller than this fraction of the template ROI area.")
+        self.sp_auto_amax = QDoubleSpinBox(); self.sp_auto_amax.setRange(1.0, 5.0)
+        self.sp_auto_amax.setSingleStep(0.25); self.sp_auto_amax.setValue(2.0)
+        _drow("max area × tmpl:", self.sp_auto_amax,
+              "Reject masks larger than this multiple of the template ROI area.")
+        self.sp_auto_floor = QDoubleSpinBox(); self.sp_auto_floor.setRange(0.0, 1.0)
+        self.sp_auto_floor.setSingleStep(0.05); self.sp_auto_floor.setValue(0.35)
+        _drow("score floor:", self.sp_auto_floor,
+              "Minimum combined match score to accept SAM's ROI; below it the section "
+              "keeps its propagated-template ROI (fallback).")
+        self.sp_auto_margin = QDoubleSpinBox(); self.sp_auto_margin.setRange(0.0, 1.0)
+        self.sp_auto_margin.setSingleStep(0.05); self.sp_auto_margin.setValue(0.15)
+        _drow("crop margin:", self.sp_auto_margin,
+              "Extra context around the section bbox when embedding it for SAM.")
+        self.sp_auto_inset = QDoubleSpinBox(); self.sp_auto_inset.setRange(0.0, 0.4)
+        self.sp_auto_inset.setSingleStep(0.05); self.sp_auto_inset.setValue(0.0)
+        _drow("grid inset:", self.sp_auto_inset,
+              "Shrink the grid inward from the section edge (fraction) to avoid edge points.")
+        self.cb_auto_contour = QComboBox()
+        self.cb_auto_contour.addItems(["SAM mask contour", "template fitted to mask"])
+        _drow("contour:", self.cb_auto_contour,
+              "Use SAM's mask outline directly, or keep the template shape scaled/placed "
+              "to best match the SAM mask (uniform ROI shape across sections).")
+        c.addWidget(_CollapsibleSection("Advanced parameters", adv, open=False))
+
+        self.chk_auto_preview = QCheckBox("👁 Preview grid on sections (live)")
+        self.chk_auto_preview.setToolTip("Overlay the SAM prompt-point grid + expected-ROI "
+                                         "box inside every section. Double-click a table "
+                                         "row / zoom in to inspect one section.")
+        self.chk_auto_preview.toggled.connect(self._toggle_auto_preview)
+        c.addWidget(self.chk_auto_preview)
+        for sp in (self.sp_auto_pps, self.sp_auto_inset):
+            sp.valueChanged.connect(lambda *_: self._refresh_auto_preview())
+
+        runrow = QHBoxLayout()
+        self.btn_auto_run = QPushButton("Run automatic ROI detection")
+        self.btn_auto_run.setToolTip("Embed each section, prompt SAM on the grid, and set "
+                                     "each section's ROI to the best template-matching "
+                                     "mask. Runs section-by-section (Stop to cancel).")
+        self.btn_auto_run.clicked.connect(self._run_auto_roi)
+        self.btn_auto_stop = QPushButton("Stop")
+        self.btn_auto_stop.setVisible(False)
+        self.btn_auto_stop.clicked.connect(self._stop_auto_roi)
+        runrow.addWidget(self.btn_auto_run, 1); runrow.addWidget(self.btn_auto_stop)
+        c.addLayout(runrow)
+        c.addWidget(self.progress)
+        self._refresh_ckpt_label()
+
+    def _auto_template_xy(self):
+        """The reference ROI polygon (overview xy) used as the detection template:
+        the current draft if any, else the reference/any section's propagated ROI."""
+        xy = self._draft_polygon_xy()
+        if xy is not None:
+            return np.asarray(xy, float).reshape(-1, 2)
+        proj = self.app.project
+        rid = proj.roi_templates[0].ref_section_id if proj.roi_templates else None
+        for want in (rid, None):
+            for s in proj.sections:
+                if (want is None or s.id == want) and s.roi and len(s.roi.polygon) >= 3:
+                    return np.asarray(s.roi.polygon, float).reshape(-1, 2)
+        return None
+
+    def _auto_params_from_ui(self):
+        return {
+            "points_per_side": int(self.sp_auto_pps.value()),
+            "pred_iou_thresh": float(self.sp_auto_iou.value()),
+            "stability_score_thresh": float(self.sp_auto_stab.value()),
+            "min_area_frac": float(self.sp_auto_amin.value()),
+            "max_area_mult": float(self.sp_auto_amax.value()),
+            "score_floor": float(self.sp_auto_floor.value()),
+            "crop_margin": float(self.sp_auto_margin.value()),
+            "inset": float(self.sp_auto_inset.value()),
+            "contour_source": "template" if self.cb_auto_contour.currentIndex() == 1 else "mask",
+        }
+
+    def _calibrate_auto(self):
+        if not self._need_image():
+            return
+        self.app.sync_sections(); self.app.ensure_poses()
+        tmpl_xy = self._auto_template_xy()
+        if tmpl_xy is None:
+            self.app.log(self.STAGE, "draw or propagate a template ROI first.")
+            return
+        try:
+            prof = self.app.gui._current_profile()
+        except Exception:
+            prof = None
+        secs = [s.polygon for s in self.app.project.sections if len(s.polygon) >= 3]
+        p = roi_mod.calibrate_roi_params(tmpl_xy, secs, profile=prof)
+        self.sp_auto_pps.setValue(int(p["points_per_side"]))
+        self.sp_auto_iou.setValue(float(p["pred_iou_thresh"]))
+        self.sp_auto_stab.setValue(float(p["stability_score_thresh"]))
+        self.sp_auto_amin.setValue(float(p["min_area_frac"]))
+        self.sp_auto_amax.setValue(float(p["max_area_mult"]))
+        self.sp_auto_floor.setValue(float(p["score_floor"]))
+        if self.app.project.roi_templates:
+            self.app.project.roi_templates[0].auto_params = {**self._auto_params_from_ui(),
+                                                             "roi_area": p["roi_area"]}
+        self.app.log(self.STAGE, f"calibrated auto-ROI from template: points/side="
+                                 f"{p['points_per_side']} (~{p['points_on_roi']:.1f} on the "
+                                 f"ROI), pred IoU≥{p['pred_iou_thresh']}, "
+                                 f"stability≥{p['stability_score_thresh']}.")
+        self._refresh_auto_preview()
+
+    def _toggle_auto_preview(self, on):
+        if not on:
+            layer_sync.clear_roi_search_preview(self.app)
+            return
+        self._refresh_auto_preview()
+
+    def _refresh_auto_preview(self):
+        if getattr(self, "chk_auto_preview", None) is None or not self.chk_auto_preview.isChecked():
+            return
+        if not self.app.has_image():
+            return
+        self.app.sync_sections()
+        tmpl_xy = self._auto_template_xy()
+        if tmpl_xy is None:
+            self.app.log(self.STAGE, "draw or propagate a template ROI to preview the grid.")
+            self.chk_auto_preview.setChecked(False)
+            return
+        layer_sync.show_roi_search_preview(self.app, tmpl_xy, int(self.sp_auto_pps.value()),
+                                           inset=float(self.sp_auto_inset.value()))
+
+    def _refresh_ckpt_label(self):
+        import os
+        try:
+            prof = self.app.gui._current_profile()
+            ck = self.app.gui._checkpoint_for_model("Auto", prof)
+            name = os.path.basename(str(ck)) if ck else "(none selected)"
+        except Exception:
+            name = "(shared with detector)"
+        self.lbl_auto_ckpt.setText(f"SAM checkpoint: {name}")
+
+    def _select_auto_checkpoint(self):
+        try:
+            self.app.gui.select_checkpoint()
+        except Exception as e:
+            self.app.log(self.STAGE, f"checkpoint select failed: {e}")
+        self._refresh_ckpt_label()
+
+    def _stop_auto_roi(self):
+        if self.worker.is_running():
+            self.worker.stop()
+            self.app.log(self.STAGE, "stopping automatic ROI detection…")
+
+    def _run_auto_roi(self):
+        import os
+        if not self._need_image() or self.worker.is_running():
+            return
+        self.app.sync_sections(); self.app.ensure_poses()
+        tmpl_xy = self._auto_template_xy()
+        if tmpl_xy is None:
+            self.app.log(self.STAGE, "draw or propagate a template ROI first, then "
+                                     "'Calibrate from template'.")
+            return
+        gui = self.app.gui
+        try:
+            prof = gui._current_profile()
+            ckpt = gui._checkpoint_for_model("Auto", prof)
+        except Exception:
+            ckpt = None
+        if not ckpt or not os.path.exists(str(ckpt)):
+            self.app.log(self.STAGE, "select a SAM checkpoint first.")
+            try:
+                gui.select_checkpoint()
+            except Exception:
+                pass
+            self._refresh_ckpt_label()
+            return
+
+        proj = self.app.project
+        sections = [s for s in proj.sections if len(s.polygon) >= 3]
+        if not sections:
+            return
+        # Fallback: seed every section with a centered template ROI when nothing
+        # has been propagated, so sections where SAM finds nothing keep an ROI.
+        if not any(getattr(s, "roi", None) and s.roi.polygon for s in sections):
+            ref = self._reference_section(tmpl_xy)
+            if ref is not None:
+                seed = roi_mod.template_from_polygon(ref.pose, tmpl_xy, ref_section_id=ref.id,
+                                                     fit_mode="center")
+                seed.polygon_local = [[float(x), float(y)] for x, y in tmpl_xy]
+                proj.roi_templates = [seed]
+                roi_mod.propagate_all(seed, sections)
+                layer_sync.show_rois(self.app)
+
+        params = self._auto_params_from_ui()
+        self._auto_contour = params["contour_source"]
+        self._auto_hit = 0
+        self._roi_refresh_ct = 0
+        spec = {
+            "image": self.app.image_path,
+            "checkpoint": str(ckpt),
+            "device": getattr(gui, "_device_prefer", "") or "",
+            "target": self.app.target_long_side(),
+            "template": [[float(x), float(y)] for x, y in np.asarray(tmpl_xy, float).reshape(-1, 2)],
+            "sections": [{"id": s.id, "polygon": s.polygon} for s in sections],
+            "params": {**params, "crop_long": 1024},
+        }
+        import json as _json
+        import tempfile
+        fd, spath = tempfile.mkstemp(suffix="_stim_roi_spec.json")
+        with os.fdopen(fd, "w") as f:
+            _json.dump(spec, f)
+
+        if self.btn_sam.isChecked():
+            self.btn_sam.setChecked(False)
+        if self.btn_manual_roi.isChecked():
+            self.btn_manual_roi.setChecked(False)
+        self.btn_auto_run.setEnabled(False); self.btn_auto_stop.setVisible(True)
+        self._auto_running = True
+        self.app.log(self.STAGE, f"automatic ROI detection on {len(sections)} sections "
+                                 "(background) — the view stays put; pan freely.")
+        started = self.worker.start("roi_detect_worker", ["--spec", spath], handlers={
+            "PROGRESS": lambda p: self._set_progress(p.get("done", 0), p.get("total", 0)),
+            "ROISTART": self._on_roi_start,
+            "ROI": self._on_roi_result,
+            "ROI_DONE": self._on_roi_done,
+            "ERROR": lambda p: self.app.log(self.STAGE, f"error: {p.get('error', p)}"),
+        }, on_log=lambda m: self.app.log(self.STAGE, m))
+        if not started:
+            self._auto_running = False
+            self.btn_auto_run.setEnabled(True); self.btn_auto_stop.setVisible(False)
+
+    def _on_roi_start(self, payload):
+        s = self.app.project.get(payload.get("id"))
+        if s is not None:
+            layer_sync.highlight_current_section(self.app, s)   # cyan, no camera move
+
+    def _on_roi_result(self, payload):
+        poly = payload.get("polygon")
+        s = self.app.project.get(payload.get("id"))
+        if s is not None and poly and len(poly) >= 3:
+            s.roi = Roi(polygon=[[float(x), float(y)] for x, y in poly],
+                        fit_mode=("auto" if self._auto_contour == "mask" else "auto_template"))
+            self._auto_hit += 1
+            self._roi_refresh_ct += 1
+            if self._roi_refresh_ct % 3 == 0:       # throttle overlay rebuilds
+                layer_sync.show_rois(self.app)
+
+    def _on_roi_done(self, payload):
+        self._auto_running = False
+        layer_sync.clear_current_section(self.app)
+        layer_sync.show_rois(self.app)
+        self.progress.setVisible(False)
+        self.btn_auto_run.setEnabled(True); self.btn_auto_stop.setVisible(False)
+        self.app.save_workflow()
+        n = payload.get("n", 0); hit = payload.get("hit", self._auto_hit)
+        self.app.log(self.STAGE, f"automatic ROI done — SAM set {hit}/{n} sections; the "
+                                 f"rest kept the propagated template. "
+                                 f"{sum(1 for s in self.app.project.sections if s.roi)} ROIs total.")
+
+    def _on_roi_worker_finished(self, _code):
+        # safety net if the worker died without a ROI_DONE (crash / Stop)
+        if not self._auto_running:
+            return
+        self._auto_running = False
+        layer_sync.clear_current_section(self.app)
+        self.btn_auto_run.setEnabled(True); self.btn_auto_stop.setVisible(False)
+        self.progress.setVisible(False)
+        try:
+            layer_sync.show_rois(self.app)
+            self.app.save_workflow()
+        except Exception:
+            pass
+        self.app.log(self.STAGE, "automatic ROI detection stopped.")
 
 # --------------------------------------------------------------------------- #
 # Reorder + TSP stage
@@ -936,6 +1407,7 @@ def attach_workflow(viewer, gui):
     (import/export) + bottom section table + a single shared log. Returns the
     StimApp. Raises on failure (caller guards)."""
     app = StimApp(gui)
+    gui.app = app          # let the GUI's debounced autosave reach the full save
     nav = FovNavigator(app)
     table = SectionTableDock(app, nav)
 
@@ -1003,9 +1475,37 @@ def attach_workflow(viewer, gui):
         state["dlg"] = ExportDialog(app, parent=container)
         state["dlg"].show()
     btn_export.clicked.connect(_open_export)
+
+    btn_save = QPushButton("💾 Save now")
+    btn_save.setToolTip("Capture the current sections, ROIs and focus points "
+                        "(including native napari edits) and save the working "
+                        "session to disk. The session also autosaves ~1.5 s after "
+                        "each edit and on quit — this is a manual, immediate save.")
+
+    def _save_now():
+        if not app.has_image():
+            app.log("io", "load an image before saving.")
+            return
+        ok = app.save_all()
+        app.log("io", "session saved." if ok else "save failed (see console).")
+    btn_save.clicked.connect(_save_now)
+
     filebar.addWidget(btn_open)
     filebar.addWidget(btn_export)
+    filebar.addWidget(btn_save)
     filebar.addStretch(1)
+    filebar.addWidget(QLabel("outline px:"))
+    sp_outline = QDoubleSpinBox()
+    sp_outline.setRange(0.25, 8.0); sp_outline.setSingleStep(0.25)
+    sp_outline.setDecimals(2); sp_outline.setValue(1.0)
+    sp_outline.setMaximumWidth(64)
+    sp_outline.setToolTip("On-screen thickness of every polygon outline (sections, "
+                          "ROIs, calibration…), in canvas pixels. Stays constant as "
+                          "you zoom, so outlines on small polygons don't get in the "
+                          "way — lower this for finer placement.")
+    sp_outline.valueChanged.connect(
+        lambda v: getattr(gui, "set_outline_screen_px", lambda *_: None)(v))
+    filebar.addWidget(sp_outline)
     cl.addLayout(filebar)
 
     loaded = {"done": None, "target": None, "tries": 0}
@@ -1075,7 +1575,7 @@ def attach_workflow(viewer, gui):
     if _qapp is not None:
         def _save_on_quit():
             try:
-                app.save_workflow()
+                app.save_all()
             except Exception:
                 pass
         _qapp.aboutToQuit.connect(_save_on_quit)

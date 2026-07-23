@@ -119,6 +119,88 @@ def test_focus_propagation_pose_consistent():
     assert np.allclose(back, np.asarray(tmpl.focus_local), atol=1e-6)
 
 
+def test_focus_center_anchoring():
+    # ROI-anchored focus rides each section's ROI centroid; section-anchored
+    # focus rides the section centroid — both unchanged in offset (no pose).
+    ref = _section(TRAP)
+    small = _section(_transform(TRAP * 0.3, 20.0, 300.0, 100.0))
+    big = _section(_transform(TRAP * 4.0, 90.0, -400.0, 50.0))
+    secs = [ref, small, big]
+    tmpl = RoiTemplate(polygon_local=[[float(x), float(y)] for x, y in ROI_SQ],
+                       ref_section_id=ref.id, fit_mode="center")
+    roi.propagate_all(tmpl, secs)                 # every section gets a centered ROI
+
+    # focus points are drawn relative to the propagated ROI as it appears on the
+    # reference section (the real GUI flow), not the original draft location.
+    ref_roi_c = np.asarray(ref.roi.polygon, float).mean(axis=0)
+    p_in = [float(ref_roi_c[0] + 0.5), float(ref_roi_c[1] + 0.5)]   # inside the ROI
+    p_out = [9.0, -4.0]                                             # in section, outside ROI
+    tmpl.focus_anchors = roi.focus_anchors_from_points(ref, [p_in, p_out])
+    tmpl.focus_local = roi.focus_template_from_points(ref.pose, [p_in, p_out])
+    tmpl.focus_mode = "center"
+    assert [a["anchor"] for a in tmpl.focus_anchors] == ["roi", "section"]
+
+    roi.propagate_all(tmpl, secs)
+    sec_off = np.array(p_out) - np.array(ref.centroid())
+    roi_off = np.array(p_in) - np.asarray(ref.roi.polygon, float).mean(axis=0)
+    for s in secs:
+        fp = np.asarray(s.focus_overview, float)
+        roi_c = np.asarray(s.roi.polygon, float).mean(axis=0)
+        assert np.allclose(fp[0], roi_c + roi_off, atol=1e-6)
+        assert np.allclose(fp[1], np.asarray(s.centroid()) + sec_off, atol=1e-6)
+
+
+def test_section_point_grid_inside_and_scales():
+    sec = [[0, 0], [100, 0], [100, 100], [0, 100]]
+    g8 = np.asarray(roi.section_point_grid(sec, 8))
+    g4 = np.asarray(roi.section_point_grid(sec, 4))
+    assert len(g8) > 0 and len(g4) < len(g8)                 # denser grid → more points
+    assert g8[:, 0].min() >= 0 and g8[:, 0].max() <= 100     # all inside the section bbox
+    # a triangle: grid points outside the polygon are dropped
+    tri = [[0, 0], [100, 0], [0, 100]]
+    gt = np.asarray(roi.section_point_grid(tri, 8))
+    assert all(x + y <= 100 + 1e-6 for x, y in gt)
+
+
+def test_score_and_choose_prefer_template_match():
+    sec = [[0, 0], [100, 0], [100, 100], [0, 100]]
+    tmpl = [[40, 40], [60, 40], [60, 60], [40, 60]]          # area 400
+    band = (200.0, 800.0)
+    good = [[41, 41], [59, 41], [59, 59], [41, 59]]          # template-like, contained
+    tiny = [[48, 48], [52, 48], [52, 52], [48, 52]]          # area 16 → outside band → 0
+    leak = [[90, 90], [130, 90], [130, 130], [90, 130]]      # partly outside section
+    assert roi.score_mask(tiny, tmpl, sec, 0.95, band) == 0.0
+    assert roi.score_mask(good, tmpl, sec, 0.95, band) > roi.score_mask(leak, tmpl, sec, 0.9, band)
+    best, sc = roi.choose_best_roi([(good, 0.95), (tiny, 0.95), (leak, 0.9)], tmpl, sec, band, floor=0.35)
+    assert best is not None and abs(np.asarray(best).mean(0)[0] - 50) < 5
+    none, _ = roi.choose_best_roi([(tiny, 0.95)], tmpl, sec, band, floor=0.35)
+    assert none is None                                       # nothing clears the floor
+
+
+def test_fit_template_to_mask_matches_area_and_centroid():
+    tmpl = [[0, 0], [10, 0], [10, 10], [0, 10]]               # area 100 at origin
+    mask = [[100, 100], [120, 100], [120, 120], [100, 120]]   # area 400, centred (110,110)
+    fit = np.asarray(roi.fit_template_to_mask(tmpl, mask))
+    assert np.allclose(fit.mean(0), [110, 110], atol=1e-6)    # recentred on the mask
+    fa = roi._shoelace_area(fit)
+    assert abs(fa - 400.0) < 1e-3                             # scaled to the mask area
+
+
+def test_calibrate_roi_params_from_template():
+    try:
+        import cv2  # noqa: F401
+    except Exception:
+        print("  skip test_calibrate_roi_params_from_template (cv2 unavailable)")
+        return
+    sec = [[0, 0], [100, 0], [100, 100], [0, 100]]            # 100×100 sections
+    tmpl = [[40, 40], [60, 40], [60, 60], [40, 60]]           # 20×20 ROI
+    p = roi.calibrate_roi_params(tmpl, [sec, sec, sec], min_points=3)
+    assert 6 <= p["points_per_side"] <= 48
+    assert p["points_on_roi"] >= 2.0                          # grid lands a few pts on the ROI
+    assert 0.7 <= p["pred_iou_thresh"] <= 0.9
+    assert p["roi_area"] > 0 and p["min_area_frac"] < 1.0 < p["max_area_mult"]
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

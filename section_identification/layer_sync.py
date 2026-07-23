@@ -38,6 +38,19 @@ def _remove(viewer, name):
             pass
 
 
+def _connect_autosave(app, layer):
+    """Fire the GUI's debounced autosave when an editable overlay (ROIs / focus
+    points) is changed natively in napari, so hand-edits to it are captured back
+    into the model and persisted like the Sections layer already is."""
+    sched = getattr(getattr(app, "gui", None), "_schedule_autosave", None)
+    if sched is None:
+        return
+    try:
+        layer.events.data.connect(sched)
+    except Exception:
+        pass
+
+
 def _centroid_yx(section):
     cx, cy = section.centroid()
     return (cy, cx)
@@ -187,9 +200,10 @@ def show_focus_points(app):
     if not pts:
         return
     try:
-        viewer.add_points(np.asarray(pts, float), name=FOCUS_LAYER, size=8,
-                          face_color="orange", border_color="orange",
-                          scale=app.layer_scale())
+        lyr = viewer.add_points(np.asarray(pts, float), name=FOCUS_LAYER, size=4,
+                                face_color="orange", border_color="orange",
+                                scale=app.layer_scale())
+        _connect_autosave(app, lyr)
     except Exception as e:
         app.log("rois", f"focus overlay error: {e}")
 
@@ -244,6 +258,134 @@ def clear_mfov_grid(app):
     _remove(app.viewer, MFOV_LAYER)
 
 
+def ensure_roi_layer(app):
+    """Return the editable "② ROIs" Shapes layer, creating an empty one if it
+    doesn't exist yet — so the user can hand-draw / SAM-trace ROIs per section
+    even before any template propagation. Edits are captured back into the model
+    by :meth:`StimApp.capture_annotations` via the autosave hook."""
+    viewer = app.viewer
+    if viewer is None:
+        return None
+    if ROI_LAYER in viewer.layers:
+        return viewer.layers[ROI_LAYER]
+    try:
+        lyr = viewer.add_shapes([], shape_type="polygon", name=ROI_LAYER,
+                                edge_color="cyan", face_color="transparent",
+                                edge_width=_overlay_width(app), scale=app.layer_scale())
+        _connect_autosave(app, lyr)
+        return lyr
+    except Exception as e:
+        app.log("rois", f"ROI layer error: {e}")
+        return None
+
+
+ROI_GRID_LAYER = "◦ ROI search grid"
+ROI_BOX_LAYER = "◦ ROI template box"
+ROI_CURRENT_LAYER = "▶ segmenting section"
+
+
+def _roi_box_for_section(section, template_polygon):
+    """A rectangle polygon (overview xy) showing where the ROI is expected on a
+    section: the section's propagated ROI bbox if present, else the template's
+    bbox dropped on the section centroid. Drives the preview + the SAM box hint."""
+    if getattr(section, "roi", None) and len(section.roi.polygon) >= 3:
+        p = np.asarray(section.roi.polygon, float).reshape(-1, 2)
+        x0, y0, x1, y1 = p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max()
+    else:
+        t = np.asarray(template_polygon, float).reshape(-1, 2)
+        if len(t) < 3:
+            return None
+        w = (t[:, 0].max() - t[:, 0].min()) / 2.0
+        h = (t[:, 1].max() - t[:, 1].min()) / 2.0
+        cx, cy = section.centroid()
+        x0, y0, x1, y1 = cx - w, cy - h, cx + w, cy + h
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+
+def show_roi_search_preview(app, template_polygon, points_per_side, inset=0.0,
+                            max_points=15000):
+    """Overlay, inside every section, the SAM prompt-point grid (magenta) and the
+    expected-ROI box (yellow) — the per-section analogue of the section detector's
+    parameter preview. Caps total points by subsampling which sections show a grid
+    (all still show the box), so dense grids on large wafers stay responsive."""
+    from . import roi as roi_mod
+    viewer = app.viewer
+    _remove(viewer, ROI_GRID_LAYER)
+    _remove(viewer, ROI_BOX_LAYER)
+    if viewer is None or points_per_side < 1:
+        return
+    secs = [s for s in app.project.sections if len(s.polygon) >= 3]
+    if not secs:
+        return
+    per = max(1, int(points_per_side)) ** 2
+    budget = max(1, int(max_points / max(per, 1)))
+    step = max(1, len(secs) // budget) if len(secs) > budget else 1
+    grid_secs = secs[::step]
+    pts_yx, boxes = [], []
+    # Uniform points_per_side grid over each section's bbox — exactly what the
+    # automatic mask generator samples on the crop (not clipped to the polygon).
+    g = roi_mod.build_point_grid(int(points_per_side))
+    for s in grid_secs:
+        x0, y0, x1, y1 = s.bbox()
+        w, h = (x1 - x0), (y1 - y0)
+        x0 += w * inset; x1 -= w * inset
+        y0 += h * inset; y1 -= h * inset
+        for gx, gy in g:
+            pts_yx.append([y0 + gy * (y1 - y0), x0 + gx * (x1 - x0)])
+    for s in secs:
+        box = _roi_box_for_section(s, template_polygon)
+        if box is not None:
+            boxes.append(_xy_to_yx(box))
+    size = max(2.0, _overlay_width(app) * 3.0)
+    try:
+        if pts_yx:
+            lyr = viewer.add_points(np.asarray(pts_yx, float), name=ROI_GRID_LAYER,
+                                    size=size, face_color="magenta", border_color="magenta",
+                                    scale=app.layer_scale(),
+                                    metadata={"stim_screen_pts": True})
+            # keep the grid dots a constant small on-screen size regardless of zoom
+            sync = getattr(getattr(app, "gui", None), "_sync_outline_widths", None)
+            if sync is not None:
+                try:
+                    sync()
+                except Exception:
+                    pass
+        if boxes:
+            viewer.add_shapes(boxes, shape_type="polygon", name=ROI_BOX_LAYER,
+                              edge_color="yellow", face_color="transparent",
+                              edge_width=_overlay_width(app), scale=app.layer_scale())
+    except Exception as e:
+        app.log("rois", f"ROI preview error: {e}")
+    if step > 1:
+        app.log("rois", f"ROI search preview: grid shown on {len(grid_secs)}/"
+                        f"{len(secs)} sections (subsampled to stay responsive).")
+
+
+def clear_roi_search_preview(app):
+    _remove(app.viewer, ROI_GRID_LAYER)
+    _remove(app.viewer, ROI_BOX_LAYER)
+
+
+def highlight_current_section(app, section):
+    """Cyan highlight of the section SAM is segmenting right now — the per-section
+    analogue of the detector's 'Current tile' highlight."""
+    viewer = app.viewer
+    _remove(viewer, ROI_CURRENT_LAYER)
+    if section is None or len(section.polygon) < 3:
+        return
+    try:
+        viewer.add_shapes([_xy_to_yx(section.polygon)], shape_type="polygon",
+                          name=ROI_CURRENT_LAYER, edge_color="cyan",
+                          face_color=[0, 1, 1, 0.12], edge_width=_overlay_width(app) * 2,
+                          scale=app.layer_scale())
+    except Exception:
+        pass
+
+
+def clear_current_section(app):
+    _remove(app.viewer, ROI_CURRENT_LAYER)
+
+
 def show_rois(app):
     viewer = app.viewer
     _remove(viewer, ROI_LAYER)
@@ -252,9 +394,10 @@ def show_rois(app):
     if not polys:
         return
     try:
-        viewer.add_shapes(polys, shape_type="polygon", name=ROI_LAYER,
-                          edge_color="cyan", face_color="transparent",
-                          edge_width=_overlay_width(app), scale=app.layer_scale())
+        lyr = viewer.add_shapes(polys, shape_type="polygon", name=ROI_LAYER,
+                                edge_color="cyan", face_color="transparent",
+                                edge_width=_overlay_width(app), scale=app.layer_scale())
+        _connect_autosave(app, lyr)
     except Exception as e:
         app.log("rois", f"overlay error: {e}")
 

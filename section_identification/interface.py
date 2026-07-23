@@ -29,6 +29,43 @@ from qtpy.QtWidgets import (
 
 import napari
 
+
+def _bind_polygon_edit_keys():
+    """Add intuitive Ctrl+C / Ctrl+V / Ctrl+D (copy / paste / duplicate) to napari
+    Shapes and Points layers. napari ships copy/paste for Points on Cmd only and
+    none at all for Shapes, and has no duplicate — so section / ROI polygons and
+    focus points can't be copied by keyboard out of the box. Bound at class level
+    (idempotent) so every current and future layer gets them."""
+    from napari.layers import Points, Shapes
+
+    def _copy(layer):
+        try:
+            layer._copy_data()
+        except Exception:
+            pass
+
+    def _paste(layer):
+        try:
+            layer._paste_data()
+        except Exception:
+            pass
+
+    def _duplicate(layer):
+        try:
+            layer._copy_data()
+            layer._paste_data()
+        except Exception:
+            pass
+
+    for cls in (Shapes, Points):
+        for key, fn in (("Control-C", _copy), ("Control-V", _paste),
+                        ("Control-D", _duplicate)):
+            try:
+                cls.bind_key(key, fn, overwrite=True)
+            except Exception:
+                pass
+
+
 from section_identification.section_detector import automatic_identification
 from section_identification.export import export_polygons
 from section_identification import czi_io
@@ -146,6 +183,7 @@ class SectionIdentificationGUI(QWidget):
     def __init__(self, napari_viewer):
         super().__init__()
         self.viewer = napari_viewer
+        _bind_polygon_edit_keys()          # Ctrl+C / Ctrl+V / Ctrl+D on shapes+points
         self.image_path = None
         self.overview = None
         self.geom = None
@@ -159,9 +197,20 @@ class SectionIdentificationGUI(QWidget):
         self.tiles_layer = None
         self.current_tile_layer = None
         self.raw_layer = None
+        # Keep polygon outlines a constant width on screen (~this many canvas px)
+        # regardless of zoom / polygon size, so small polygons stay legible.
+        self._outline_screen_px = 1.0
+        self._outline_timer = QTimer(self); self._outline_timer.setSingleShot(True)
+        self._outline_timer.timeout.connect(self._sync_outline_widths)
+        try:
+            # Debounce zoom (fires in bursts); apply to new layers immediately.
+            self.viewer.camera.events.zoom.connect(self._schedule_outline_sync)
+            self.viewer.layers.events.inserted.connect(self._sync_outline_widths)
+        except Exception:
+            pass
         # autosave (debounced) + detection process + streaming state
         self._autosave_timer = QTimer(self); self._autosave_timer.setSingleShot(True)
-        self._autosave_timer.timeout.connect(self.save_project)
+        self._autosave_timer.timeout.connect(self._autosave)
         self.proc = None
         self._det_params = None
         self._det_t0 = 0.0
@@ -1068,13 +1117,71 @@ class SectionIdentificationGUI(QWidget):
                 pass
 
     def _outline_width(self):
-        """A thin, ~consistent outline width (overview-data units) scaled to the
-        overview size, so section/calibration outlines stay ~thin regardless of
-        the overview-px setting (world width ≈ overview_long·0.0005 / zoom)."""
+        """Initial outline width (overview-data units) for a freshly created
+        Shapes layer. :meth:`_sync_outline_widths` corrects it to a constant
+        on-screen width as soon as the layer is inserted / the camera zooms."""
         try:
             return max(1.0, max(self.overview.shape[:2]) * 0.0005)
         except Exception:
             return 1.0
+
+    def _schedule_outline_sync(self, *a):
+        try:
+            self._outline_timer.start(40)
+        except Exception:
+            self._sync_outline_widths()
+
+    def _sync_outline_widths(self, *a):
+        """Rescale every polygon (Shapes) layer's ``edge_width`` — which napari
+        measures in *data* units — to the current camera zoom, so all outlines
+        render at ~``self._outline_screen_px`` canvas pixels no matter the zoom
+        level or how small the polygon is.
+
+        Point layers keep a fixed size by default (e.g. focus points), EXCEPT
+        those tagged ``metadata['stim_screen_pts']`` (transient previews like the
+        ROI search grid), whose ``size`` is likewise scaled to a constant on-screen
+        diameter so the grid stays legible when zoomed in."""
+        viewer = getattr(self, "viewer", None)
+        if viewer is None:
+            return
+        try:
+            from napari.layers import Points, Shapes
+        except Exception:
+            Points = Shapes = None
+        try:
+            zoom = float(viewer.camera.zoom)
+        except Exception:
+            return
+        if not zoom or zoom <= 0:
+            return
+        try:
+            scale = float(self._layer_scale()[0]) or 1.0
+        except Exception:
+            scale = 1.0
+        target = float(getattr(self, "_outline_screen_px", 1.0) or 1.0)
+        width = max(target / (zoom * scale), 1e-9)
+        pt_size = max((target * 5.0) / (zoom * scale), 1e-9)   # a visible dot, ~5 px
+        for lyr in list(viewer.layers):
+            cls = lyr.__class__.__name__
+            is_shapes = (isinstance(lyr, Shapes) if Shapes is not None else cls == "Shapes")
+            is_points = (isinstance(lyr, Points) if Points is not None else cls == "Points")
+            if is_shapes:
+                try:
+                    lyr.edge_width = width
+                    lyr.current_edge_width = width
+                except Exception:
+                    pass
+            elif is_points and getattr(lyr, "metadata", {}).get("stim_screen_pts"):
+                try:
+                    lyr.size = pt_size
+                    lyr.current_size = pt_size
+                except Exception:
+                    pass
+
+    def set_outline_screen_px(self, px: float):
+        """Set the target on-screen outline width (canvas px) and apply it now."""
+        self._outline_screen_px = max(float(px), 0.1)
+        self._sync_outline_widths()
 
     def _ensure_calib_layer(self):
         if self.calib_layer is None or self.calib_layer not in self.viewer.layers:
@@ -1105,6 +1212,17 @@ class SectionIdentificationGUI(QWidget):
             self._autosave_timer.start(1500)
         except Exception:
             pass
+
+    def _autosave(self):
+        """Debounced autosave target. When the workflow facade is attached it
+        does the full save (captures ROI/focus overlay edits + writes both the
+        project JSON and the workflow sidecar); otherwise it falls back to the
+        legacy sections/fiducials JSON only."""
+        app = getattr(self, "app", None)
+        if app is not None and app.has_image():
+            app.save_all()
+        else:
+            self.save_project()
 
     def _project_path(self):
         base = os.path.splitext(os.path.basename(self.image_path))[0]

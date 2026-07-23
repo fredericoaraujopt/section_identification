@@ -142,18 +142,15 @@ class NapariSamEditor:
                 and rect[2] + mx >= ext[2] and rect[3] + my >= ext[3])
 
     # ---------------- embedding (synchronous, main thread) ----------------
-    def _read_view_crop(self):
-        """(crop_rgb, (wx0,wy0) world origin, read_zoom) for the current view, or
-        None. Reads at a zoom that keeps the crop ≈ENCODE_PX (full-res when zoomed
-        in, downscaled when zoomed out → works at ANY zoom). Supports CZI
+    def _read_crop_for_rect(self, wx0, wy0, wx1, wy1):
+        """(crop_rgb, (wx0,wy0) world origin, read_zoom) for an explicit world
+        rect, or None. Reads at a zoom that keeps the crop ≈ENCODE_PX so the
+        embedding is ~1024 px regardless of the rect's true size. Supports CZI
         (read_czi_region) AND ordinary images (slices gui.overview)."""
         from section_identification import czi_io
-        ext = self._view_extent_world()
-        if ext is None:
-            return None
         W, H = self._image_wh()
-        wx0 = max(0.0, ext[0]); wy0 = max(0.0, ext[1])
-        wx1 = min(float(W), ext[2]); wy1 = min(float(H), ext[3])
+        wx0 = max(0.0, wx0); wy0 = max(0.0, wy0)
+        wx1 = min(float(W), wx1); wy1 = min(float(H), wy1)
         ww, wh = wx1 - wx0, wy1 - wy0
         if min(ww, wh) < 4:
             return None
@@ -177,6 +174,13 @@ class NapariSamEditor:
         if crop is None or getattr(crop, "size", 0) == 0:
             return None
         return np.ascontiguousarray(crop), (wx0, wy0), rz
+
+    def _read_view_crop(self):
+        """As :meth:`_read_crop_for_rect` but for the current camera view."""
+        ext = self._view_extent_world()
+        if ext is None:
+            return None
+        return self._read_crop_for_rect(ext[0], ext[1], ext[2], ext[3])
 
     def _build_predictor(self):
         """SAM2 image predictor with the host-adaptive model (tiny/small on weak
@@ -278,6 +282,104 @@ class NapariSamEditor:
         wx = self._view_world_origin[0] + c[:, 0] / rz       # crop px → world
         wy = self._view_world_origin[1] + c[:, 1] / rz
         return np.column_stack([wx * z, wy * z])                          # overview xy
+
+    # ------------- automatic per-section ROI detection (headless API) -------------
+    def _crop_mask_to_overview(self, mask2d):
+        """Largest external contour of a crop-space binary mask → overview xy."""
+        m = np.squeeze(np.asarray(mask2d)).astype(np.uint8)
+        if m.ndim != 2 or m.sum() == 0:
+            return None
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+        c = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(float)
+        if len(c) < 3:
+            return None
+        z = self._zoom()
+        rz = self._read_zoom or 1.0
+        wx = self._view_world_origin[0] + c[:, 0] / rz
+        wy = self._view_world_origin[1] + c[:, 1] / rz
+        return np.column_stack([wx * z, wy * z])
+
+    def embed_rect_overview(self, bbox_overview, margin_frac=0.15):
+        """Embed a section's crop (bbox in overview px, grown by ``margin_frac``)
+        so :meth:`predict_points` can be prompted inside it. One encoder pass;
+        stores the same crop↔overview transform state the interactive path uses.
+        Returns True on success. Main thread only (SAM/MPS is not thread-safe)."""
+        if self.gui.overview is None:
+            return False
+        z = self._zoom()
+        x0, y0, x1, y1 = (float(v) for v in bbox_overview)
+        wx0, wy0, wx1, wy1 = x0 / z, y0 / z, x1 / z, y1 / z      # overview → world
+        mw = (wx1 - wx0) * margin_frac
+        mh = (wy1 - wy0) * margin_frac
+        got = self._read_crop_for_rect(wx0 - mw, wy0 - mh, wx1 + mw, wy1 + mh)
+        if got is None:
+            return False
+        crop, origin, rz = got
+        try:
+            if self.predictor is None:
+                self.predictor = self._build_predictor()
+            with self._lock:
+                self.predictor.set_image(crop)
+            self._view_world_origin = origin
+            self._read_zoom = rz
+            self._crop_w, self._crop_h = crop.shape[1], crop.shape[0]
+            self._embed_rect = (wx0, wy0, wx1, wy1)
+            self._embed_ready = True
+            return True
+        except Exception as e:
+            self._embed_ready = False
+            self._log(f"per-section embed failed: {e}")
+            return False
+
+    @staticmethod
+    def _stability(logit, offset=1.0, thr=0.0):
+        """SAM's stability score for one low-res logit mask: agreement between the
+        mask thresholded at +offset vs -offset (1.0 = very stable)."""
+        l = np.asarray(logit, dtype=np.float32)
+        hi = float((l > (thr + offset)).sum())
+        lo = float((l > (thr - offset)).sum())
+        return hi / lo if lo > 0 else 0.0
+
+    def predict_points(self, points_overview, multimask=True, stability_offset=1.0):
+        """Prompt the CURRENT embedding at each point (overview xy) and return a
+        flat list of ``(polygon_overview_xy, sam_iou, stability)`` candidates — up
+        to 3 masks per point when ``multimask``. Requires a prior
+        :meth:`embed_rect_overview`."""
+        if not self._embed_ready or self.predictor is None:
+            return []
+        z = self._zoom()
+        rz = self._read_zoom or 1.0
+        ox, oy = self._view_world_origin
+        out = []
+        with self._lock:
+            for (px, py) in points_overview:
+                cx = (float(px) / z - ox) * rz
+                cy = (float(py) / z - oy) * rz
+                if not (0 <= cx < self._crop_w and 0 <= cy < self._crop_h):
+                    continue
+                try:
+                    masks, scores, low = self.predictor.predict(
+                        point_coords=np.array([[cx, cy]], dtype=np.float32),
+                        point_labels=np.array([1], dtype=np.float32),
+                        multimask_output=bool(multimask))
+                except Exception:
+                    continue
+                masks = np.asarray(masks)
+                scores = np.asarray(scores).ravel()
+                low = np.asarray(low)
+                if masks.ndim == 2:
+                    masks = masks[None]
+                if low.ndim == 2:
+                    low = low[None]
+                for i in range(masks.shape[0]):
+                    poly = self._crop_mask_to_overview(masks[i])
+                    if poly is not None and len(poly) >= 3:
+                        iou = float(scores[i]) if i < len(scores) else 0.0
+                        stab = self._stability(low[i], stability_offset) if i < low.shape[0] else 1.0
+                        out.append(([[float(x), float(y)] for x, y in poly], iou, stab))
+        return out
 
     # ---------------- hover (debounced, off the event) ----------------
     def _on_move(self, viewer, event):

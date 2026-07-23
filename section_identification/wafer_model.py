@@ -250,6 +250,18 @@ class RoiTemplate:
     target_px_nm: Optional[float] = None               # target pixel size
     focus_cols: int = 2                                # SupportPoint grid
     focus_rows: int = 2
+    # Focus propagation. "pose" maps focus_local through each section's pose
+    # (rotation-aware). "center" places each point by its anchor (see
+    # focus_anchors) at the section/ROI centroid — robust when sections vary in
+    # size. focus_anchors is a per-point list of {"anchor": "roi"|"section",
+    # "off": [dx, dy]} giving the drawn offset from that anchor's centroid.
+    focus_mode: str = "pose"
+    focus_anchors: list = field(default_factory=list)
+    # Automatic per-section SAM ROI detection settings (points_per_side,
+    # pred_iou_thresh, stability_score_thresh, min_area_frac, max_area_mult,
+    # score_floor, contour_source, crop_margin, inset, roi_area…). Populated by
+    # calibrate-from-template, editable by the user, persisted for reproducibility.
+    auto_params: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {"polygon_local": _poly_xy(self.polygon_local),
@@ -258,7 +270,13 @@ class RoiTemplate:
                 "fit_percent": float(self.fit_percent),
                 "tile_um": list(self.tile_um) if self.tile_um else None,
                 "overlap": float(self.overlap), "target_px_nm": self.target_px_nm,
-                "focus_cols": int(self.focus_cols), "focus_rows": int(self.focus_rows)}
+                "focus_cols": int(self.focus_cols), "focus_rows": int(self.focus_rows),
+                "focus_mode": self.focus_mode,
+                "focus_anchors": [{"anchor": str(a.get("anchor", "section")),
+                                   "off": [float(a.get("off", [0, 0])[0]),
+                                           float(a.get("off", [0, 0])[1])]}
+                                  for a in self.focus_anchors],
+                "auto_params": dict(self.auto_params)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "RoiTemplate":
@@ -272,7 +290,10 @@ class RoiTemplate:
                    overlap=float(d.get("overlap", 0.1)),
                    target_px_nm=d.get("target_px_nm"),
                    focus_cols=int(d.get("focus_cols", 2)),
-                   focus_rows=int(d.get("focus_rows", 2)))
+                   focus_rows=int(d.get("focus_rows", 2)),
+                   focus_mode=d.get("focus_mode", "pose"),
+                   focus_anchors=list(d.get("focus_anchors", [])),
+                   auto_params=dict(d.get("auto_params", {})))
 
 
 @dataclass
