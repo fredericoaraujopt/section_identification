@@ -99,6 +99,19 @@ def build_manifest(project, geom, wafer_id: str | None = None,
                 roi_stage = _stage_um_poly(geom, roi_full)
             else:
                 roi_full = [[float(a), float(b)] for a, b in ra]
+        # Editable focus points the user drew/nudged in STiM (overview px). These
+        # are distinct from `s.focus_points` (ZEN SupportPoints in stage µm, only
+        # populated when reading a CZI); the manifest carries both.
+        focus_full = None
+        focus_stage = None
+        if s.focus_overview:
+            fa = np.asarray(s.focus_overview, float).reshape(-1, 2)
+            if geom is not None:
+                fx, fy = geom.ds_to_full(fa[:, 0], fa[:, 1])
+                focus_full = [[float(a), float(b)] for a, b in zip(np.ravel(fx), np.ravel(fy))]
+                focus_stage = _stage_um_poly(geom, focus_full)
+            else:
+                focus_full = [[float(a), float(b)] for a, b in fa]
         sections.append({
             "id": s.id,
             "serial_index": s.serial_index,
@@ -112,6 +125,8 @@ def build_manifest(project, geom, wafer_id: str | None = None,
             "area_full_px": s.area() / (getattr(geom, "zoom", 1.0) ** 2 if geom else 1.0),
             "roi_full_px": roi_full,
             "roi_stage_um": roi_stage,
+            "focus_full_px": focus_full,
+            "focus_stage_um": focus_stage,
             "focus_points_stage_um": [fp.to_dict() for fp in s.focus_points],
             "qc": s.qc.to_dict() if s.qc else None,
             "mfovs": int(mfov_counts.get(s.id, 1)),
@@ -156,6 +171,51 @@ def write_json_manifest(manifest: dict, out_dir: str) -> str:
     path = os.path.join(out_dir, f"{manifest['wafer_id']}_wafer.json")
     with open(path, "w") as f:
         json.dump(manifest, f, indent=2)
+    return path
+
+
+def build_geojson(manifest: dict, data=None) -> dict:
+    """A GeoJSON ``FeatureCollection`` (full-res pixel coords) for the selected
+    data keys: section outlines, per-section ROIs, and fiducial points. ``data``
+    is the set of enabled data toggles (``{"sections", "rois", "fiducials"}``);
+    ``None`` means all three. Each feature carries a ``kind`` property
+    (``section`` / ``roi`` / ``fiducial``) so consumers can tell them apart when
+    sections and ROIs share the frame."""
+    data = {"sections", "rois", "fiducials"} if data is None else set(data)
+    feats = []
+
+    def _poly_feature(poly, props):
+        if len(poly) < 3:
+            return
+        ring = [[float(x), float(y)] for x, y in poly]
+        ring.append(ring[0])                                  # close the ring
+        feats.append({"type": "Feature",
+                      "geometry": {"type": "Polygon", "coordinates": [ring]},
+                      "properties": props})
+
+    if "sections" in data:
+        for s in manifest["sections"]:
+            _poly_feature(s.get("polygon_full_px") or [],
+                          {"id": s["id"], "kind": "section",
+                           "serial": s.get("serial_index"), "imaging": s.get("imaging_index")})
+    if "rois" in data:
+        for s in manifest["sections"]:
+            _poly_feature(s.get("roi_full_px") or [],
+                          {"id": s["id"], "kind": "roi",
+                           "serial": s.get("serial_index"), "imaging": s.get("imaging_index")})
+    if "fiducials" in data:
+        for i, f in enumerate(manifest.get("fiducials", []), 1):
+            if f.get("full_px"):
+                feats.append({"type": "Feature",
+                              "geometry": {"type": "Point", "coordinates": f["full_px"]},
+                              "properties": {"id": f"fiducial_{i}", "kind": "fiducial"}})
+    return {"type": "FeatureCollection", "features": feats}
+
+
+def write_geojson(manifest: dict, out_dir: str, data=None) -> str:
+    path = os.path.join(out_dir, f"{manifest['wafer_id']}_sections.geojson")
+    with open(path, "w") as fh:
+        json.dump(build_geojson(manifest, data), fh, indent=2)
     return path
 
 

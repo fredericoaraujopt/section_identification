@@ -9,7 +9,6 @@ can't carry (e.g. QC isn't written into a CZI). Replaces the per-stage exports.
 
 from __future__ import annotations
 
-import json
 import os
 
 from qtpy.QtWidgets import (QCheckBox, QDialog, QGroupBox, QHBoxLayout, QLabel,
@@ -249,27 +248,9 @@ class ExportDialog(QDialog):
             return None
 
     def _write_geojson(self, manifest, out_dir, data):
-        feats = []
-        if "sections" in data:
-            for s in manifest["sections"]:
-                poly = s.get("polygon_full_px") or []
-                if len(poly) >= 3:
-                    ring = [[float(x), float(y)] for x, y in poly]
-                    ring.append(ring[0])
-                    feats.append({"type": "Feature",
-                                  "geometry": {"type": "Polygon", "coordinates": [ring]},
-                                  "properties": {"id": s["id"], "serial": s.get("serial_index"),
-                                                 "imaging": s.get("imaging_index")}})
-        if "fiducials" in data:
-            for i, f in enumerate(manifest.get("fiducials", []), 1):
-                if f.get("full_px"):
-                    feats.append({"type": "Feature",
-                                  "geometry": {"type": "Point", "coordinates": f["full_px"]},
-                                  "properties": {"id": f"fiducial_{i}"}})
-        path = os.path.join(out_dir, f"{manifest['wafer_id']}_sections.geojson")
-        with open(path, "w") as fh:
-            json.dump({"type": "FeatureCollection", "features": feats}, fh, indent=2)
-        return path
+        # Delegates to wafer_export so section outlines, ROIs, and fiducials are
+        # built + tested in one place (the dialog only picks the data toggles).
+        return wafer_export.write_geojson(manifest, out_dir, data)
 
     def _write_czi(self, proj, geom, data, out_dir):
         """Write the annotated CZI in ZEN's CAT format: sections -> CAT_Section,

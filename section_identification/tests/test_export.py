@@ -118,7 +118,8 @@ def _project():
     p.sections[0].imaging_index = 1
     p.sections[1].imaging_index = 2
     p.sections[0].roi = Roi(polygon=[[2, 2], [6, 2], [6, 6], [2, 6]])
-    p.sections[0].focus_points = [FocusPoint(1.0, 2.0, 3.0)]
+    p.sections[0].focus_points = [FocusPoint(1.0, 2.0, 3.0)]       # CZI SupportPoint
+    p.sections[0].focus_overview = [(4.0, 4.0)]                    # user-drawn (overview px)
     return p
 
 
@@ -145,6 +146,42 @@ def test_manifest_and_adapters():
         assert rows[1] == "002; S2; 6", rows
         # 003 = section_2 (imaging 2, serial 0 -> S1)
         assert rows[2] == "003; S1; 1", rows
+
+
+def test_manifest_carries_editable_focus():
+    """The manifest must export the focus points the user drew/edited in STiM
+    (``section.focus_overview``, overview px) — not only the CZI-origin
+    ``focus_points`` (stage µm). Regression: these were silently dropped."""
+    g = _FakeGeom()
+    manifest = wafer_export.build_manifest(_project(), g)
+    s1 = next(s for s in manifest["sections"] if s["id"] == "section_1")
+    # overview (4,4) -> /zoom(0.5) -> full (8,8) -> *0.001 -> stage µm (0.008, 0.008)
+    assert s1["focus_full_px"] == [[8.0, 8.0]]
+    assert s1["focus_stage_um"] == [[0.008, 0.008]]
+    # the CZI-origin SupportPoint is still carried separately
+    assert s1["focus_points_stage_um"] == [{"x_um": 1.0, "y_um": 2.0, "z_um": 3.0}]
+    # sections without drawn focus report None (not an empty-list surprise)
+    s3 = next(s for s in manifest["sections"] if s["id"] == "section_3")
+    assert s3["focus_full_px"] is None and s3["focus_stage_um"] is None
+
+
+def test_geojson_includes_rois():
+    """GeoJSON export must emit ROI polygon features when ROIs are selected
+    (the FORMAT_DATA contract claims geojson carries 'rois'). Regression: the
+    writer previously emitted only section + fiducial features."""
+    g = _FakeGeom()
+    manifest = wafer_export.build_manifest(_project(), g)
+    fc = wafer_export.build_geojson(manifest, {"sections", "rois", "fiducials"})
+    kinds = [f["properties"]["kind"] for f in fc["features"]]
+    assert "roi" in kinds, "GeoJSON must carry ROI features"
+    rois = [f for f in fc["features"] if f["properties"]["kind"] == "roi"]
+    assert len(rois) == 1 and rois[0]["properties"]["id"] == "section_1"
+    # ROI ring is closed and in full-res px: overview [[2,2]..] -> /zoom(0.5) -> [[4,4]..]
+    ring = rois[0]["geometry"]["coordinates"][0]
+    assert ring[0] == [4.0, 4.0] and ring[0] == ring[-1]
+    # selecting only sections must NOT emit ROI features
+    only_secs = wafer_export.build_geojson(manifest, {"sections"})
+    assert all(f["properties"]["kind"] == "section" for f in only_secs["features"])
 
 
 def test_zen_contour_roi_else_outline():
