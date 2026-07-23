@@ -242,6 +242,55 @@ class StimApp:
                 best, bd = s, d
         return best
 
+    @staticmethod
+    def _section_locator(proj):
+        """Build a fast point→section lookup ONCE (shapely polygons + STRtree),
+        returning ``locate(cx, cy) -> section``. Reused across every shape in a
+        capture pass, so containment is O(shapes·log·sections) instead of
+        rebuilding a Polygon per section per shape (which made autosave freeze the
+        UI on wafers with many ROIs). Falls back to nearest-centroid."""
+        import numpy as np
+        polys, valid = [], []
+        Point = None
+        try:
+            from shapely.geometry import Point, Polygon
+            for s in proj.sections:
+                if len(s.polygon) >= 3:
+                    try:
+                        g = Polygon(s.polygon).buffer(0)
+                    except Exception:
+                        g = None
+                    if g is not None and not g.is_empty:
+                        polys.append(g); valid.append(s)
+        except Exception:
+            polys, valid = [], []
+        tree = None
+        if polys:
+            try:
+                from shapely import STRtree
+                tree = STRtree(polys)
+            except Exception:
+                tree = None
+        cents = np.array([s.centroid() for s in valid], float) if valid else None
+
+        def locate(cx, cy):
+            if Point is not None and polys:
+                pt = Point(cx, cy)
+                if tree is not None:
+                    for i in np.atleast_1d(tree.query(pt)):
+                        i = int(i)
+                        if 0 <= i < len(polys) and polys[i].contains(pt):
+                            return valid[i]
+                else:
+                    for g, s in zip(polys, valid):
+                        if g.contains(pt):
+                            return s
+            if cents is not None and len(cents):
+                d = (cents[:, 0] - cx) ** 2 + (cents[:, 1] - cy) ** 2
+                return valid[int(d.argmin())]
+            return None
+        return locate
+
     # -- live capture of hand-edits made to the ROI / focus overlays ----------
     def capture_annotations(self) -> bool:
         """Read native napari edits (move / add / delete) from the live "② ROIs"
@@ -268,9 +317,15 @@ class StimApp:
             x, y = p[:, 0], p[:, 1]
             return abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2.0
 
+        has_roi = layer_sync.ROI_LAYER in viewer.layers
+        has_focus = layer_sync.FOCUS_LAYER in viewer.layers
+        if not (has_roi or has_focus):
+            return False
+        locate = self._section_locator(proj)         # built once, reused below
+
         # ROIs: Shapes layer stored as napari (y, x); model keeps (x, y). The
         # model holds one ROI per section, so on a collision keep the largest.
-        if layer_sync.ROI_LAYER in viewer.layers:
+        if has_roi:
             for s in proj.sections:
                 s.roi = None
             dropped = 0
@@ -279,7 +334,8 @@ class StimApp:
                 if len(arr) < 3:
                     continue
                 xy = [[float(x), float(y)] for y, x in arr]
-                sec = self._section_containing(proj, xy)
+                cx, cy = arr[:, 1].mean(), arr[:, 0].mean()      # centroid (x, y)
+                sec = locate(cx, cy)
                 if sec is None:
                     continue
                 if sec.roi is not None:
@@ -293,13 +349,13 @@ class StimApp:
             touched = True
 
         # Focus points: Points layer stored as napari (y, x).
-        if layer_sync.FOCUS_LAYER in viewer.layers:
+        if has_focus:
             for s in proj.sections:
                 s.focus_overview = []
             for p in np.asarray(viewer.layers[layer_sync.FOCUS_LAYER].data,
                                 float).reshape(-1, 2):
                 ox, oy = float(p[1]), float(p[0])
-                sec = self._section_containing(proj, [(ox, oy)])
+                sec = locate(ox, oy)
                 if sec is not None:
                     sec.focus_overview.append((ox, oy))
             touched = True

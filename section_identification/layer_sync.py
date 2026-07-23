@@ -386,6 +386,22 @@ def clear_current_section(app):
     _remove(app.viewer, ROI_CURRENT_LAYER)
 
 
+def _closed_paths(polys_yx):
+    """Close each polygon into a path (append the first vertex). Paths render as
+    an edge-only outline, so napari never triangulates a face — which is what
+    crashes on the ROI's exact, un-simplified SAM contours (hundreds of vertices).
+    The face is transparent anyway, so the visual result is identical."""
+    out = []
+    for p in polys_yx:
+        a = np.asarray(p, float).reshape(-1, 2)
+        if len(a) < 2:
+            continue
+        if not np.array_equal(a[0], a[-1]):
+            a = np.vstack([a, a[0]])
+        out.append(a)
+    return out
+
+
 def show_rois(app):
     viewer = app.viewer
     _remove(viewer, ROI_LAYER)
@@ -393,13 +409,31 @@ def show_rois(app):
              if s.roi and len(s.roi.polygon) >= 3]
     if not polys:
         return
+    paths = _closed_paths(polys)
+    kw = dict(shape_type="path", name=ROI_LAYER, edge_color="cyan",
+              edge_width=_overlay_width(app), scale=app.layer_scale())
     try:
-        lyr = viewer.add_shapes(polys, shape_type="polygon", name=ROI_LAYER,
-                                edge_color="cyan", face_color="transparent",
-                                edge_width=_overlay_width(app), scale=app.layer_scale())
+        lyr = viewer.add_shapes(paths, **kw)
+    except Exception:
+        # Per-shape fallback: never let one bad outline take down the app.
+        _remove(viewer, ROI_LAYER)
+        try:
+            lyr = viewer.add_shapes([], **kw)
+        except Exception as e:
+            app.log("rois", f"overlay error: {e}")
+            return
+        skipped = 0
+        for pth in paths:
+            try:
+                lyr.add(pth, shape_type="path")
+            except Exception:
+                skipped += 1
+        if skipped:
+            app.log("rois", f"skipped {skipped} ROI outline(s) napari could not render.")
+    try:
         _connect_autosave(app, lyr)
-    except Exception as e:
-        app.log("rois", f"overlay error: {e}")
+    except Exception:
+        pass
 
 
 EXIST_FOCUS = "Focus support points (CZI)"

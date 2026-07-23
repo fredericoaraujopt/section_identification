@@ -1165,16 +1165,29 @@ class SectionIdentificationGUI(QWidget):
             cls = lyr.__class__.__name__
             is_shapes = (isinstance(lyr, Shapes) if Shapes is not None else cls == "Shapes")
             is_points = (isinstance(lyr, Points) if Points is not None else cls == "Points")
+            md = getattr(lyr, "metadata", None)
+            md = md if isinstance(md, dict) else None
             if is_shapes:
+                # Skip re-setting (which re-triangulates every shape's edge — the
+                # cost on 200-shape layers) when the width barely changed.
+                prev = md.get("_stim_ew") if md is not None else None
+                if prev is not None and abs(width - prev) <= 0.03 * width:
+                    continue
                 try:
                     lyr.edge_width = width
                     lyr.current_edge_width = width
+                    if md is not None:
+                        md["_stim_ew"] = width
                 except Exception:
                     pass
-            elif is_points and getattr(lyr, "metadata", {}).get("stim_screen_pts"):
+            elif is_points and md is not None and md.get("stim_screen_pts"):
+                prev = md.get("_stim_ps")
+                if prev is not None and abs(pt_size - prev) <= 0.03 * pt_size:
+                    continue
                 try:
                     lyr.size = pt_size
                     lyr.current_size = pt_size
+                    md["_stim_ps"] = pt_size
                 except Exception:
                     pass
 
