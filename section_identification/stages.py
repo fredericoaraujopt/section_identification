@@ -1540,6 +1540,18 @@ def attach_workflow(viewer, gui):
         section id, so the masks must be in place before we merge)."""
         if not app.has_image():
             return
+        # A wafer load flips app.image_path before the new wafer's sections are in
+        # place; log_msg()'s processEvents can call us mid-load. Restoring then would
+        # bind the new sidecar's ROIs/focus to the PREVIOUS wafer's sections (matched
+        # by id -> nothing matches) and latch us done, so the real sections never get
+        # their overlays. Wait for the load to finish; re-arm once per (re)load so a
+        # switch — or reopening the same wafer — always restores.
+        if getattr(app.gui, "_loading", False):
+            return
+        gen = getattr(app.gui, "_session_generation", 0)
+        if loaded.get("gen") != gen:
+            loaded["done"] = None
+            loaded["gen"] = gen
         path = app.image_path
         if loaded["done"] == path:
             return

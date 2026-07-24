@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -635,9 +636,8 @@ def write_geojson(path: str, polygons, fiducials, geom=None) -> str:
         })
 
     fc = {"type": "FeatureCollection", "features": features}
-    with open(path, "w") as f:
-        json.dump(fc, f, indent=2)
-    return path
+    from . import atomicio
+    return atomicio.atomic_write_json(path, fc, indent=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -649,11 +649,131 @@ def _read_metadata_xml(path: str) -> str:
         return cz.raw_metadata
 
 
+def _remove_quietly(path: str) -> None:
+    try:
+        if os.path.lexists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _copy_czi_cancellable(src: str, tmp: str, *, on_progress=None,
+                          is_cancelled=None) -> None:
+    """Copy the (large) CZI ``src`` -> ``tmp`` safely, fast where possible, and
+    cancellably. Does NOT publish ``tmp`` — the caller edits + verifies + renames.
+
+    - Free-space preflight (need >= source size at the destination) so we fail
+      *before* writing a doomed, truncated copy.
+    - Fast path: an APFS copy-on-write clone (``cp -c`` — instant on the same
+      local volume). Falls through when the volume can't clone (e.g. a network
+      share), where ``cp`` may still use SMB server-side copy.
+    - The copy runs in a child ``cp`` process, so it does not hold the Python
+      thread; ``on_progress(copied, total)`` fires ~10x/s (a GUI caller pumps its
+      event loop there) and ``is_cancelled()`` lets a user abort — on abort the
+      child is killed and ``tmp`` removed, so no truncated file survives.
+    - Verifies the copied size equals the source before returning.
+    """
+    total = os.path.getsize(src)
+    dst_dir = os.path.dirname(os.path.abspath(tmp)) or "."
+    try:
+        free = shutil.disk_usage(dst_dir).free
+        if free < total:
+            raise OSError(f"insufficient free space at {dst_dir}: need "
+                          f"{total:,} bytes, have {free:,}")
+    except OSError:
+        raise
+    except Exception:
+        pass                                      # disk_usage unsupported → skip
+
+    _remove_quietly(tmp)
+
+    def _size_ok() -> bool:
+        try:
+            return os.path.getsize(tmp) == total
+        except OSError:
+            return False
+
+    # Fast path — instant COW clone on APFS; a no-op elsewhere.
+    try:
+        r = subprocess.run(["cp", "-c", src, tmp],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode == 0 and _size_ok():
+            if on_progress:
+                on_progress(total, total)
+            return
+        _remove_quietly(tmp)
+    except FileNotFoundError:
+        pass                                      # no `cp` (non-POSIX) → fallbacks
+    except Exception:
+        _remove_quietly(tmp)
+
+    # General path — `cp` as a child process, polled for progress + cancel.
+    proc = None
+    try:
+        proc = subprocess.Popen(["cp", src, tmp])
+    except FileNotFoundError:
+        proc = None
+    if proc is not None:
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if is_cancelled and is_cancelled():
+                    proc.kill(); proc.wait(); _remove_quietly(tmp)
+                    raise RuntimeError("CZI copy cancelled")
+                if on_progress:
+                    try:
+                        on_progress(os.path.getsize(tmp), total)
+                    except OSError:
+                        pass
+            if proc.returncode != 0:
+                _remove_quietly(tmp)
+                raise IOError(f"cp exited with code {proc.returncode}")
+        except BaseException:
+            if proc.poll() is None:
+                try:
+                    proc.kill(); proc.wait()
+                except Exception:
+                    pass
+            _remove_quietly(tmp)
+            raise
+    else:
+        # Pure-Python chunked fallback (non-POSIX hosts).
+        try:
+            with open(src, "rb") as fi, open(tmp, "wb") as fo:
+                done = 0
+                while True:
+                    if is_cancelled and is_cancelled():
+                        raise RuntimeError("CZI copy cancelled")
+                    chunk = fi.read(16 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    fo.write(chunk)
+                    done += len(chunk)
+                    if on_progress:
+                        on_progress(done, total)
+        except BaseException:
+            _remove_quietly(tmp)
+            raise
+
+    if not _size_ok():
+        got = os.path.getsize(tmp) if os.path.lexists(tmp) else 0
+        _remove_quietly(tmp)
+        raise IOError(f"CZI copy incomplete: {got:,} of {total:,} bytes")
+    if on_progress:
+        on_progress(total, total)
+
+
 def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
                         copy: bool = True, fiducial_radius_px: float = 50.0,
                         section_ids: list | None = None,
                         sf_markers_stage_um=None, sf_orientation=None,
-                        tile_regions=None, rois=None, focus_full=None) -> dict:
+                        tile_regions=None, rois=None, focus_full=None,
+                        on_progress=None, is_cancelled=None,
+                        force_copy: bool = False) -> dict:
     """Produce a new CZI carrying STiM section polygons + ROIs + focus + markers.
 
     Copies ``src_czi`` -> ``dst_czi`` (preserving full-res pixels), then injects
@@ -670,31 +790,73 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
     node — the LM↔SEM correlative calibration. This edits only the destination
     COPY, never ``src_czi``. ``sf_orientation`` overrides the ``StageOrientation``.
 
+    **Corruption-safe & fast.** The multi-GB pixel copy goes to ``dst.part`` and
+    is only ``os.replace``d onto ``dst`` after the metadata is injected AND the
+    round-trip verifies — so an interrupted/cancelled/failed write can never leave
+    a truncated ``dst`` (the bug that produced a half-written ``_STiM_acq.czi``).
+    A re-export onto an existing full copy skips the pixel copy entirely and only
+    re-edits the metadata in place (seconds instead of minutes), rolling the
+    metadata back if verification fails. ``on_progress(copied,total)`` /
+    ``is_cancelled()`` drive a responsive, cancellable copy; ``force_copy`` forces
+    a fresh copy even when a matching ``dst`` already exists.
+
     Returns a report dict (``dst``, ``n_polygons``, ``n_rois``, ``n_focus``,
-    ``n_fiducials``, ``n_sf_markers``, ``roundtrip_ok``).
+    ``n_fiducials``, ``n_sf_markers``, ``roundtrip_ok`` (always True — a False
+    round-trip raises), ``reused_existing``).
     """
-    if copy:
-        if os.path.abspath(src_czi) != os.path.abspath(dst_czi):
-            shutil.copy2(src_czi, dst_czi)
-    elif not os.path.exists(dst_czi):
-        raise FileNotFoundError(dst_czi)
+    same = os.path.abspath(src_czi) == os.path.abspath(dst_czi)
 
-    # Build the new metadata XML — ZEN CAT layers (sections/ROIs/focus/fiducials).
-    old_xml = _read_metadata_xml(dst_czi)
-    new_xml = inject_cat_layers(old_xml, polygons, rois=rois, focus=focus_full,
-                                fiducials=fiducials,
-                                fiducial_radius_px=fiducial_radius_px,
-                                section_ids=section_ids)
-    if sf_markers_stage_um:
-        new_xml = inject_shuttle_and_find(new_xml, sf_markers_stage_um,
-                                          orientation=sf_orientation)
-    if tile_regions:
-        new_xml = inject_tile_regions(new_xml, tile_regions)
+    def _edit_metadata(target: str) -> None:
+        old_xml = _read_metadata_xml(target)
+        new_xml = inject_cat_layers(old_xml, polygons, rois=rois, focus=focus_full,
+                                    fiducials=fiducials,
+                                    fiducial_radius_px=fiducial_radius_px,
+                                    section_ids=section_ids)
+        if sf_markers_stage_um:
+            new_xml = inject_shuttle_and_find(new_xml, sf_markers_stage_um,
+                                              orientation=sf_orientation)
+        if tile_regions:
+            new_xml = inject_tile_regions(new_xml, tile_regions)
+        _commit_metadata(target, new_xml)
+        if not roundtrip_check(target, expect_polygons=len(polygons)):
+            raise RuntimeError("annotated CZI failed round-trip verification "
+                               "(section polygons not found after write)")
 
-    # Commit metadata-only via the CziEditor (pylibCZIrw >= 6.0.0).
-    _commit_metadata(dst_czi, new_xml)
+    reused = False
+    if not copy or same:
+        # Edit the destination in place (caller vouches it exists / is the source).
+        if not os.path.exists(dst_czi):
+            raise FileNotFoundError(dst_czi)
+        _edit_metadata(dst_czi)
+    elif (not force_copy and os.path.exists(dst_czi)
+          and os.path.getsize(dst_czi) == os.path.getsize(src_czi)):
+        # Fast re-export: a full copy is already here. Only the metadata changes,
+        # and the pixels are never touched, so edit in place — but snapshot the
+        # old metadata first and restore it if the new one fails to verify.
+        reused = True
+        prev_xml = _read_metadata_xml(dst_czi)
+        try:
+            _edit_metadata(dst_czi)
+        except BaseException:
+            try:
+                _commit_metadata(dst_czi, prev_xml)      # roll back the metadata
+            except Exception:
+                pass
+            raise
+    else:
+        # First export (or forced): atomic copy -> edit -> verify -> publish.
+        work = f"{dst_czi}.part"
+        _remove_quietly(work)
+        try:
+            _copy_czi_cancellable(src_czi, work, on_progress=on_progress,
+                                  is_cancelled=is_cancelled)
+            _edit_metadata(work)
+            os.replace(work, dst_czi)
+        except BaseException:
+            _remove_quietly(work)
+            raise
 
-    report = {
+    return {
         "n_tile_regions": len(tile_regions or []),
         "dst": dst_czi,
         "n_polygons": len(polygons),
@@ -702,9 +864,9 @@ def write_annotated_czi(src_czi: str, dst_czi: str, polygons, fiducials,
         "n_focus": len(focus_full or []),
         "n_fiducials": len(fiducials or []),
         "n_sf_markers": len(sf_markers_stage_um or []),
-        "roundtrip_ok": roundtrip_check(dst_czi, expect_polygons=len(polygons)),
+        "roundtrip_ok": True,          # enforced above (a failure raises)
+        "reused_existing": reused,
     }
-    return report
 
 
 def _commit_metadata(dst_czi: str, new_xml: str) -> None:

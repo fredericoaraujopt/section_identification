@@ -24,6 +24,8 @@ import os
 
 import numpy as np
 
+from . import atomicio
+
 
 # --------------------------------------------------------------------------- #
 # manifest
@@ -169,9 +171,7 @@ def _imaging_sorted(manifest):
 
 def write_json_manifest(manifest: dict, out_dir: str) -> str:
     path = os.path.join(out_dir, f"{manifest['wafer_id']}_wafer.json")
-    with open(path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    return path
+    return atomicio.atomic_write_json(path, manifest, indent=2)
 
 
 def build_geojson(manifest: dict, data=None) -> dict:
@@ -214,9 +214,7 @@ def build_geojson(manifest: dict, data=None) -> dict:
 
 def write_geojson(manifest: dict, out_dir: str, data=None) -> str:
     path = os.path.join(out_dir, f"{manifest['wafer_id']}_sections.geojson")
-    with open(path, "w") as fh:
-        json.dump(build_geojson(manifest, data), fh, indent=2)
-    return path
+    return atomicio.atomic_write_json(path, build_geojson(manifest, data), indent=2)
 
 
 def write_csv_table(manifest: dict, out_dir: str) -> str:
@@ -224,18 +222,20 @@ def write_csv_table(manifest: dict, out_dir: str) -> str:
     cols = ["section_id", "serial_index", "imaging_index", "serial_name", "accepted",
             "centroid_x_um", "centroid_y_um", "area_full_px",
             "qc_overall", "qc_debris", "qc_fold", "qc_shred", "qc_chatter", "flag_any"]
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(cols)
-        for s in manifest["sections"]:
-            c = s.get("centroid_stage_um") or [None, None]
-            sc = (s.get("qc") or {}).get("scores", {})
-            fl = (s.get("qc") or {}).get("flags", {})
-            w.writerow([s["id"], s["serial_index"], s["imaging_index"], s["serial_name"],
-                        s["accepted"], c[0], c[1], s.get("area_full_px"),
-                        sc.get("overall"), sc.get("debris"), sc.get("fold"),
-                        sc.get("shred"), sc.get("chatter"), (fl or {}).get("any")])
-    return path
+
+    def _write(tmp):
+        with open(tmp, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            for s in manifest["sections"]:
+                c = s.get("centroid_stage_um") or [None, None]
+                sc = (s.get("qc") or {}).get("scores", {})
+                fl = (s.get("qc") or {}).get("flags", {})
+                w.writerow([s["id"], s["serial_index"], s["imaging_index"], s["serial_name"],
+                            s["accepted"], c[0], c[1], s.get("area_full_px"),
+                            sc.get("overall"), sc.get("debris"), sc.get("fold"),
+                            sc.get("shred"), sc.get("chatter"), (fl or {}).get("any")])
+    return atomicio.atomic_write(path, _write)
 
 
 def write_mvis_lmb(manifest: dict, out_dir: str) -> str:
@@ -243,19 +243,26 @@ def write_mvis_lmb(manifest: dict, out_dir: str) -> str:
     contract. id = acquisition order (ZEN images by Id), name = serial section."""
     path = os.path.join(out_dir, "region_names.csv")
     ordered = _imaging_sorted(manifest)
-    with open(path, "w", newline="") as f:
-        for i, s in enumerate(ordered, start=1):
-            n_mfovs = max(1, int(s.get("mfovs", 1)))
-            f.write(f"{i:03d}; {s['serial_name']}; {n_mfovs}\n")
+
+    def _write_names(tmp):
+        with open(tmp, "w", newline="") as f:
+            for i, s in enumerate(ordered, start=1):
+                n_mfovs = max(1, int(s.get("mfovs", 1)))
+                f.write(f"{i:03d}; {s['serial_name']}; {n_mfovs}\n")
+    atomicio.atomic_write(path, _write_names)
+
     # sidecar with stage coords for a future spatial wafer overview
     side = os.path.join(out_dir, "region_positions.csv")
-    with open(side, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["id", "name", "section_id", "stage_x_um", "stage_y_um", "n_mfovs"])
-        for i, s in enumerate(ordered, start=1):
-            c = s.get("centroid_stage_um") or [None, None]
-            w.writerow([f"{i:03d}", s["serial_name"], s["id"], c[0], c[1],
-                        max(1, int(s.get("mfovs", 1)))])
+
+    def _write_pos(tmp):
+        with open(tmp, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["id", "name", "section_id", "stage_x_um", "stage_y_um", "n_mfovs"])
+            for i, s in enumerate(ordered, start=1):
+                c = s.get("centroid_stage_um") or [None, None]
+                w.writerow([f"{i:03d}", s["serial_name"], s["id"], c[0], c[1],
+                            max(1, int(s.get("mfovs", 1)))])
+    atomicio.atomic_write(side, _write_pos)
     return path
 
 
@@ -276,9 +283,7 @@ def write_magc(manifest: dict, out_dir: str) -> str:
     lines.append("")
     lines.append("# NOTE: partial .magc projection — validate field names against a")
     lines.append("# real MagFinder/SBEMimage .magc before downstream use.")
-    with open(path, "w") as f:
-        f.write("\n".join(lines))
-    return path
+    return atomicio.atomic_write_text(path, "\n".join(lines))
 
 
 def _contour_verts(section, geometry):
@@ -348,9 +353,8 @@ def write_zen_contour(manifest: dict, out_dir: str, geometry: str = "roi_else_ou
     if skipped:
         print(f"[warn] ZEN .contour: {skipped} section(s) skipped (no stage-µm polygon).")
     path = os.path.join(out_dir, f"{manifest['wafer_id']}.contour")
-    with open(path, "w", newline="") as f:                # newline='' -> keep our CRLF verbatim
-        f.write("\r\n".join(lines) + "\r\n")
-    return path
+    # newline='' -> keep our CRLF verbatim
+    return atomicio.atomic_write_text(path, "\r\n".join(lines) + "\r\n", newline="")
 
 
 # --------------------------------------------------------------------------- #

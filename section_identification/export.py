@@ -19,6 +19,8 @@ import tempfile
 
 import numpy as np
 
+from . import atomicio
+
 
 # --------------------------------------------------------------------------- #
 # Output directory (read-only-drive safe)
@@ -242,11 +244,13 @@ def _write_outputs(image_path, polygons, fiducials_full, section_ids=None,
         fid_row["distance"] = (str(compute_pairwise_distances(fiducials_full))
                                if len(fiducials_full) >= 2 else "")
         rows.append(fid_row)
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["id", "type",
-                                                   "contour_coordinates", "distance"])
-            writer.writeheader()
-            writer.writerows(rows)
+        def _write_csv(tmp):
+            with open(tmp, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["id", "type",
+                                                       "contour_coordinates", "distance"])
+                writer.writeheader()
+                writer.writerows(rows)
+        atomicio.atomic_write(csv_path, _write_csv)
         print(f"Wrote CSV: {csv_path}")
         outputs["csv"] = csv_path
 
@@ -360,7 +364,20 @@ def render_overlay_png(image_path, polygons_full, fiducials_full, out_path,
         cv2.line(img, (cx, cy - arm), (cx, cy + arm), fiducial_color, th + 2, cv2.LINE_AA)
         cv2.circle(img, (cx, cy), arm, fiducial_color, max(2, th), cv2.LINE_AA)
 
-    cv2.imwrite(out_path, img)
+    # Atomic: encode to a temp with the real extension (cv2 infers format from it),
+    # then rename in — a killed render can't leave a truncated PNG at out_path.
+    tmp = out_path + ".part.png"
+    try:
+        if not cv2.imwrite(tmp, img):
+            raise IOError(f"cv2.imwrite failed for {tmp}")
+        os.replace(tmp, out_path)
+    except BaseException:
+        try:
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return out_path
 
 

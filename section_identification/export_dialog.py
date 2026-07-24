@@ -144,6 +144,20 @@ class ExportDialog(QDialog):
         if not fmts:
             app.log("export", "select at least one format.")
             return
+        gui = getattr(app, "gui", None)
+        # Pause the debounced autosave for the whole export: the CZI step pumps the
+        # Qt event loop to keep its progress bar responsive, and a re-entrant
+        # autosave in that window would contend with / re-capture a mid-export
+        # model. Always cleared in the finally.
+        if gui is not None:
+            gui._exporting = True
+        try:
+            self._run_export(app, data, fmts)
+        finally:
+            if gui is not None:
+                gui._exporting = False
+
+    def _run_export(self, app, data, fmts):
         proj = app.sync_sections()
         # Fold in any hand-edited ROIs and, crucially, preserve section-less ones:
         # capture promotes each ROI that has no section of its own into a margined
@@ -241,7 +255,17 @@ class ExportDialog(QDialog):
             if arr.ndim == 3 and arr.shape[2] == 4:      # drop alpha (figure is opaque)
                 arr = arr[..., :3]
             from PIL import Image as PILImage
-            PILImage.fromarray(arr).save(path, dpi=(300, 300))
+            tmp = path + ".part.png"                     # atomic: encode then rename
+            try:
+                PILImage.fromarray(arr).save(tmp, dpi=(300, 300))
+                os.replace(tmp, path)
+            except BaseException:
+                if os.path.lexists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                raise
             h, w = arr.shape[:2]
             note = f"{w}x{h}px @300dpi"
             if scale < 1.0:
@@ -317,15 +341,56 @@ class ExportDialog(QDialog):
 
         base = os.path.splitext(os.path.basename(self.app.image_path))[0]
         dst = os.path.join(out_dir, f"{base}_STiM_acq.czi")
+
+        # A modal progress bar keeps the UI alive during the (multi-GB) pixel copy
+        # and lets the user cancel — a cancel kills the copy and removes the
+        # partial, so it can never leave a truncated CZI. The copy itself is atomic
+        # + round-trip-verified inside write_annotated_czi; a re-export skips the
+        # copy entirely (metadata-only, seconds).
+        from qtpy.QtWidgets import QApplication, QProgressDialog
+        from qtpy.QtCore import Qt
+        dlg = None
+        try:
+            dlg = QProgressDialog("Writing annotated CZI…", "Cancel", 0, 100, self)
+            dlg.setWindowModality(Qt.ApplicationModal)   # block disruptive input mid-copy
+            dlg.setMinimumDuration(0)
+            dlg.setAutoClose(False)
+            dlg.setAutoReset(False)
+            dlg.setValue(0)
+            QApplication.processEvents()
+        except Exception:
+            dlg = None
+
+        def _on_progress(done, total):
+            if dlg is None:
+                return
+            gb = 1024.0 ** 3
+            dlg.setLabelText(f"Copying CZI pixels… {done / gb:.1f} / {total / gb:.1f} GB")
+            dlg.setValue(int(100 * done / total) if total else 0)
+            QApplication.processEvents()
+
+        def _is_cancelled():
+            if dlg is None:
+                return False
+            QApplication.processEvents()
+            return dlg.wasCanceled()
+
         try:
             report = czi_export.write_annotated_czi(
                 self.app.image_path, dst, polys_full, fids_full,
                 section_ids=[s.id for s in proj.sections],
                 rois=rois_full or None, focus_full=focus_full or None,
                 tile_regions=tile_regions,
-                sf_markers_stage_um=sf)
+                sf_markers_stage_um=sf,
+                on_progress=_on_progress, is_cancelled=_is_cancelled)
+            if dlg is not None:
+                dlg.setValue(100)
             self.app.log("export", f"CZI: {report}")
             return dst
         except Exception as e:
-            self.app.log("export", f"⚠️ CZI write failed: {e}")
+            self.app.log("export", f"⚠️ CZI write failed/cancelled (source + other "
+                                    f"exports are untouched): {e}")
             return None
+        finally:
+            if dlg is not None:
+                dlg.close()

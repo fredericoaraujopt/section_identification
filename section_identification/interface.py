@@ -844,6 +844,21 @@ class SectionIdentificationGUI(QWidget):
         if not path:
             return
         self._last_dir = os.path.dirname(path)     # reopen here next time
+        # A wafer switch flips image_path immediately, but the new wafer's sections
+        # are not restored until later in this same call — and log_msg() pumps the
+        # Qt event loop (processEvents), which lets the ROI/focus restore poll fire
+        # mid-load. If it fires now it restores against the PREVIOUS wafer's
+        # still-present sections and latches itself "done", so the real sections
+        # never get their overlays. Guard the whole load; the poll waits for
+        # _loading to clear (and re-runs once, keyed on _session_generation).
+        self._loading = True
+        self._session_generation = getattr(self, "_session_generation", 0) + 1
+        try:
+            self._load_selected_image(path)
+        finally:
+            self._loading = False
+
+    def _load_selected_image(self, path):
         self.image_path = path
         self.lbl_path.setText(f"Selected: {os.path.basename(path)}")
         self.lbl_path.setToolTip(path)
@@ -953,6 +968,25 @@ class SectionIdentificationGUI(QWidget):
             self.log_msg(f"Restored {len(polys)} sections + {len(fids)} fiducials "
                          "from autosaved project.")
             return polys, fids
+        # The legacy project JSON is missing/empty/unreadable — fall back to the
+        # workflow sidecar, which independently stores full section geometry (+
+        # fiducials) in our own atomic format. Keeps sections recoverable even if
+        # _stim_project.json was truncated by a crash mid-write.
+        try:
+            from . import project_io
+            src = project_io.load(self.image_path, self.geom,
+                                  path=project_io.workflow_path(self.image_path))
+            if src is not None and src.sections:
+                polys = [[[float(x), float(y)] for x, y in s.polygon]
+                         for s in src.sections if len(s.polygon) >= 3]
+                fids = [(float(x), float(y)) for x, y in src.fiducials]
+                self.log_msg(f"Restored {len(polys)} sections + {len(fids)} "
+                             "fiducials from the workflow sidecar (project JSON "
+                             "was missing/unreadable).")
+                return polys, fids
+        except Exception:
+            self.log_msg("[warn] workflow-sidecar geometry fallback failed:\n"
+                         + traceback.format_exc())
         if czi_io.is_czi(self.image_path) and self.geom is not None:
             try:
                 from section_identification.czi_export import read_cat_annotations
@@ -1236,6 +1270,12 @@ class SectionIdentificationGUI(QWidget):
         does the full save (captures ROI/focus overlay edits + writes both the
         project JSON and the workflow sidecar); otherwise it falls back to the
         legacy sections/fiducials JSON only."""
+        # An export pumps the Qt event loop (progress updates) while it runs; a
+        # re-entrant autosave during that window would contend with the export and
+        # re-capture a mid-export model. Defer until the export finishes.
+        if getattr(self, "_exporting", False):
+            self._schedule_autosave()
+            return
         app = getattr(self, "app", None)
         if app is not None and app.has_image():
             app.save_all()
@@ -1312,10 +1352,11 @@ class SectionIdentificationGUI(QWidget):
                     # full unfiltered detector output, kept for re-filtering / QC
                     "raw_sections": [self._to_full(p) for p in self.current_raw_xy()],
                     "calibration_examples": [self._to_full(p) for p in self.current_calib_xy()]}
-            path = self._project_path()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
-                json.dump(data, f)
+            # Atomic write: a crash/kill mid-save can no longer truncate the
+            # project JSON (which is the section-geometry autosave) and lose every
+            # section on the next open. See section_identification.atomicio.
+            from . import atomicio
+            atomicio.atomic_write_json(self._project_path(), data)
         except Exception:
             pass
 

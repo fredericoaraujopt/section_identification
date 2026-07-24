@@ -25,6 +25,10 @@ class StimApp:
         self.gui = gui
         self.project = WaferProject()
         self._log_sinks = []        # extra log targets (e.g. the shared footer log)
+        # Which image's workflow sidecar we've actually loaded this session. Guards
+        # against autosaving an un-restored (ROI-less) model over a populated sidecar
+        # — the data-loss path that wiped ROIs when the restore was defeated.
+        self._workflow_loaded_path = None
 
     # -- passthrough state --
     @property
@@ -128,13 +132,21 @@ class StimApp:
         if not self.has_image():
             return
         from . import layer_sync, project_io
+        wf_path = project_io.workflow_path(self.image_path)
+        # Data-loss guard: if a sidecar for this image already exists on disk but we
+        # have NOT loaded it yet this session, saving now would persist a model that
+        # is still missing that sidecar's ROIs/focus/order (restore pending or
+        # failed) — silently overwriting good data with nothing. Skip until we've
+        # loaded it; a fresh image (no sidecar) still saves normally.
+        if self._workflow_loaded_path != self.image_path and os.path.isfile(wf_path):
+            return
         self.sync_sections()
         try:
             self.project.display_settings = layer_sync.capture_display(self)
         except Exception:
             pass
-        project_io.save(self.project, self.geom,
-                        path=project_io.workflow_path(self.image_path))
+        project_io.save(self.project, self.geom, path=wf_path)
+        self._workflow_loaded_path = self.image_path
 
     def load_workflow(self) -> bool:
         """Restore saved workflow results onto the current sections (matched by
@@ -148,6 +160,7 @@ class StimApp:
             return False
         self.sync_sections()
         self.project.apply_results(src)
+        self._workflow_loaded_path = self.image_path
         return True
 
     def restore_annotations_from_czi(self) -> tuple:
